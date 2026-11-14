@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "manifest": {
+    "id": "toolboks.hello",
+    "title": "Hello",
+    "native_provider": "toolboks.hello",
+    "description": "A small add-on for checking the release pipeline.",
+    "long_description": "Draws a greeting inside Toolboks. It does not change your system.",
+    "version": "0.1.0",
+    "author": "Toolboks",
+    "publisher": "Toolboks",
+    "category": "system",
+    "icon": "grid",
+    "accent": "#8b5cf6",
+    "api_version": 2,
+    "min_toolboks_version": "0.12.5",
+    "license": "MIT",
+    "capabilities": []
+  },
+  "pages": []
+}

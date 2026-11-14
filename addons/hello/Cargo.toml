@@ -1,0 +1,15 @@
+[package]
+name = "hello"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+toolboks-addon-sdk.workspace = true
+toolboks-shared.workspace = true
+egui.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+toolboks-addon-proto.workspace = true

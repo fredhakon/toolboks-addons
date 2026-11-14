@@ -1,0 +1,146 @@
+name: Release add-on
+on:
+  push:
+    tags: ['*-v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      addon: ${{ steps.release.outputs.addon }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Validate tag, version and main ancestry
+        id: release
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          ./scripts/check-release.ps1 -Tag $env:RELEASE_TAG | Out-File $env:GITHUB_OUTPUT -Append -Encoding ascii
+      - name: Test only the selected add-on
+        shell: pwsh
+        env:
+          ADDON: ${{ steps.release.outputs.addon }}
+        run: |
+          cargo test --locked -p $env:ADDON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --release -p $env:ADDON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:ADDON_TEST_EXE = (Resolve-Path "target/release/$env:ADDON.exe").Path
+          cargo test --locked -p $env:ADDON --test protocol
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package executable and checksum
+        shell: pwsh
+        env:
+          ADDON: ${{ steps.release.outputs.addon }}
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item "target/release/$env:ADDON.exe" dist/
+          $exe = "dist/$env:ADDON.exe"
+          $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:ADDON.exe" | Set-Content -LiteralPath "$exe.sha256" -Encoding ascii
+          $size = (Get-Item -LiteralPath $exe).Length
+          "### $env:ADDON`nExecutable size: $size bytes" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-addon
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+  # GitHub permissions are job-scoped. This job runs no repository code and is the
+  # only job with a contents:write GITHUB_TOKEN; build and catalog stay read-only.
+  publish:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-addon
+          path: dist
+      - name: Publish tested assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          if ($env:RELEASE_TAG -cnotmatch '\A[a-z][a-z0-9]*(?:-[a-z0-9]+)*-v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z') { throw 'Invalid tag' }
+          # Existing releases are never overwritten. Retry catalog alone after a PR failure.
+          gh release create $env:RELEASE_TAG --verify-tag --target $env:RELEASE_SHA --title $env:RELEASE_TAG --notes 'Native add-on. Catalog availability follows owner review and offline signing.' dist/*
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  catalog:
+    needs: [build, publish]
+    runs-on: windows-latest
+    # Serialize catalog PR creation across independent add-on releases.
+    concurrency:
+      group: catalog-pr
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-source
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-addon
+          path: dist
+      - name: Update catalog using the host format
+        shell: pwsh
+        env:
+          ADDON: ${{ needs.build.outputs.addon }}
+          VERSION: ${{ needs.build.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          # Use the released manifest, protocol pin and tooling against main's index.
+          Copy-Item catalog/index.json release-source/catalog/index.json
+          $exe = (Resolve-Path "dist/$env:ADDON.exe").Path
+          Push-Location release-source
+          cargo run --locked -p addon-repo -- catalog-update $env:ADDON $env:VERSION $env:REPOSITORY $exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          Copy-Item release-source/catalog/index.json catalog/index.json
+          Remove-Item catalog/index.json.sig -ErrorAction SilentlyContinue
+      - name: Open unsigned catalog PR
+        shell: pwsh
+        env:
+          # Fine-grained bot token: this repo only, Contents + Pull requests write.
+          # A separate credential also allows the resulting PR to trigger CI.
+          GH_TOKEN: ${{ secrets.CATALOG_PR_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ADDON: ${{ needs.build.outputs.addon }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          if (!$env:GH_TOKEN) { throw 'Configure CATALOG_PR_TOKEN to open the catalog PR; release assets are already published. Re-run this job after configuration.' }
+          $branch = "catalog/$env:ADDON-v$env:VERSION"
+          git switch -c $branch
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot create catalog branch' }
+          git config user.name 'toolboks-catalog-bot'
+          git config user.email 'toolboks-catalog-bot@users.noreply.github.com'
+          git add -- catalog
+          git commit -m "Catalog: $env:ADDON $env:VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot commit catalog' }
+          gh auth setup-git
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot configure bot authentication' }
+          git push origin $branch
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot push catalog branch (an existing branch is never overwritten)' }
+          'Unsigned catalog update. Review the URL, checksum, size and host compatibility. Mark verified only after review. Refresh sequence/expiry against latest main, sign offline with the host catalog-sign tool, verify, then merge. Never put private keys in CI.' | Set-Content pr-body.md -Encoding utf8
+          gh pr create --base main --head $branch --title "Catalog: $env:ADDON $env:VERSION" --body-file pr-body.md
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -13,6 +13,12 @@ Local Windows checks, 2026-11-14, stable Rust 1.100.0:
   unknown add-on, version mismatch and off-main commit rejected in a disposable local repository.
 - `actionlint`: passed for both workflows. Action commit pins resolve on GitHub.
 
+CI follow-up: the tag-validation test passed its assertions but left the expected
+off-main `git merge-base` exit code at 1. Reproduced using GitHub's PowerShell wrapper
+pattern (`if (Test-Path variable:\LASTEXITCODE) { exit $LASTEXITCODE }`). After clearing
+the native exit code only on successful completion, the same wrapper exits 0 and all
+rejection assertions still pass. `actionlint` also passes after the correction.
+
 No production tags or GitHub releases were created. Actual publication/catalog-PR flow
 requires merging to main, configuring the documented bot token and pushing a release tag.
 Catalog signing remains the owner's offline step. The headless stdio protocol test is

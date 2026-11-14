@@ -50,3 +50,8 @@ edition = "2021"
     }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
+
+# The expected off-main rejection leaves git's native exit code at 1. GitHub's
+# PowerShell wrapper exits with that value even though we caught the exception.
+# Clear it only after every assertion and cleanup have completed successfully.
+$global:LASTEXITCODE = 0

@@ -1,0 +1,11 @@
+[package]
+name = "addon-repo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+toolboks-addon-sdk.workspace = true
+toolboks-addon-proto.workspace = true
+toolboks-catalog.workspace = true
+serde_json.workspace = true

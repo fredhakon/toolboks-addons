@@ -1,0 +1,3 @@
+* text=auto eol=lf
+catalog/index.json -text
+catalog/index.json.sig -text

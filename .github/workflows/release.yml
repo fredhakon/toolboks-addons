@@ -120,13 +120,18 @@ jobs:
       - name: Open unsigned catalog PR
         shell: pwsh
         env:
-          # Fine-grained bot token: this repo only, Contents + Pull requests write.
+          # Fine-grained bot token: this repo only, Contents + Pull requests write. Optional: without
+          # it the release is still published and the catalog entry is added by hand with
+          # `addon-repo catalog-update` from the published executable (see README).
           GH_TOKEN: ${{ secrets.CATALOG_PR_TOKEN }}
           GH_REPO: ${{ github.repository }}
           ADDON: ${{ needs.build.outputs.addon }}
           VERSION: ${{ needs.build.outputs.version }}
         run: |
-          if (!$env:GH_TOKEN) { throw 'Configure CATALOG_PR_TOKEN to open the catalog PR; release assets are already published. Re-run this job after configuration.' }
+          if (!$env:GH_TOKEN) {
+            Write-Host "::notice::CATALOG_PR_TOKEN is not set, so no catalog pull request was opened. The release assets are published; add the catalog entry with addon-repo catalog-update."
+            exit 0
+          }
           $branch = "catalog/$env:ADDON-v$env:VERSION"
           git switch -c $branch
           if ($LASTEXITCODE -ne 0) { throw 'Cannot create catalog branch' }

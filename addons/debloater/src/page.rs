@@ -11,7 +11,8 @@ use super::services::{self, ServiceDef, ServiceState};
 use super::startup::{self, Class, Entry, Source};
 use super::style::{self, Chip};
 use super::tasks::{self, TaskDef, TaskState};
-use super::{backend, catalog, plan, Debloater, ServiceJob, TaskJob};
+use super::{admin, backend, catalog, plan, AdminKind, Debloater, ServiceJob, TaskJob};
+use toolboks_addon_sdk::{AdminOutcome, AdminRequest, HostRequest};
 use toolboks_shared::elevation;
 use toolboks_shared::ui::{self, AMBER, GAP, GREEN, MUTED, SPACE_M};
 
@@ -124,45 +125,105 @@ fn restore_description(text: &str) -> String {
 
 impl Debloater {
     /// The "Create a restore point first" switch with its notes.
-    fn restore_switch(&mut self, ui: &mut egui::Ui, busy: bool) {
-        let elevated = self.env.elevated;
+    /// `helper` is true where the administrator helper can make the restore point for the page.
+    fn restore_switch(&mut self, ui: &mut egui::Ui, busy: bool, helper: bool) {
+        let usable = self.env.elevated || helper;
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(elevated && !busy, |ui| {
+            ui.add_enabled_ui(usable && !busy, |ui| {
                 ui::toggle_switch(ui, &mut self.restore.on);
             });
             ui.label("Create a restore point first");
         });
-        if !elevated {
+        if !usable {
             style::note(ui, "Needs admin");
+        } else if helper && self.restore.on {
+            style::note(ui, "A separate administrator window asks you to confirm.");
         }
         style::note(ui, RESTORE_NOTE);
     }
 
-    /// Starts an apply: with the switch on, a restore point is made on a worker first.
-    fn start_apply(&mut self, ctx: &egui::Context, ids: &[&'static str]) {
+    /// Sends one administrator request. The separate helper checks it, shows its own Confirm /
+    /// Cancel window and only then changes anything; nothing here can approve it.
+    fn send_admin(&mut self, kind: AdminKind, json: String) {
+        self.next_request = self.next_request.wrapping_add(1);
+        self.admin_pending = Some((self.next_request, kind));
+        self.request = Some(HostRequest::AdminOperation(AdminRequest {
+            id: self.next_request,
+            operation: admin::OPERATION.into(),
+            json,
+        }));
+    }
+
+    /// The helper answered. This only shows the outcome; it never authorizes anything.
+    pub(super) fn admin_finished(&mut self, id: u64, outcome: AdminOutcome) {
+        let Some((pending, kind)) = self.admin_pending else {
+            return;
+        };
+        if pending != id {
+            return;
+        }
+        self.admin_pending = None;
+        match outcome {
+            AdminOutcome::Cancelled => {
+                self.message = Some("Cancelled. Nothing was changed.".to_string());
+            }
+            AdminOutcome::Failed { reason } => self.message = Some(reason),
+            AdminOutcome::Completed { json } => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                match kind {
+                    AdminKind::RegistryApply => self.registry_applied(&value),
+                    AdminKind::RegistryUndo => self.registry_undone(&value),
+                }
+            }
+        }
+        self.refresh();
+    }
+
+    fn registry_applied(&mut self, value: &serde_json::Value) {
+        if let Some(text) = value["restore"].as_str() {
+            self.restore.status = Some(text.to_owned());
+        }
+        if value["blocked"].as_bool() == Some(true) {
+            self.message = Some("Nothing was changed.".to_string());
+            return;
+        }
+        let run = admin::run_from_json(value);
+        self.message = Some(summarize(&run));
+        self.run_notes = run_notes(&run);
+        if !run.undo.is_empty() {
+            self.undo_runs.push(run.undo);
+        }
+    }
+
+    fn registry_undone(&mut self, value: &serde_json::Value) {
+        let total = value["total"].as_u64().unwrap_or(0) as usize;
+        let remaining = admin::steps_from_json(&value["remaining"]);
+        self.message = Some(undo_summary(total, remaining.len()));
+        if remaining.is_empty() {
+            self.undo_runs.pop();
+        } else if let Some(last) = self.undo_runs.last_mut() {
+            *last = remaining;
+        }
+        self.run_notes.clear();
+    }
+
+    /// Starts an apply. An item that writes the machine-wide registry, or a restore point, needs
+    /// administrator rights and goes through the helper; everything else runs here as before.
+    fn start_apply(&mut self, _ctx: &egui::Context, ids: &[&'static str]) {
         self.confirming = false;
         self.restore.status = None;
-        if self.restore.creating.is_some() {
+        if self.admin_pending.is_some() {
             return;
         }
-        if !should_create(self.restore.on, self.env.elevated, false) {
-            self.apply_selected(ids);
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        let ids = ids.to_vec();
-        let elevated = self.env.elevated;
-        std::thread::spawn(move || {
-            let status = restore::create(
-                &mut restore::WinRestore,
-                &restore_description("privacy and ads changes"),
-                elevated,
+        if admin::needs_helper(ids, self.restore.on) {
+            self.send_admin(
+                AdminKind::RegistryApply,
+                admin::registry_apply_request(ids, self.restore.on),
             );
-            let _ = tx.send((status, ids));
-            ctx.request_repaint();
-        });
-        self.restore.creating = Some(rx);
+            return;
+        }
+        self.apply_selected(ids);
     }
 
     fn restore_poll(&mut self) {
@@ -417,19 +478,24 @@ impl Debloater {
         if review.needs_admin > 0 {
             ui.add_space(GAP);
             ui.label(format!("{} need administrator rights", review.needs_admin));
-            style::note(ui, ADMIN_UNAVAILABLE);
+            style::note(
+                ui,
+                "A separate administrator window shows exactly what will change. Confirm or cancel there.",
+            );
         }
 
         style::divider(ui);
-        let applicable = review.changes - review.needs_admin;
+        let applicable = review.changes;
         if applicable == 0 {
             self.confirming = false;
         }
         let apply_label = format!("Apply {}", plural(applicable, "change", "changes"));
-        let creating = self.restore.creating.is_some();
-        self.restore_switch(ui, creating);
+        let creating = self.restore.creating.is_some() || self.admin_pending.is_some();
+        self.restore_switch(ui, creating, true);
         ui.add_space(GAP);
-        if creating {
+        if self.admin_pending.is_some() {
+            style::note(ui, "Waiting for the administrator window...");
+        } else if creating {
             style::note(ui, "Creating restore point...");
         } else if self.confirming {
             ui.label(format!(
@@ -450,13 +516,6 @@ impl Debloater {
         {
             self.confirming = true;
         }
-        if review.needs_admin > 0 && !self.confirming {
-            style::note(
-                ui,
-                &format!("{} need admin and will be skipped", review.needs_admin),
-            );
-        }
-
         for note in &self.run_notes {
             ui.add(egui::Label::new(RichText::new(note).small().color(AMBER)).wrap());
         }
@@ -493,6 +552,16 @@ impl Debloater {
     }
 
     fn undo_last_run(&mut self) {
+        if self.admin_pending.is_some() {
+            return;
+        }
+        if let Some(steps) = self.undo_runs.last() {
+            if steps.iter().any(|op| op.hive == Hive::LocalMachine) {
+                let request = admin::registry_undo_request(steps);
+                self.send_admin(AdminKind::RegistryUndo, request);
+                return;
+            }
+        }
         let Some(steps) = self.undo_runs.last_mut() else {
             return;
         };
@@ -1565,7 +1634,7 @@ impl Debloater {
 
         style::divider(ui);
         let busy = self.tasks_busy();
-        self.restore_switch(ui, busy);
+        self.restore_switch(ui, busy, false);
         if self.restore.on && self.env.elevated && self.restore.tasks_done {
             style::note(ui, "A restore point was already made this session.");
         }
@@ -1988,7 +2057,7 @@ impl Debloater {
 
         style::divider(ui);
         let busy = self.services_busy();
-        self.restore_switch(ui, busy);
+        self.restore_switch(ui, busy, false);
         if self.restore.on && self.env.elevated && self.restore.services_done {
             style::note(ui, "A restore point was already made this session.");
         }

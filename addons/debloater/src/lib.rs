@@ -6,16 +6,26 @@
 use std::collections::HashSet;
 use std::sync::mpsc::Receiver;
 
-use toolboks_addon_sdk::{NativeAddon, TutorialStep};
+use toolboks_addon_sdk::{AdminOutcome, AdminRequest, HostRequest, NativeAddon, TutorialStep};
+
+pub use admin::prepare_admin;
 
 // The UI-free engine lives in its own crate; re-exported so `debloat::<module>` paths keep working.
 pub use toolboks_debloat_engine::{
     apps, backend, catalog, model, plan, restore, services, startup, tasks, ChangeError,
 };
 
+mod admin;
 mod page;
 mod style;
 mod tutorial;
+
+/// What an administrator request that is waiting for its answer was for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdminKind {
+    RegistryApply,
+    RegistryUndo,
+}
 
 /// State of the Apps page. Package calls are slow, so they run on worker threads and report
 /// back over these channels.
@@ -160,6 +170,11 @@ pub struct Debloater {
     restore: RestoreState,
     /// Which page is shown: 0 Privacy and ads, 1 Apps, 2 Startup, 3 Tasks, 4 Services.
     page: usize,
+    /// The administrator request waiting to be sent to the host.
+    request: Option<HostRequest>,
+    next_request: u64,
+    /// The request that has been sent and not answered yet, and what it was for.
+    admin_pending: Option<(u64, AdminKind)>,
 }
 
 impl Debloater {
@@ -181,6 +196,9 @@ impl Debloater {
             services: ServicesState::default(),
             restore: RestoreState::default(),
             page: 0,
+            request: None,
+            next_request: 0,
+            admin_pending: None,
         }
     }
 }
@@ -220,6 +238,21 @@ impl NativeAddon for Debloater {
     }
     fn page_index(&self) -> usize {
         self.page
+    }
+    fn prepare_admin(
+        &mut self,
+        request: &AdminRequest,
+    ) -> Result<Box<dyn toolboks_addon_sdk::admin::AdminChange>, String> {
+        admin::prepare_admin(request)
+    }
+    fn admin_result(&mut self, id: u64, outcome: AdminOutcome) {
+        self.admin_finished(id, outcome);
+    }
+    fn take_host_request(&mut self) -> Option<HostRequest> {
+        self.request.take()
+    }
+    fn has_background_work(&self) -> bool {
+        self.admin_pending.is_some()
     }
     /// Drops what was read from Windows. Results and undo steps of this session stay in memory.
     fn suspend(&mut self) {

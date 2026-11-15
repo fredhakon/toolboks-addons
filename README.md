@@ -8,7 +8,9 @@ is only a small pipeline fixture.
 
 - `addons/<name>/`: one crate, one `<name>.tbaddon` SDK manifest, and `tests/protocol.rs`.
 - `catalog/index.json`: the host's format 1, initially empty and unsigned.
-- `tools/repo/`: manifest/index validation and release-to-catalog automation using host types.
+- `tools/repo/`: manifest/index validation, release-to-catalog automation using host types,
+  and the `measure` command.
+- `budgets.json`: the size, start-up and memory limits `measure` checks.
 - `.github/workflows/`: Windows PR CI and isolated per-add-on releases.
 
 Folder, crate and executable names must agree. The manifest version matches Cargo's
@@ -39,6 +41,28 @@ cargo test --locked -p hello --test protocol
 
 PR CI runs these checks for all add-ons. For interactive inspection, use the pinned
 host's `cargo run --example addon_host -- <absolute-hello.exe-path> toolboks.hello`.
+
+## Budgets
+
+Every add-on is a separate process, so each one has to stay small (host issue #97).
+`budgets.json` holds the limits: the first frame within 1000 ms of starting the exe, and
+under 25 MB of memory when idle.
+
+```powershell
+cargo build --locked --release -p hello
+cargo run --locked -p addon-repo -- measure            # every add-on; fails when one is over
+cargo run --locked -p addon-repo -- measure hello --report-only --json target/measure.json
+```
+
+It starts each release exe 5 times (`--runs <n>` changes that) the way the protocol test
+does, and prints the median: exe size, time to the handshake, time to the first drawn
+frame, and memory after 3 idle seconds. "Idle memory" is the working set, which is at least
+what Task Manager shows; "Private bytes" is the memory only that process holds. PR CI runs
+it in report-only mode and puts the table in the job summary.
+
+It measures the add-on alone. The named pipes, the launch token and the host's own drawing
+are not part of it, and neither are the host budgets (host exe size, no process for a hidden
+add-on); those are checked in the host repository.
 
 ## Release flow
 

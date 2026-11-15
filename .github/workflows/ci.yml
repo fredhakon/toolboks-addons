@@ -34,3 +34,13 @@ jobs:
             cargo test --locked -p $addon.Name --test protocol
             if ($LASTEXITCODE -ne 0) { throw 'Release protocol test failed' }
           }
+      # Size, start time and idle memory of every release exe (host issue #97). Report only:
+      # shared runners are too uneven to fail a pull request on timing.
+      - name: Measure add-ons against the budgets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $report = cargo run --quiet --locked -p addon-repo -- measure --report-only --json target/measure.json
+          if ($LASTEXITCODE -ne 0) { throw 'Measuring failed' }
+          $report | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $report

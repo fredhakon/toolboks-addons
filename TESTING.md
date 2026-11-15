@@ -24,3 +24,11 @@ requires merging to main, configuring the documented bot token and pushing a rel
 Catalog signing remains the owner's offline step. The headless stdio protocol test is
 adapted from the pinned host sample; named-pipe authentication and graphical integration
 remain host-side checks.
+
+## Budgets (host #97), 2026-11-15
+
+`cargo run --locked -p addon-repo -- measure` on a Windows 11 PC, release build, median of
+5 starts: `hello` is 2.7 MB on disk, completes the handshake in 5 ms, draws its first frame
+in 21 ms and holds 7.0 MB of working set (2.1 MB private) after 3 idle seconds. Both budgets
+are met. With the budgets set below those numbers the command exits 1; with `--report-only`
+it exits 0.

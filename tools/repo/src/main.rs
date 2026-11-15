@@ -7,6 +7,8 @@ use std::{
 use toolboks_addon_sdk::Package;
 use toolboks_catalog::{Channel, Entry, Index, Kind};
 
+mod measure;
+
 fn package(name: &str) -> Package {
     assert!(
         !name.is_empty()
@@ -101,8 +103,9 @@ fn main() {
         ["catalog-update", name, version, repository, exe] => {
             update(name, version, repository, Path::new(exe))
         }
+        ["measure", options @ ..] => measure::measure(options),
         _ => panic!(
-            "usage: addon-repo validate | catalog-update <name> <version> <owner/repo> <exe>"
+            "usage: addon-repo validate | catalog-update <name> <version> <owner/repo> <exe> | measure [--report-only] [--runs <n>] [--json <file>] [<add-on>...]"
         ),
     }
 }

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "manifest": {
+    "id": "toolboks.memory-cleaner",
+    "title": "Memory Cleaner",
+    "native_provider": "toolboks.memory-cleaner",
+    "description": "Keep an eye on memory and clean up what idle apps are holding.",
+    "long_description": "Memory Cleaner shows how your memory is used, which apps hold the most, and how close Windows is to running short. It can trim the memory that idle apps are not using, by hand or automatically when memory is under real pressure, and it keeps a short history. Trimming moves memory into the cache and never closes an app. One advanced action, clearing the low-priority cache, changes how Windows manages memory for the whole PC: it asks for administrator rights in a separate window and only runs when you confirm there. Nothing is stored between runs.",
+    "version": "0.1.0",
+    "author": "Toolboks team",
+    "publisher": "Toolboks",
+    "category": "System tools",
+    "icon": "chip",
+    "accent": "#A48ACA",
+    "api_version": 2,
+    "min_toolboks_version": "0.12.5",
+    "website": "https://github.com/Gusseti/toolboks",
+    "support_url": "https://github.com/Gusseti/toolboks/issues",
+    "license": "MIT",
+    "capabilities": [
+      "host_metrics",
+      "system_tuning"
+    ]
+  },
+  "pages": []
+}

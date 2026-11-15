@@ -177,7 +177,7 @@ impl Panel {
                         .clicked()
                     {
                         backend::refresh(&self.service);
-                        self.health.lock().unwrap().clear();
+                        crate::health::clear(&self.health);
                     }
                 })
             });

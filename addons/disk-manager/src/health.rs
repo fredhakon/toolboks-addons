@@ -116,7 +116,8 @@ pub fn parse_ata(page: &[u8]) -> Result<DriveHealth, ParseError> {
         spare_threshold: None,
         temperature_c: temperature,
         media_errors: None,
-        unsafe_shutdowns: raw32(174).or(raw32(192)),
+        // Only 174 (unexpected power loss); 192 is often a power-off retract count instead.
+        unsafe_shutdowns: raw32(174),
         power_on_hours: raw32(9),
         reallocated: raw32(5),
         pending: raw32(197),
@@ -143,10 +144,12 @@ impl Verdict {
 /// Conservative verdict over the reported values only; a missing value never raises it.
 ///
 /// Replace soon: an NVMe critical warning for spare, reliability, read-only or backup
-/// (bits 0, 2, 3, 4); spare below the drive's own threshold; wear at 90% or more; or 100 or
-/// more reallocated, pending and uncorrectable sectors together.
+/// (bits 0, 2, 3, 4); spare below the drive's own threshold; NVMe wear at 90% or more; or 100
+/// or more reallocated, pending and uncorrectable sectors together.
 /// Watch: the NVMe temperature warning (bit 1); wear at 70% or more; any media error; any
 /// reallocated, pending or uncorrectable sector; or a temperature of 70 °C or more.
+/// SATA wear comes from vendor-defined attributes (231, 233, 177), so it is an estimate and
+/// never raises the verdict beyond Watch on its own; Replace soon on SATA needs sector evidence.
 pub fn verdict(h: &DriveHealth) -> (Verdict, String) {
     let mut found: Vec<(Verdict, String)> = vec![];
     let mut add = |v, text: String| found.push((v, text));
@@ -173,7 +176,7 @@ pub fn verdict(h: &DriveHealth) -> (Verdict, String) {
         }
     }
     match h.wear_used {
-        Some(w) if w >= 90 => add(
+        Some(w) if w >= 90 && h.protocol == Protocol::Nvme => add(
             Verdict::ReplaceSoon,
             format!("{w}% of the rated write endurance is used."),
         ),
@@ -258,7 +261,7 @@ pub fn rows(h: &DriveHealth) -> Vec<(&'static str, Option<String>)> {
             ),
         ],
         Protocol::Ata => vec![
-            ("Wear", wear),
+            ("Wear (estimated)", wear),
             ("Temperature", temperature),
             ("Reallocated sectors", n(h.reallocated)),
             ("Pending sectors", n(h.pending)),
@@ -277,7 +280,7 @@ pub enum ReadError {
     Other(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
     pub model: String,
     pub health: DriveHealth,
@@ -367,7 +370,9 @@ fn read(letter: &str) -> Result<(Protocol, String, Vec<u8>), ReadError> {
     }
     let volume = open(&format!(r"\\.\{letter}"), 0)?;
     let mut number = [0u8; std::mem::size_of::<STORAGE_DEVICE_NUMBER>()];
-    ioctl(&volume, IOCTL_STORAGE_GET_DEVICE_NUMBER, &[], &mut number)?;
+    if ioctl(&volume, IOCTL_STORAGE_GET_DEVICE_NUMBER, &[], &mut number)? < number.len() {
+        return Err(ReadError::Unsupported);
+    }
     drop(volume);
     let disk = format!(r"\\.\PhysicalDrive{}", u32_at(&number, 4));
     // Access 0 is enough for storage queries and needs no administrator rights.
@@ -453,11 +458,22 @@ fn read(letter: &str) -> Result<(Protocol, String, Vec<u8>), ReadError> {
         )
     }
     .map_err(map)?;
+    if !ata_complete(returned as usize, smart.header.DataTransferLength as usize) {
+        return Err(ReadError::Unsupported);
+    }
     // Status register error bit: the drive refused the SMART command.
     if smart.header.CurrentTaskFile[6] & 1 != 0 {
         return Err(ReadError::Unsupported);
     }
     Ok((Protocol::Ata, model, smart.data.to_vec()))
+}
+/// True when an ATA pass-through returned the header and a full SMART page.
+fn ata_complete(returned: usize, transferred: usize) -> bool {
+    #[cfg(windows)]
+    let header = std::mem::size_of::<windows::Win32::Storage::IscsiDisc::ATA_PASS_THROUGH_EX>();
+    #[cfg(not(windows))]
+    let header = 0;
+    returned >= header + PAGE && transferred >= PAGE
 }
 #[cfg(not(windows))]
 fn read(_: &str) -> Result<(Protocol, String, Vec<u8>), ReadError> {
@@ -465,19 +481,39 @@ fn read(_: &str) -> Result<(Protocol, String, Vec<u8>), ReadError> {
 }
 
 /// Health per drive letter. `None` while the background read runs.
-pub type Cache = Arc<Mutex<BTreeMap<String, Option<Result<Report, ReadError>>>>>;
+#[derive(Default)]
+pub struct State {
+    generation: u64,
+    results: BTreeMap<String, Option<Result<Report, ReadError>>>,
+}
+pub type Cache = Arc<Mutex<State>>;
+
+/// Forgets every result; reads still running from before are discarded when they finish.
+pub fn clear(cache: &Cache) {
+    let mut s = cache.lock().unwrap();
+    s.generation += 1;
+    s.results.clear();
+}
+
+/// Stores a finished read unless the cache was cleared after it started.
+fn store(cache: &Cache, generation: u64, letter: String, result: Result<Report, ReadError>) {
+    let mut s = cache.lock().unwrap();
+    if s.generation == generation {
+        s.results.insert(letter, Some(result));
+    }
+}
 
 /// Returns the cached result, starting a background read the first time a letter is asked for.
 pub fn get(cache: &Cache, letter: &str) -> Option<Result<Report, ReadError>> {
-    let mut map = cache.lock().unwrap();
-    if let Some(entry) = map.get(letter) {
+    let mut s = cache.lock().unwrap();
+    if let Some(entry) = s.results.get(letter) {
         return entry.clone();
     }
-    map.insert(letter.into(), None);
-    let (cache, letter) = (cache.clone(), letter.to_string());
+    s.results.insert(letter.into(), None);
+    let (cache, letter, generation) = (cache.clone(), letter.to_string(), s.generation);
     std::thread::spawn(move || {
         let result = report(&letter);
-        cache.lock().unwrap().insert(letter, Some(result));
+        store(&cache, generation, letter, result);
     });
     None
 }
@@ -684,7 +720,7 @@ mod tests {
         .unwrap();
         assert_eq!(h.wear_used, None);
         assert_eq!(h.temperature_c, None);
-        assert_eq!(h.unsafe_shutdowns, Some(88));
+        assert_eq!(h.unsafe_shutdowns, None, "192 is not unsafe shutdowns");
         let (v, reason) = verdict(&h);
         assert_eq!(v, Verdict::Watch);
         assert!(reason.contains("10 reallocated"), "{reason}");
@@ -695,7 +731,12 @@ mod tests {
         // SSD life left attribute 231 at 8% left.
         let h = parse_ata(&ata(&[(231, 8, 0)])).unwrap();
         assert_eq!(h.wear_used, Some(92));
-        assert_eq!(verdict(&h).0, Verdict::ReplaceSoon);
+        assert_eq!(
+            verdict(&h).0,
+            Verdict::Watch,
+            "estimated SATA wear alone stays Watch"
+        );
+        assert!(rows(&h).contains(&("Wear (estimated)", Some("92% used (8% left)".into()))));
     }
 
     #[test]
@@ -717,6 +758,31 @@ mod tests {
         );
         let h = parse_ata(&ata(&[(194, 100, 0), (231, 0, 0)])).unwrap();
         assert_eq!((h.temperature_c, h.wear_used), (None, None));
+    }
+
+    #[test]
+    fn reads_from_before_a_refresh_are_discarded() {
+        let cache = Cache::default();
+        cache.lock().unwrap().results.insert("C:".into(), None);
+        let old = cache.lock().unwrap().generation;
+        clear(&cache);
+        store(&cache, old, "C:".into(), Err(ReadError::NotFound));
+        assert!(cache.lock().unwrap().results.is_empty());
+        let now = cache.lock().unwrap().generation;
+        store(&cache, now, "C:".into(), Err(ReadError::Unsupported));
+        assert_eq!(
+            cache.lock().unwrap().results.get("C:"),
+            Some(&Some(Err(ReadError::Unsupported)))
+        );
+    }
+
+    #[test]
+    fn ata_pass_through_needs_a_full_page() {
+        let header = if cfg!(windows) { 48 } else { 0 };
+        assert!(ata_complete(header + PAGE, PAGE));
+        assert!(!ata_complete(header + PAGE - 1, PAGE));
+        assert!(!ata_complete(header + PAGE, PAGE - 1));
+        assert!(!ata_complete(0, 0));
     }
 
     /// Prints what this PC reports for C: without administrator rights.

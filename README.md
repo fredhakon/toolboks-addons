@@ -246,8 +246,15 @@ for registry locations the catalog itself lists.
   request), refuses names the engine never offers, and runs the unchanged engine. Task Scheduler
   work runs on its own thread inside the helper because it uses COM. An undo batch is undone newest
   first and never puts an older value over a newer one that failed.
-- **Not yet: startup entries that need administrator rights** (all-users entries). Still listed
-  and marked "Needs admin", but off.
+- **Done: Startup entries that need administrator rights** (all-users Run keys and the all-users
+  Startup folder). Switching one on or off, and undoing a batch that includes one, go through the
+  helper (kinds `startup_set` and `startup_undo`). The helper re-reads the real startup list and
+  only accepts an entry that is in it (source and name), refuses the protected ones, and builds the
+  preview from the real entry (name, publisher, command, scope). Undo values are accepted only as
+  absent or exactly 12 bytes, for entries that still exist. Entries for your own account still
+  change in the add-on without a prompt.
+
+All families are now done, so nothing in the Debloater is listed as unavailable any more.
 
 Real UAC validation of the new operations has not been done; the owner chose to test on use and
 report anything found.

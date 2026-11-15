@@ -18,10 +18,6 @@ use toolboks_shared::ui::{self, AMBER, GAP, GREEN, MUTED, SPACE_M};
 
 const INSPECTOR_WIDTH: f32 = 256.0;
 
-/// Shown where the built-in tool offered to restart the whole app as administrator. This add-on
-/// never runs elevated; its own administrator helper is not built yet.
-const ADMIN_UNAVAILABLE: &str = "This needs administrator rights, which this add-on cannot request yet. The change is listed but not available here.";
-
 /// Text for the state column of a row.
 fn state_text(status: Status) -> &'static str {
     if status.applicable == Applicable::EditionNotSupported {
@@ -174,6 +170,10 @@ impl Debloater {
             self.finish_job(kind, outcome);
             return;
         }
+        if matches!(kind, AdminKind::StartupSet | AdminKind::StartupUndo) {
+            self.finish_startup(kind, outcome);
+            return;
+        }
         match outcome {
             AdminOutcome::Cancelled => {
                 self.message = Some("Cancelled. Nothing was changed.".to_string());
@@ -264,9 +264,65 @@ impl Debloater {
                     });
                 }
             }
-            AdminKind::RegistryApply | AdminKind::RegistryUndo => {}
+            _ => {}
         }
         self.refresh();
+    }
+
+    /// The helper's answer for a startup request: the same messages and undo steps the page used to
+    /// produce when it changed the entry itself.
+    fn finish_startup(&mut self, kind: AdminKind, outcome: AdminOutcome) {
+        let value = match &outcome {
+            AdminOutcome::Completed { json } => {
+                serde_json::from_str::<serde_json::Value>(json).ok()
+            }
+            _ => None,
+        };
+        let stopped = match outcome {
+            AdminOutcome::Cancelled => "Cancelled. Nothing was changed.".to_string(),
+            AdminOutcome::Failed { reason } => reason,
+            AdminOutcome::Completed { .. } => {
+                "The administrator helper returned an unreadable answer.".to_string()
+            }
+        };
+        match kind {
+            AdminKind::StartupSet => {
+                let (name, enable) = self.pending_startup.take().unwrap_or_default();
+                let result = match &value {
+                    Some(value) => admin::change_from_json(value, admin::startup_step_from).0,
+                    None => Err(stopped.into()),
+                };
+                self.startup.message = Some(match result {
+                    Ok(step) => {
+                        self.startup.steps.push(step);
+                        format!("{name} is now {}.", if enable { "on" } else { "off" })
+                    }
+                    Err(e) => {
+                        let message = format!("Could not change {name}: {e}");
+                        self.startup.steps.extend(e.recovery);
+                        message
+                    }
+                });
+            }
+            AdminKind::StartupUndo => {
+                let batch = std::mem::take(&mut self.startup_batch);
+                let mut remaining = std::mem::take(&mut self.startup_rest);
+                let (done, kept) = match &value {
+                    Some(value) => admin::undo_batch_from_json(value, admin::startup_step_from),
+                    None => (0, batch),
+                };
+                let failed = kept.len();
+                remaining.extend(kept.into_iter().rev());
+                self.startup.steps = remaining;
+                self.startup.message = Some(if value.is_none() {
+                    stopped
+                } else {
+                    startup_undo_summary(done, failed)
+                });
+            }
+            _ => {}
+        }
+        self.startup.started = false;
     }
 
     fn registry_applied(&mut self, value: &serde_json::Value) {
@@ -1157,6 +1213,17 @@ impl Debloater {
     /// One registry write on the UI thread, then reload the list.
     fn startup_set(&mut self, entry: &Entry, enable: bool) {
         self.startup.pending = None;
+        if entry.source.needs_admin() {
+            if self.admin_pending.is_some() {
+                return;
+            }
+            self.pending_startup = Some((entry.name.clone(), enable));
+            self.send_admin(
+                AdminKind::StartupSet,
+                admin::startup_set_request(entry, enable),
+            );
+            return;
+        }
         let result = startup::set_enabled(&mut startup::WinStartup, entry, enable, filetime_now());
         self.startup.message = Some(match result {
             Ok(step) => {
@@ -1177,6 +1244,29 @@ impl Debloater {
     }
 
     fn startup_undo(&mut self, all: bool) {
+        if self.admin_pending.is_some() {
+            return;
+        }
+        // The steps this click would undo, newest last. If any of them is an all-users entry the
+        // helper undoes the whole batch; otherwise it runs here as before.
+        let take = if all {
+            self.startup.steps.len()
+        } else {
+            self.startup.steps.len().min(1)
+        };
+        let from = self.startup.steps.len() - take;
+        if self.startup.steps[from..]
+            .iter()
+            .any(|step| step.source.needs_admin())
+        {
+            let mut batch = self.startup.steps.split_off(from);
+            batch.reverse();
+            let request = admin::startup_undo_request(&batch);
+            self.startup_batch = batch;
+            self.startup_rest = std::mem::take(&mut self.startup.steps);
+            self.send_admin(AdminKind::StartupUndo, request);
+            return;
+        }
         let (done, failed) = run_undo(
             &mut self.startup.steps,
             all,
@@ -1270,7 +1360,7 @@ impl Debloater {
     fn startup_row(&mut self, ui: &mut egui::Ui, entry: &Entry) -> Option<(Entry, bool)> {
         let key = (entry.source, entry.name.clone());
         let focused = self.startup.focus.as_ref() == Some(&key);
-        let blocked = needs_admin_now(entry, self.env.elevated);
+        let blocked = needs_admin_now(entry, self.machine_ok());
         let locked = entry.class == Class::Never;
 
         let mut chips = Vec::new();
@@ -1353,11 +1443,14 @@ impl Debloater {
             .startup
             .entries
             .iter()
-            .any(|e| needs_admin_now(e, self.env.elevated))
+            .any(|e| e.class != Class::Never && e.source.needs_admin())
         {
             style::divider(ui);
-            ui.label("Some items need administrator rights.");
-            style::note(ui, ADMIN_UNAVAILABLE);
+            ui.label("Items for all users need administrator rights.");
+            style::note(
+                ui,
+                "A separate administrator window shows exactly what will change. Confirm or cancel there.",
+            );
         }
 
         style::divider(ui);

@@ -2023,8 +2023,8 @@ impl Debloater {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::debloat::model::Edition;
-    use crate::tools::debloat::startup::UndoStep;
+    use crate::model::Edition;
+    use crate::startup::UndoStep;
 
     fn task_def(id: &'static str, risk: Risk) -> TaskDef {
         TaskDef {

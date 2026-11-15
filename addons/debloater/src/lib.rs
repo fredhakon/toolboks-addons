@@ -6,8 +6,6 @@
 use std::collections::HashSet;
 use std::sync::mpsc::Receiver;
 
-use egui;
-
 use toolboks_addon_sdk::{NativeAddon, TutorialStep};
 
 // The UI-free engine lives in its own crate; re-exported so `debloat::<module>` paths keep working.
@@ -197,12 +195,23 @@ impl Default for Debloater {
 pub const PAGES: [&str; 5] = ["Privacy and ads", "Apps", "Startup", "Tasks", "Services"];
 pub const ID: &str = "toolboks.debloater";
 
+/// Applies the Toolboks look (fonts, text sizes, spacing, colours) the first time the add-on
+/// draws. The add-on runs in its own process, so the host's own set-up does not reach it.
+fn style_once(ctx: &egui::Context) {
+    let id = egui::Id::NULL.with("toolboks-style-applied");
+    if !ctx.data(|data| data.get_temp::<bool>(id)).unwrap_or(false) {
+        toolboks_shared::ui::apply_style(ctx);
+        ctx.data_mut(|data| data.insert_temp(id, true));
+    }
+}
+
 impl NativeAddon for Debloater {
     fn ui(
         &mut self,
         ui: &mut egui::Ui,
         _preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
     ) -> bool {
+        style_once(ui.ctx());
         self.page_ui(ui, self.page);
         false
     }

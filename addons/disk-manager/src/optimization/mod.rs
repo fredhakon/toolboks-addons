@@ -13,6 +13,7 @@ pub(super) struct Panel {
     tour_selection: Option<String>,
     pending: Option<u64>,
     next_id: u64,
+    health: crate::health::Cache,
 }
 impl Default for Panel {
     fn default() -> Self {
@@ -25,6 +26,7 @@ impl Default for Panel {
             tour_selection: None,
             pending: None,
             next_id: 0,
+            health: Default::default(),
         }
     }
 }
@@ -175,6 +177,7 @@ impl Panel {
                         .clicked()
                     {
                         backend::refresh(&self.service);
+                        crate::health::clear(&self.health);
                     }
                 })
             });
@@ -198,6 +201,10 @@ impl Panel {
                     weak(ui,"The hardware did not expose a reliable media type. Windows will choose its appropriate optimization.");
                 }
                 ui.add_space(theme::SPACE_L);
+                if !tutorial {
+                    crate::health::show(ui, &self.health, &v.letter);
+                    ui.add_space(theme::SPACE_L);
+                }
                 let report = state.reports.get(&v.device_id);
                 guide::region(ui, "optimize-fragmentation", |ui| {
                     card().show(ui,|ui|{

@@ -251,7 +251,21 @@ pub fn preview(selected: &[&str]) -> Vec<String> {
 pub fn review_backup() -> Result<Vec<String>, String> {
     elevation::require_user_profile()?;
     let journal = load_journal(&root().join(JOURNAL))?;
-    review_registry(&journal, &WinRegistry)
+    let mut lines = review_registry(&journal, &WinRegistry)?;
+    lines.extend(power_review(&journal));
+    Ok(lines)
+}
+
+/// The restore also removes the power plan this profile created, so the review must say so.
+fn power_review(journal: &Journal) -> Option<String> {
+    journal
+        .power
+        .as_ref()
+        .filter(|plan| plan.attempted)
+        .map(|_| {
+            "Power plan • the Ultimate Performance plan Toolboks created is deleted, and your original plan is switched back on if the new one is active"
+                .to_string()
+        })
 }
 
 fn review_registry(journal: &Journal, registry: &impl Registry) -> Result<Vec<String>, String> {
@@ -756,5 +770,19 @@ mod tests {
         let output = format!("GUID for strømstyringsplan: {id} (Balansert) *");
         assert_eq!(guids(&output).collect::<Vec<_>>(), [id]);
         assert_eq!(guids("381b4222-f694-41f0-9685-ff5bb260df2x").next(), None);
+    }
+
+    #[test]
+    fn the_restore_review_mentions_the_power_plan_only_when_one_was_created() {
+        let mut journal = Journal::default();
+        assert!(power_review(&journal).is_none());
+        journal.power = Some(Power {
+            original: "a".into(),
+            created: "b".into(),
+            attempted: false,
+        });
+        assert!(power_review(&journal).is_none());
+        journal.power.as_mut().unwrap().attempted = true;
+        assert!(power_review(&journal).unwrap().contains("deleted"));
     }
 }

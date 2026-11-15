@@ -2,6 +2,7 @@
 mod category;
 mod explorer;
 mod folder_picker;
+mod health;
 mod map;
 mod optimization;
 mod saved_scan;

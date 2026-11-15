@@ -136,3 +136,18 @@ The built-in copy stays in the host until the final removal and "Restore your to
 #94). The tray's memory percentage is measured by the host itself and does not depend on this
 add-on. Measure with `cargo run --locked -p addon-repo -- measure memory-cleaner`.
 
+
+## Event Watch (host #91)
+
+`addons/event-watch` builds `event-watch.exe`, keeping ID `toolboks.event-watch`, the three
+pages Live, Crashes and Summary, and the built-in tool's behavior. The code is the host's
+`src/tools/events/` moved over; the only changes are the imports (`toolboks_shared::ui` instead
+of the host's own module) and the add-on entry point in `src/lib.rs`. It only reads: Windows
+event logs and crash dump headers, no administrator rights, nothing is cleared or changed. A
+log the user cannot read is reported in the page header as before. Its guided tour has the same
+six steps. Suspending releases the loaded events; they are read again on return. The tool has no
+saved settings today, so nothing needs migrating.
+
+The built-in copy stays in the host until the final removal and "Restore your tools" step (host
+#94), so users never lose the tab or see it twice. Measure it with
+`cargo run --locked -p addon-repo -- measure event-watch`.

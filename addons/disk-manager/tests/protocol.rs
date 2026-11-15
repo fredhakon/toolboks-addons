@@ -7,7 +7,7 @@ use toolboks_addon_proto::{
     host_handshake, AddonMessage, FrameReader, FrameWriter, Hello, HostMessage, InputBatch, Theme,
 };
 
-struct Guard(Child);
+struct Guard(Child, std::path::PathBuf);
 
 #[test]
 fn manifest_matches_the_executable() {
@@ -38,6 +38,7 @@ impl Drop for Guard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        let _ = std::fs::remove_dir_all(&self.1);
     }
 }
 
@@ -63,12 +64,20 @@ fn protocol_test_host_draws_pings_and_quits() {
     // CI can exercise the exact release executable, rather than Cargo's test build.
     let exe = std::env::var("ADDON_TEST_EXE")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_disk-manager").into());
+    let data = std::path::PathBuf::from(
+        std::env::var_os("CARGO_TARGET_DIR")
+            .unwrap_or_else(|| std::env::temp_dir().into_os_string()),
+    )
+    .join(format!("disk-manager-protocol-{}", std::process::id()));
+    assert!(data.is_absolute());
     let mut child = Guard(
         Command::new(exe)
+            .env("TOOLBOKS_DATA_DIR", &data)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
+        data,
     );
     let stdout = child.0.stdout.take().unwrap();
     let stdin = child.0.stdin.take().unwrap();
@@ -135,7 +144,9 @@ fn protocol_test_host_draws_pings_and_quits() {
         loop {
             if let AddonMessage::Preferences { json, .. } = reader.read().unwrap() {
                 let saved: serde_json::Value = serde_json::from_str(&json).unwrap();
-                assert_eq!(saved["settings"], preferences["settings"]);
+                let mut expected = preferences["settings"].clone();
+                expected["remember"] = serde_json::json!(true);
+                assert_eq!(saved["settings"], expected);
                 assert_eq!(saved["future_preference"], "preserved");
                 assert!(saved.get("fragmentation_reports").is_some());
                 assert!(saved.get("optimize_selected_drive").is_some());

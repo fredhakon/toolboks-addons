@@ -1,3 +1,5 @@
+mod quick;
+pub use quick::rescan;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -20,14 +22,16 @@ pub struct Node {
     pub bytes: u64,
     pub files: u64,
     pub modified: u64,
+    /// Full-resolution directory time, independent of descendant file times. Zero forces a reread.
+    pub dir_stamp: u64,
 }
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Extension {
     pub name: String,
     pub bytes: u64,
     pub files: u64,
 }
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Progress {
     pub running: bool,
     pub cancelled: bool,
@@ -41,6 +45,49 @@ pub struct Progress {
     pub extensions: Vec<Extension>,
     pub root: String,
     pub generation: u64,
+    pub scanned_at: u64,
+    pub full_scanned_at: u64,
+    pub volume: String,
+    pub exclusions: Vec<String>,
+    pub changes: Option<Changes>,
+}
+#[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct Changes {
+    pub new: u64,
+    pub removed: u64,
+    pub changed: u64,
+    pub folders_read: u64,
+    pub folders_reused: u64,
+}
+pub fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+pub fn exclusions(values: &[String]) -> Vec<String> {
+    let mut result: Vec<_> = values
+        .iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    result.sort();
+    result.dedup();
+    result
+}
+fn stamp(meta: &fs::Metadata) -> u64 {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.last_write_time()
+    }
+    #[cfg(not(windows))]
+    {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos().min(u64::MAX as u128) as u64)
+    }
 }
 #[derive(Default)]
 pub struct State {
@@ -71,6 +118,7 @@ struct Entry {
     dir_path: Option<PathBuf>,
     bytes: u64,
     modified: u64,
+    dir_stamp: u64,
     /// Lowercased extension key for files (empty for directories).
     ext: String,
 }
@@ -84,6 +132,7 @@ struct Batch {
     /// Entries or the directory itself that could not be read.
     error_count: u64,
     errors: Vec<String>,
+    stamp: u64,
 }
 struct Job {
     path: PathBuf,
@@ -200,6 +249,7 @@ fn read_dir_job(job: Job, exclusions: &[String], cancel: &AtomicBool) -> Batch {
         skipped: 0,
         error_count: 0,
         errors: Vec::new(),
+        stamp: 0,
     };
     let fail = |b: &mut Batch, e: String| {
         b.error_count += 1;
@@ -207,6 +257,7 @@ fn read_dir_job(job: Job, exclusions: &[String], cancel: &AtomicBool) -> Batch {
             b.errors.push(e);
         }
     };
+    let before = fs::symlink_metadata(&b.path).ok().map_or(0, |m| stamp(&m));
     let rd = match fs::read_dir(&b.path) {
         Ok(v) => v,
         Err(e) => {
@@ -264,9 +315,14 @@ fn read_dir_job(job: Job, exclusions: &[String], cancel: &AtomicBool) -> Batch {
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map_or(0, |t| t.as_secs()),
+            dir_stamp: if is_dir { stamp(&meta) } else { 0 },
             ext,
             dir_path: if is_dir { Some(path) } else { None },
         });
+    }
+    let after = fs::symlink_metadata(&b.path).ok().map_or(0, |m| stamp(&m));
+    if before == after && b.error_count == 0 && !cancel.load(Ordering::Relaxed) {
+        b.stamp = before;
     }
     b
 }
@@ -284,6 +340,10 @@ fn scan_with(
         running: true,
         root: root.to_string_lossy().into(),
         generation,
+        scanned_at: now(),
+        full_scanned_at: now(),
+        volume: crate::saved_scan::volume_id(&root).unwrap_or_default(),
+        exclusions: exclusions(&exclude),
         ..Default::default()
     };
     let mut nodes = vec![Node {
@@ -299,6 +359,7 @@ fn scan_with(
         bytes: 0,
         files: 0,
         modified: 0,
+        dir_stamp: 0,
     }];
     nodes.reserve(1024);
     let mut extensions: HashMap<String, (u64, u64)> = HashMap::new();
@@ -345,6 +406,7 @@ fn scan_with(
                 Ok(b) => {
                     outstanding -= 1;
                     p.folders += 1;
+                    nodes[b.parent].dir_stamp = b.stamp;
                     p.skipped += b.skipped + b.error_count;
                     for e in b.errors {
                         if p.errors.len() < MAX_ERRORS {
@@ -374,6 +436,7 @@ fn scan_with(
                             bytes: e.bytes,
                             files: if dir { 0 } else { 1 },
                             modified: e.modified,
+                            dir_stamp: e.dir_stamp,
                         });
                     }
                     last_dir = b.path;
@@ -488,14 +551,18 @@ pub fn listing(nodes: &[Node], q: &Query) -> Listing {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
-    fn temp(tag: &str) -> PathBuf {
+    pub(crate) fn temp(tag: &str) -> PathBuf {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("stratum-{tag}-{}-{n}", std::process::id()))
+        PathBuf::from(
+            std::env::var_os("CARGO_TARGET_DIR")
+                .unwrap_or_else(|| std::env::temp_dir().into_os_string()),
+        )
+        .join(format!("stratum-{tag}-{}-{n}", std::process::id()))
     }
     fn run(root: &Path, exclude: &[&str], threads: usize) -> Arc<Mutex<State>> {
         let state = Arc::new(Mutex::new(State::default()));

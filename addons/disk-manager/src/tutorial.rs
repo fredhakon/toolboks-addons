@@ -5,9 +5,9 @@ use toolboks_addon_sdk::TutorialStep as S;
 pub(super) fn steps() -> Vec<S> {
     [
         ("0", "disk-drives", "Choose a drive", "The drive menu lists detected volumes with free and total capacity. Choosing one fills the scan path; it does not start a scan."),
-        ("0", "disk-path", "Choose the scan location", "Analyze a whole drive or enter a specific folder path. Narrower scans finish sooner and focus on the area you want to understand. The path is remembered locally."),
+        ("0", "disk-path", "Choose the scan location", "Scan a whole drive or enter a specific folder path. Narrower scans finish sooner and focus on the area you want to understand. The path is remembered locally."),
         ("0", "disk-browse", "Browse to a folder", "Browse to folder opens the Windows folder picker. Select a folder to fill the path, or cancel to leave it unchanged. The walkthrough does not open the picker."),
-        ("0", "disk-analyze", "Analyze space and stop", "Analyze space scans file and folder metadata in the background. You can use another add-on while it runs. Stop scan cancels the work and keeps partial results; it does not delete files. The tutorial never starts or stops a scan."),
+        ("0", "disk-analyze", "Scan, rescan and stop", "Scan reads file and folder metadata in the background. Remember my last scan keeps completed results on this PC. Rescan (quick) checks folder times and can miss in-place size edits; Full rescan refreshes every size. Stop scan keeps partial results and never deletes your files. This tutorial starts no scan."),
         ("0/options", "disk-options", "Scan options and exclusions", "Enter folder names separated by semicolons to skip them. Matching ignores case and uses exact names. Exclusions affect scan coverage and can reduce totals. Leave this empty for the broadest scan; the tour changes no settings."),
         ("0", "disk-stats", "Understand the scan totals", "This bar shows discovered file bytes, file and folder counts, and elapsed time. A cancelled scan contains partial totals. Sizes are logical lengths and can differ from allocated disk space. If no scan is ready, this tour uses clearly labeled sample data."),
         ("0", "disk-workspace-title", "Explore the five views", "Use the Disk Manager pages in the Toolboks sidebar or the Pages menu when the sidebar is collapsed. Next will visit each view for you."),
@@ -39,6 +39,7 @@ pub(super) fn sample() -> (Progress, Arc<Vec<Node>>) {
             bytes: 950 * mib,
             files: 3,
             modified: 0,
+            dir_stamp: 0,
         },
         Node {
             id: 1,
@@ -49,6 +50,7 @@ pub(super) fn sample() -> (Progress, Arc<Vec<Node>>) {
             bytes: 600 * mib,
             files: 1,
             modified: 0,
+            dir_stamp: 0,
         },
         Node {
             id: 2,
@@ -59,6 +61,7 @@ pub(super) fn sample() -> (Progress, Arc<Vec<Node>>) {
             bytes: 300 * mib,
             files: 1,
             modified: 0,
+            dir_stamp: 0,
         },
         Node {
             id: 3,
@@ -69,6 +72,7 @@ pub(super) fn sample() -> (Progress, Arc<Vec<Node>>) {
             bytes: 50 * mib,
             files: 1,
             modified: 0,
+            dir_stamp: 0,
         },
         Node {
             id: 4,
@@ -79,6 +83,7 @@ pub(super) fn sample() -> (Progress, Arc<Vec<Node>>) {
             bytes: 600 * mib,
             files: 1,
             modified: 0,
+            dir_stamp: 0,
         },
         Node {
             id: 5,
@@ -89,6 +94,7 @@ pub(super) fn sample() -> (Progress, Arc<Vec<Node>>) {
             bytes: 300 * mib,
             files: 1,
             modified: 0,
+            dir_stamp: 0,
         },
     ];
     (

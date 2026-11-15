@@ -302,6 +302,19 @@ impl NativeAddon for Resources {
 }
 
 impl Resources {
+    /// System totals for the Processes headers; None until a fresh reading exists.
+    fn process_totals(&self) -> Option<processes::Totals> {
+        let fresh = self.last_at.is_some_and(|t| t.elapsed() < LIVE_WITHIN);
+        let sample = self.last.as_ref().filter(|_| fresh)?;
+        Some(processes::Totals {
+            cpu: sample.cpu,
+            mem_used: sample.mem_used,
+            mem_total: self.info.as_ref().map_or(0, |i| i.mem_total),
+            disk_active: sample.disk_active,
+            disk_bps: sample.disk_read_bps + sample.disk_write_bps,
+        })
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
         self.processes.tick();
         self.connections.tick();
@@ -367,7 +380,7 @@ impl Resources {
         sampler.ping();
         match page {
             2 => {
-                self.processes.ui(ui);
+                self.processes.ui(ui, self.process_totals());
                 return;
             }
             3 => {

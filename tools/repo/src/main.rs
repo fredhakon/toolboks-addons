@@ -10,8 +10,16 @@ fn host_services(name: &str) -> (Vec<String>, bool) {
         Ok(bytes) => {
             let value: serde_json::Value =
                 serde_json::from_slice(&bytes).expect("host services JSON");
-            let pages = serde_json::from_value(value["pages"].clone()).expect("page names");
-            let background = value["background"].as_bool().expect("background flag");
+            // Both keys are optional: no pages means a single-page add-on, no flag means it does
+            // not keep running while hidden.
+            let pages = match value.get("pages") {
+                Some(pages) => serde_json::from_value(pages.clone()).expect("page names"),
+                None => Vec::new(),
+            };
+            let background = match value.get("background") {
+                Some(flag) => flag.as_bool().expect("background flag"),
+                None => false,
+            };
             (pages, background)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (vec![], false),

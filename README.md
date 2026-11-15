@@ -128,3 +128,23 @@ saved settings today, so nothing needs migrating.
 The built-in copy stays in the host until the final removal and "Restore your tools" step (host
 #94), so users never lose the tab or see it twice. Measure it with
 `cargo run --locked -p addon-repo -- measure event-watch`.
+
+## Resource Monitor (host #89)
+
+`addons/resource-monitor` builds `resource-monitor.exe`, keeping ID `toolboks.resource-monitor`,
+the pages Overview, Details, Processes and Connections and the built-in tool's behavior. The
+host's `src/tools/resources/` code moved over with imports changed to the shared crates (and the
+add-on entry point in `src/lib.rs`); 91 of its own unit tests moved with it. It needs no
+administrator rights and stores nothing: the graphs live in memory while the add-on is shown.
+
+- **Status bar.** The `CPU nn%` and `GPU nn%` items go through the host's status services.
+- **Suspending** stops the sampler and drops the graphs, as the built-in tool does when it is
+  not shown.
+- **Not in the background yet.** `host-services.json` does not set `background`. Keeping the
+  sampler running while hidden belongs with the history recorder (host #64), which does not
+  exist yet. Today the built-in tool does not record while hidden either.
+- The guided tour has the same 22 steps.
+
+The built-in copy stays in the host until the final removal and "Restore your tools" step (host
+#94). Measure with `cargo run --locked -p addon-repo -- measure resource-monitor`.
+

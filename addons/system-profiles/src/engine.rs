@@ -16,24 +16,86 @@ use toolboks_debloat_engine::{
 };
 use toolboks_shared::{elevation, storage, win, win::windows_dir};
 
+/// How well a speed claim is backed. Only sources or our own measurement may raise it (issue #32).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Evidence {
+    /// Our own controlled measurement shows a gain. Nothing qualifies yet.
+    #[allow(dead_code)]
+    Measured,
+    /// Sources or tests disagree, or the gain is small.
+    Mixed,
+    /// No controlled measurement found.
+    Unproven,
+}
+
+impl Evidence {
+    pub fn label(self) -> &'static str {
+        match self {
+            Evidence::Measured => "Measured",
+            Evidence::Mixed => "Mixed evidence",
+            Evidence::Unproven => "Unproven",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Group {
+    Performance,
+    Privacy,
+    Cleanup,
+}
+
+pub const GROUPS: [Group; 3] = [Group::Performance, Group::Privacy, Group::Cleanup];
+
+impl Group {
+    pub fn title(self) -> &'static str {
+        match self {
+            Group::Performance => "Performance",
+            Group::Privacy => "Privacy",
+            Group::Cleanup => "Cleanup",
+        }
+    }
+
+    pub fn intro(self) -> &'static str {
+        match self {
+            Group::Performance => "Aimed at game speed. The badge shows how well that is backed.",
+            Group::Privacy => {
+                "Reduce what Windows collects or suggests. These do not make games faster."
+            }
+            Group::Cleanup => "Housekeeping. This does not make games faster.",
+        }
+    }
+}
+
+const NO_MEASUREMENT: &str =
+    "No controlled measurement found (checked 2026-11); see issue #32 for our own test.";
+const MS_CONNECTIONS: &str = "https://learn.microsoft.com/windows/privacy/manage-connections-from-windows-operating-system-components-to-microsoft-services";
+const NO_SPEED_CLAIM: &str = "No speed claim is made for this setting.";
+
 #[derive(Clone, Copy)]
 pub struct Choice {
     pub id: &'static str,
     pub title: &'static str,
     pub detail: &'static str,
+    pub group: Group,
+    /// None means "Not a speed tweak": it is chosen for privacy or housekeeping, not speed.
+    pub evidence: Option<Evidence>,
+    pub why: &'static str,
+    /// A Microsoft Learn link or a plain note. Never a made-up address.
+    pub source: &'static str,
 }
 
 pub const CHOICES: &[Choice] = &[
-    Choice { id: "game-mode", title: "Turn on Game Mode", detail: "Enable Game Mode for your Windows account." },
-    Choice { id: "game-bar-capture", title: "Turn off Game DVR", detail: "Disable Game Bar recording for your account." },
-    Choice { id: "consumer-features", title: "Turn off suggested app installs", detail: "Applies to Windows Enterprise and Education." },
-    Choice { id: "diagnostic-data-minimum", title: "Limit Windows diagnostic data", detail: "Sets Required on Pro. Keeps a stricter existing setting." },
-    Choice { id: "activity-history", title: "Turn off activity history policies", detail: "Stops publishing and uploading activity where Windows supports these policies." },
-    Choice { id: "location", title: "Turn off Windows Location", detail: "Blocks Windows location access for all users on Pro, Enterprise, and Education." },
-    Choice { id: "storage-sense", title: "Turn off Storage Sense", detail: "Stops automatic storage cleanup for all users on Pro, Enterprise, and Education." },
-    Choice { id: "powershell-telemetry", title: "Turn off PowerShell 7 telemetry", detail: "Set the opt-out for your account. Sign out and back in before starting PowerShell 7." },
-    Choice { id: "scheduler", title: "Apply gaming scheduler settings", detail: "Set Games scheduling to High, Win32PrioritySeparation to 0x26, and SystemResponsiveness to 10. Changes can affect other apps." },
-    Choice { id: "power", title: "Activate Ultimate Performance", detail: "Create and activate a new Ultimate Performance plan. Power use and heat can increase." },
+    Choice { id: "game-mode", title: "Turn on Game Mode", detail: "Enable Game Mode for your Windows account.", group: Group::Performance, evidence: Some(Evidence::Mixed), why: "Windows favours the running game over background work. Independent tests show small or no gain.", source: NO_MEASUREMENT },
+    Choice { id: "game-bar-capture", title: "Turn off Game DVR", detail: "Disable Game Bar recording for your account.", group: Group::Performance, evidence: Some(Evidence::Mixed), why: "Background capture has a small cost while you play. The gain from turning it off is small.", source: NO_MEASUREMENT },
+    Choice { id: "scheduler", title: "Apply gaming scheduler settings", detail: "Set Games scheduling to High, Win32PrioritySeparation to 0x26, and SystemResponsiveness to 10. Changes can affect other apps.", group: Group::Performance, evidence: Some(Evidence::Unproven), why: "These are Windows' own scheduling settings. No controlled benchmark shows a gain.", source: NO_MEASUREMENT },
+    Choice { id: "power", title: "Activate Ultimate Performance", detail: "Create and activate a new Ultimate Performance plan. Power use and heat can increase.", group: Group::Performance, evidence: Some(Evidence::Mixed), why: "Can cut latency and clock-speed ramp-up on desktops. No frame-rate gain is proven, and laptops pay more in power and heat.", source: NO_MEASUREMENT },
+    Choice { id: "consumer-features", title: "Turn off suggested app installs", detail: "Applies to Windows Enterprise and Education.", group: Group::Privacy, evidence: None, why: "Stops Windows suggesting and installing promoted apps.", source: MS_CONNECTIONS },
+    Choice { id: "diagnostic-data-minimum", title: "Limit Windows diagnostic data", detail: "Sets Required on Pro. Keeps a stricter existing setting.", group: Group::Privacy, evidence: None, why: "Reduces the diagnostic data Windows sends to Microsoft.", source: MS_CONNECTIONS },
+    Choice { id: "activity-history", title: "Turn off activity history policies", detail: "Stops publishing and uploading activity where Windows supports these policies.", group: Group::Privacy, evidence: None, why: "Stops Windows recording and uploading what you do on this PC.", source: MS_CONNECTIONS },
+    Choice { id: "location", title: "Turn off Windows Location", detail: "Blocks Windows location access for all users on Pro, Enterprise, and Education.", group: Group::Privacy, evidence: None, why: "Stops Windows and apps reading this PC's location.", source: MS_CONNECTIONS },
+    Choice { id: "powershell-telemetry", title: "Turn off PowerShell 7 telemetry", detail: "Set the opt-out for your account. Sign out and back in before starting PowerShell 7.", group: Group::Privacy, evidence: None, why: "Stops PowerShell 7 sending usage data.", source: NO_SPEED_CLAIM },
+    Choice { id: "storage-sense", title: "Turn off Storage Sense", detail: "Stops automatic storage cleanup for all users on Pro, Enterprise, and Education.", group: Group::Cleanup, evidence: None, why: "Stops Windows clearing temporary files by itself. Disk space may fill sooner.", source: NO_SPEED_CLAIM },
 ];
 
 const PROFILE: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile";
@@ -215,37 +277,57 @@ fn display_value(value: Option<RegValue>) -> String {
     }
 }
 
+const UNAVAILABLE: &str = "unavailable on this edition";
+
+/// One flat list for the administrator confirmation text.
 pub fn preview(selected: &[&str]) -> Vec<String> {
-    let env = backend::detect_env();
     let mut lines = Vec::new();
+    for (title, group) in preview_by_choice(selected) {
+        for line in group {
+            lines.push(if line == UNAVAILABLE {
+                format!("{title} • {UNAVAILABLE}")
+            } else {
+                line
+            });
+        }
+    }
+    lines
+}
+
+/// Current and new values per selected choice, in the order of `CHOICES`.
+pub fn preview_by_choice(selected: &[&str]) -> Vec<(&'static str, Vec<String>)> {
+    let env = backend::detect_env();
+    let mut groups = Vec::new();
     for choice in CHOICES
         .iter()
         .filter(|choice| selected.contains(&choice.id))
     {
+        let mut lines = Vec::new();
         if env.edition < required_edition(choice.id) {
-            lines.push(format!("{} • unavailable on this edition", choice.title));
-            continue;
+            lines.push(UNAVAILABLE.to_string());
+        } else {
+            for target in targets(choice.id) {
+                let line = match target.read(&WinRegistry) {
+                    Ok(current) if target.matches(current.as_ref()) => {
+                        format!("{} • {} (keep)", target.name, display_value(current))
+                    }
+                    Ok(current) => format!(
+                        "{} • {} → {}",
+                        target.name,
+                        display_value(current),
+                        display_value(Some(target.desired))
+                    ),
+                    Err(error) => format!("{} • {error}", target.name),
+                };
+                lines.push(line);
+            }
+            if choice.id == "power" {
+                lines.push("Active power plan → Ultimate Performance".into());
+            }
         }
-        for target in targets(choice.id) {
-            let line = match target.read(&WinRegistry) {
-                Ok(current) if target.matches(current.as_ref()) => {
-                    format!("{} • {} (keep)", target.name, display_value(current))
-                }
-                Ok(current) => format!(
-                    "{} • {} → {}",
-                    target.name,
-                    display_value(current),
-                    display_value(Some(target.desired))
-                ),
-                Err(error) => format!("{} • {error}", target.name),
-            };
-            lines.push(line);
-        }
+        groups.push((choice.title, lines));
     }
-    if selected.contains(&"power") {
-        lines.push("Active power plan → Ultimate Performance".into());
-    }
-    lines
+    groups
 }
 
 pub fn review_backup() -> Result<Vec<String>, String> {

@@ -465,6 +465,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memory-cleaner"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui_extras",
+ "serde_json",
+ "sysinfo",
+ "toolboks-addon-proto",
+ "toolboks-addon-sdk",
+ "toolboks-shared",
+ "windows",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

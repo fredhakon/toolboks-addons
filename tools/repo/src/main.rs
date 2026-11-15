@@ -1,11 +1,23 @@
 //! Repository automation; catalog types and validation belong to the host, not this repo.
-use std::{
-    env, fs,
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{env, fs, path::Path};
 use toolboks_addon_sdk::Package;
 use toolboks_catalog::{Channel, Entry, Index, Kind};
+mod measure;
+
+fn host_services(name: &str) -> (Vec<String>, bool) {
+    let path = format!("addons/{name}/host-services.json");
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("host services JSON");
+            let pages = serde_json::from_value(value["pages"].clone()).expect("page names");
+            let background = value["background"].as_bool().expect("background flag");
+            (pages, background)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (vec![], false),
+        Err(error) => panic!("{path}: {error}"),
+    }
+}
 
 fn package(name: &str) -> Package {
     assert!(
@@ -34,6 +46,7 @@ fn update(name: &str, version: &str, repository: &str, exe: &Path) {
         .bytes()
         .all(|c| c.is_ascii_alphanumeric() || b"-_./".contains(&c)));
     let m = package(name).manifest;
+    let (pages, background) = host_services(name);
     assert_eq!(m.version, version);
     let bytes = fs::read(exe).expect("release executable");
     let entry = Entry {
@@ -42,15 +55,15 @@ fn update(name: &str, version: &str, repository: &str, exe: &Path) {
         short_description: m.description,
         long_description: m.long_description,
         publisher: m.publisher,
-        publisher_key_id: None,
+        byline: m.byline,
         category: m.category,
         icon: m.icon,
         accent: m.accent,
         screenshots: m.screenshots,
         capabilities: serde_json::from_value(serde_json::to_value(m.capabilities).unwrap())
             .unwrap(),
-        pages: vec![],
-        background: false,
+        pages,
+        background,
         kind: Kind::Native,
         version: version.into(),
         min_toolboks_version: m.min_toolboks_version,
@@ -71,22 +84,12 @@ fn update(name: &str, version: &str, repository: &str, exe: &Path) {
         .entries
         .retain(|e| !(e.id == entry.id && e.version == entry.version));
     index.entries.push(entry);
-    index.sequence = index.sequence.checked_add(1).unwrap();
-    index.generated_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    index.expires_at = index.generated_at + 14 * 24 * 60 * 60;
     index.validate().unwrap();
     fs::write(
         "catalog/index.json",
         serde_json::to_vec_pretty(&index).unwrap(),
     )
     .unwrap();
-    // A changed index must never retain a stale signature.
-    if Path::new("catalog/index.json.sig").exists() {
-        fs::remove_file("catalog/index.json.sig").unwrap();
-    }
 }
 
 fn main() {
@@ -98,11 +101,12 @@ fn main() {
         .as_slice()
     {
         ["validate"] => validate(),
+        ["measure", name] => measure::run(name),
         ["catalog-update", name, version, repository, exe] => {
             update(name, version, repository, Path::new(exe))
         }
         _ => panic!(
-            "usage: addon-repo validate | catalog-update <name> <version> <owner/repo> <exe>"
+            "usage: addon-repo validate | measure <name> | catalog-update <name> <version> <owner/repo> <exe>"
         ),
     }
 }

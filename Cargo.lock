@@ -21,6 +21,7 @@ dependencies = [
  "toolboks-addon-proto",
  "toolboks-addon-sdk",
  "toolboks-catalog",
+ "windows",
 ]
 
 [[package]]
@@ -143,6 +144,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "disk-manager"
+version = "0.2.0"
+dependencies = [
+ "egui",
+ "egui_extras",
+ "serde",
+ "serde_json",
+ "toolboks-addon-proto",
+ "toolboks-addon-sdk",
+ "toolboks-shared",
+ "windows",
+]
+
+[[package]]
 name = "ecolor"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -151,12 +166,6 @@ dependencies = [
  "emath",
  "serde",
 ]
-
-[[package]]
-name = "ed25519-compact"
-version = "2.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9547879431a90e352a35863a54416d92898a787b9af09e6ae2e09a96bd78be80"
 
 [[package]]
 name = "egui"
@@ -176,6 +185,20 @@ dependencies = [
  "serde",
  "smallvec",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "egui_extras"
+version = "0.37.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "def286cf47194f3fe45b8e37c503ada7a20a64b59a903b4bc704baec943b1827"
+dependencies = [
+ "ahash",
+ "egui",
+ "enum-map",
+ "itertools",
+ "log",
+ "profiling",
 ]
 
 [[package]]
@@ -204,6 +227,26 @@ name = "embedded-io"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
+name = "enum-map"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4532960034c15ba2f55e9eee631040ecc473c32e6c4b200828c759840f13a06"
+dependencies = [
+ "enum-map-derive",
+]
+
+[[package]]
+name = "enum-map-derive"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7127272f64b3e098f7d81f350d672081b879bff896d219c42370dc858b1af9ff"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
 
 [[package]]
 name = "enumn"
@@ -650,7 +693,7 @@ dependencies = [
 [[package]]
 name = "toolboks-addon-proto"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=5f7c39b04dc367379be0eb9396cfb7362af2ffa3#5f7c39b04dc367379be0eb9396cfb7362af2ffa3"
+source = "git+https://github.com/Gusseti/toolboks?rev=86c749cbd3a27de920329b512ea8a3f33baca74b#86c749cbd3a27de920329b512ea8a3f33baca74b"
 dependencies = [
  "egui",
  "postcard",
@@ -660,7 +703,7 @@ dependencies = [
 [[package]]
 name = "toolboks-addon-sdk"
 version = "0.4.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=5f7c39b04dc367379be0eb9396cfb7362af2ffa3#5f7c39b04dc367379be0eb9396cfb7362af2ffa3"
+source = "git+https://github.com/Gusseti/toolboks?rev=86c749cbd3a27de920329b512ea8a3f33baca74b#86c749cbd3a27de920329b512ea8a3f33baca74b"
 dependencies = [
  "egui",
  "serde",
@@ -671,9 +714,8 @@ dependencies = [
 [[package]]
 name = "toolboks-catalog"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=5f7c39b04dc367379be0eb9396cfb7362af2ffa3#5f7c39b04dc367379be0eb9396cfb7362af2ffa3"
+source = "git+https://github.com/Gusseti/toolboks?rev=86c749cbd3a27de920329b512ea8a3f33baca74b#86c749cbd3a27de920329b512ea8a3f33baca74b"
 dependencies = [
- "ed25519-compact",
  "serde",
  "serde_json",
  "sha2",
@@ -683,7 +725,7 @@ dependencies = [
 [[package]]
 name = "toolboks-shared"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=5f7c39b04dc367379be0eb9396cfb7362af2ffa3#5f7c39b04dc367379be0eb9396cfb7362af2ffa3"
+source = "git+https://github.com/Gusseti/toolboks?rev=86c749cbd3a27de920329b512ea8a3f33baca74b#86c749cbd3a27de920329b512ea8a3f33baca74b"
 dependencies = [
  "egui",
  "toolboks-addon-sdk",

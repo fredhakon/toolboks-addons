@@ -14,9 +14,10 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo build --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Each add-on's integration test uses the pinned host's stdio protocol test host.
       - run: cargo test --workspace --locked
       - run: cargo run --locked -p addon-repo -- validate
@@ -34,3 +35,5 @@ jobs:
             cargo test --locked -p $addon.Name --test protocol
             if ($LASTEXITCODE -ne 0) { throw 'Release protocol test failed' }
           }
+      - name: Measure Disk Manager pilot
+        run: cargo run --locked -p addon-repo -- measure disk-manager

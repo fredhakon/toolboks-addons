@@ -7,7 +7,7 @@
     "native_provider": "stratum.disk-manager",
     "description": "Map storage and find large files. Keeps your last scan of each drive on this PC. Saved file names stay local; remembering scans can be turned off.",
     "long_description": "Stratum's disk analysis, built for your Toolboks workspace. Scan any drive or folder, explore an interactive space map, find the largest files, filter by size and age, inspect file types, and export your findings. Analyze fragmentation, inspect Windows optimization history, defragment hard drives, or TRIM SSDs with administrator access. Optimization only runs when requested. Scans are read-only, run in the background, and can be cancelled. Links and junctions are skipped; access errors are reported transparently. Sizes are logical file lengths and may differ from allocated disk usage. Drive-changing optimization is unavailable pending host issue #132 and a rebuild against its protocol and elevated helper. Keeps your last scan of each drive on this PC, in the add-on data folder, never in preferences or online. Turn off Remember my last scan or use Delete saved scans to remove saved file names. Quick rescans compare folder times; in-place file size changes require Full rescan. Drive optimization also shows drive health (Healthy, Watch or Replace soon) from the NVMe health log or SATA SMART data, with the raw values one click away; drives that only report health to administrators are named as such.",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "author": "Stratum",
     "publisher": "Toolboks",
     "category": "Storage",

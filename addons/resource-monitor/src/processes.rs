@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui::{self, Align, Layout, RichText, Sense, Vec2};
+use egui::{self, Align, Color32, Layout, RichText, Sense, Vec2};
 use egui_extras::{Column, TableBuilder};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use windows::core::{HRESULT, PWSTR};
@@ -24,14 +24,16 @@ use windows::Win32::System::Threading::{
     PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
 };
 
-use toolboks_shared::format::{friendly_name, size_plain, uptime};
+use toolboks_shared::format::{friendly_name, rate, size_plain, uptime};
 use toolboks_shared::ui::{
     body_cell, header_cell, inspector_edge, inspector_frame, row_rule, switch_row, table_style,
-    CARD_PAD, GAP, RED, SPACE_M, TEXT_SECTION,
+    CARD_PAD, DATA_CPU, DATA_DISK, DATA_MEMORY, GAP, MUTED, RED, SPACE_M, TEXT_SECTION,
 };
 use toolboks_shared::win::Handle;
 
 pub(super) const ROW_HEIGHT: f32 = 28.0;
+/// Header row: the column name above the system total.
+const HEADER_HEIGHT: f32 = 40.0;
 pub(super) const INSPECTOR_WIDTH: f32 = 240.0;
 /// Time between two process refreshes while the page is visible.
 pub(super) const REFRESH: Duration = Duration::from_secs(2);
@@ -77,6 +79,9 @@ struct Proc {
     cpu: f32,
     /// Working set in bytes.
     mem: u64,
+    /// Bytes per second read plus written since the previous refresh; None until this process
+    /// has been seen in two refreshes in a row.
+    disk: Option<f64>,
     run_secs: u64,
     exe: Option<String>,
 }
@@ -92,6 +97,8 @@ struct Row {
     pids: Vec<u32>,
     cpu: f32,
     mem: u64,
+    /// Sum of the known disk rates in the row; None while none of its processes has one.
+    disk: Option<f64>,
     run_secs: u64,
     exe: Option<String>,
     /// True when every process in the row is protected.
@@ -104,6 +111,7 @@ enum SortKey {
     Pid,
     Cpu,
     Memory,
+    Disk,
 }
 
 /// True for processes Windows needs and this app itself.
@@ -131,7 +139,7 @@ fn shown<'a>(live: &'a [Proc], frozen: Option<&'a [Proc]>) -> &'a [Proc] {
     frozen.unwrap_or(live)
 }
 
-/// Rows for the table; grouped rows sum CPU and memory of every process with the same name.
+/// Rows for the table; grouped rows sum CPU, memory and disk of every process with the same name.
 fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -145,6 +153,10 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                 r.pids.push(p.pid);
                 r.cpu += p.cpu;
                 r.mem += p.mem;
+                r.disk = match (r.disk, p.disk) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    (a, b) => a.or(b),
+                };
                 r.run_secs = r.run_secs.max(p.run_secs);
                 if r.exe.is_none() {
                     r.exe = p.exe.clone();
@@ -161,6 +173,7 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     pids: vec![p.pid],
                     cpu: p.cpu,
                     mem: p.mem,
+                    disk: p.disk,
                     run_secs: p.run_secs,
                     exe: p.exe.clone(),
                     protected: is_prot,
@@ -179,6 +192,7 @@ fn sort_rows(rows: &mut [Row], key: SortKey, descending: bool) {
             SortKey::Pid => a.pid.cmp(&b.pid),
             SortKey::Cpu => a.cpu.total_cmp(&b.cpu),
             SortKey::Memory => a.mem.cmp(&b.mem),
+            SortKey::Disk => a.disk.unwrap_or(0.0).total_cmp(&b.disk.unwrap_or(0.0)),
         };
         let ord = if descending { ord.reverse() } else { ord };
         ord.then_with(|| a.lower_name.cmp(&b.lower_name))
@@ -251,12 +265,120 @@ fn cpu_text(cpu: f32, ready: bool) -> String {
     }
 }
 
+fn disk_text(disk: Option<f64>) -> String {
+    disk.map_or_else(|| "...".to_string(), rate)
+}
+
+/// Which processes were present in the previous refresh. sysinfo reports a process's disk
+/// bytes as a delta against its previous reading, which is 0 for a process it sees for the
+/// first time, so that first "delta" is the whole lifetime I/O. A rate is only trusted for a
+/// process (pid plus start time) that was already there last time.
+#[derive(Default)]
+struct DiskBaseline {
+    seen: HashSet<ProcessIdentity>,
+}
+
+impl DiskBaseline {
+    fn rate(&self, id: Option<ProcessIdentity>, bytes: u64, secs: f64) -> Option<f64> {
+        let known = id.is_some_and(|id| self.seen.contains(&id));
+        (known && secs > 0.0).then(|| bytes as f64 / secs)
+    }
+
+    /// Remembers the processes of this refresh; ones that are gone are dropped.
+    fn commit(&mut self, ids: impl Iterator<Item = ProcessIdentity>) {
+        self.seen = ids.collect();
+    }
+}
+
+/// Tints the cell background; the text is drawn plain on top. The fill reaches half the gap to
+/// its neighbours so a column of shaded cells reads as one band.
+fn shade_cell(ui: &egui::Ui, base: Color32, level: usize) {
+    if level == 0 {
+        return;
+    }
+    let reach = ui.spacing().item_spacing / 2.0;
+    let rect = ui.max_rect().expand2(reach);
+    ui.painter()
+        .with_clip_rect(rect)
+        .rect_filled(rect, 0.0, shade_color(base, level));
+}
+
 pub(super) fn sort_arrow(active: bool, descending: bool) -> &'static str {
     match (active, descending) {
         // Plain letters: the bundled font has none of the arrow or triangle glyphs.
         (true, true) => " v",
         (true, false) => " ^",
         _ => "",
+    }
+}
+
+/// Number of shading levels above "none": a cell has level 0 to `SHADE_STEPS`.
+const SHADE_STEPS: usize = 4;
+/// Fixed thresholds, so a shade changes only when a value really crosses a step.
+/// CPU: percent of the whole machine.
+const CPU_SHADE: [f64; SHADE_STEPS] = [1.0, 10.0, 25.0, 50.0];
+/// Memory: percent of the installed RAM.
+const MEM_SHADE: [f64; SHADE_STEPS] = [1.0, 5.0, 10.0, 25.0];
+/// Disk: bytes per second (0.1, 1, 10 and 100 MB/s).
+const DISK_SHADE: [f64; SHADE_STEPS] = [100_000.0, 1_000_000.0, 10_000_000.0, 100_000_000.0];
+/// Tint opacity per level (of 255). Low enough that the plain text stays readable on top, in a
+/// light or a dark theme.
+const SHADE_ALPHA: [u8; SHADE_STEPS + 1] = [0, 26, 52, 78, 104];
+
+/// How many of the ascending `steps` the value has reached: 0 (none) to `SHADE_STEPS`.
+fn shade_level(value: f64, steps: &[f64; SHADE_STEPS]) -> usize {
+    steps.iter().filter(|&&step| value >= step).count()
+}
+
+/// Share of the installed RAM in percent; 0 when the total is unknown.
+fn mem_share(mem: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        mem as f64 / total as f64 * 100.0
+    }
+}
+
+/// Background tint of `base` for a level; fully transparent at level 0.
+fn shade_color(base: Color32, level: usize) -> Color32 {
+    let alpha = SHADE_ALPHA[level.min(SHADE_STEPS)];
+    Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), alpha)
+}
+
+/// System totals for the column headers, from the latest main-sampler reading.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Totals {
+    /// Percent of the machine, 0 to 100.
+    pub cpu: f32,
+    pub mem_used: u64,
+    /// Installed RAM; 0 while unknown.
+    pub mem_total: u64,
+    /// Share of time the drives were busy, when Windows reports it.
+    pub disk_active: Option<f32>,
+    /// Bytes per second read plus written, used when `disk_active` is missing.
+    pub disk_bps: f64,
+}
+
+impl Totals {
+    fn cpu_text(&self) -> String {
+        format!("{:.0}%", self.cpu)
+    }
+
+    /// None while the installed RAM is unknown, instead of a fake 0 %.
+    fn mem_text(&self) -> Option<String> {
+        (self.mem_total > 0).then(|| {
+            format!(
+                "{:.0}%",
+                mem_share(self.mem_used, self.mem_total).clamp(0.0, 100.0)
+            )
+        })
+    }
+
+    fn disk_text(&self) -> String {
+        match self.disk_active {
+            Some(active) => format!("{active:.0}%"),
+            None => rate(self.disk_bps),
+        }
     }
 }
 
@@ -610,9 +732,11 @@ impl Worker {
                 let kind = ProcessRefreshKind::nothing()
                     .with_cpu()
                     .with_memory()
+                    .with_disk_usage()
                     .with_exe(UpdateKind::OnlyIfNotSet);
                 let mut last: Option<Instant> = None;
                 let mut ready = false;
+                let mut disk_baseline = DiskBaseline::default();
                 loop {
                     std::thread::sleep(Duration::from_millis(250));
                     if Arc::strong_count(&ping) == 1 {
@@ -623,6 +747,7 @@ impl Worker {
                         // The CPU baseline goes stale while hidden.
                         last = None;
                         ready = false;
+                        disk_baseline = DiskBaseline::default();
                         continue;
                     }
                     let wait = if ready { REFRESH } else { PRIME };
@@ -630,6 +755,7 @@ impl Worker {
                         continue;
                     }
                     let sample_start = snapshot_start();
+                    let secs = last.map_or(0.0, |t| t.elapsed().as_secs_f64());
                     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
                     let was_primed = last.is_some();
                     last = Some(Instant::now());
@@ -638,18 +764,27 @@ impl Worker {
                         .values()
                         .map(|p| {
                             let name = p.name().to_string_lossy().into_owned();
+                            let u = p.disk_usage();
+                            let identity = sampled_identity(p, sample_start);
+                            let disk = disk_baseline.rate(
+                                identity,
+                                u.read_bytes.saturating_add(u.written_bytes),
+                                secs,
+                            );
                             Proc {
                                 pid: p.pid().as_u32(),
-                                identity: sampled_identity(p, sample_start),
+                                identity,
                                 lower_name: name.to_lowercase(),
                                 name,
                                 cpu: (p.cpu_usage() / logical).clamp(0.0, 100.0),
                                 mem: p.memory(),
+                                disk,
                                 run_secs: p.run_time(),
                                 exe: p.exe().map(|e| e.display().to_string()),
                             }
                         })
-                        .collect();
+                        .collect::<Vec<Proc>>();
+                    disk_baseline.commit(procs.iter().filter_map(|p| p.identity));
                     ready = was_primed;
                     if tx
                         .send(Snapshot {
@@ -776,7 +911,8 @@ impl Page {
         }
     }
 
-    pub(super) fn ui(&mut self, ui: &mut egui::Ui) {
+    /// `totals` is None until the main sampler has produced a reading.
+    pub(super) fn ui(&mut self, ui: &mut egui::Ui, totals: Option<Totals>) {
         let worker = self.worker.get_or_insert_with(|| Worker::start(ui.ctx()));
         worker.ping();
 
@@ -827,7 +963,7 @@ impl Page {
             toolboks_addon_sdk::tutorial::region(ui, "table", |ui| {
                 ui.scope(|ui| {
                     table_style(ui);
-                    self.table(ui, &rows);
+                    self.table(ui, &rows, totals);
                 });
             });
         });
@@ -962,12 +1098,13 @@ impl Page {
         }
     }
 
-    fn table(&mut self, ui: &mut egui::Ui, rows: &[Row]) {
+    fn table(&mut self, ui: &mut egui::Ui, rows: &[Row], totals: Option<Totals>) {
         let mut sort_click: Option<SortKey> = None;
         let mut click: Option<Click> = None;
         let (sort_key, descending, grouped) = (self.sort_key, self.descending, self.was_grouped);
         let selection = &self.selection;
         let ready = self.cpu_ready;
+        let mem_total = totals.map_or(0, |t| t.mem_total);
         let modifiers = ui.input(|i| i.modifiers);
 
         let mut table = TableBuilder::new(ui)
@@ -983,11 +1120,29 @@ impl Page {
         table
             .column(Column::exact(64.0))
             .column(Column::exact(84.0))
-            .header(ROW_HEIGHT, |mut header| {
+            .column(Column::exact(80.0))
+            .header(HEADER_HEIGHT, |mut header| {
                 header.col(|_| {});
+                // The caption sorts; the system total sits under it, right-aligned, and is
+                // left out until a first reading exists.
                 let sortable = |ui: &mut egui::Ui, label: &str, key: SortKey, right: bool| {
                     let arrow = sort_arrow(sort_key == key, descending);
                     header_cell(ui, label, arrow, sort_key == key, right).then_some(key)
+                };
+                let with_total = |ui: &mut egui::Ui,
+                                  label: &str,
+                                  key: SortKey,
+                                  total: Option<String>|
+                 -> Option<SortKey> {
+                    ui.with_layout(Layout::top_down(Align::Max), |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let clicked = sortable(ui, label, key, false);
+                        if let Some(total) = total {
+                            ui.label(RichText::new(total).small().strong().color(MUTED));
+                        }
+                        clicked
+                    })
+                    .inner
                 };
                 header.col(|ui| {
                     sort_click = sortable(ui, "Name", SortKey::Name, false).or(sort_click)
@@ -997,10 +1152,17 @@ impl Page {
                         sort_click = sortable(ui, "PID", SortKey::Pid, true).or(sort_click)
                     });
                 }
-                header
-                    .col(|ui| sort_click = sortable(ui, "CPU", SortKey::Cpu, true).or(sort_click));
                 header.col(|ui| {
-                    sort_click = sortable(ui, "Memory", SortKey::Memory, true).or(sort_click)
+                    let total = totals.map(|t| t.cpu_text());
+                    sort_click = with_total(ui, "CPU", SortKey::Cpu, total).or(sort_click)
+                });
+                header.col(|ui| {
+                    let total = totals.and_then(|t| t.mem_text());
+                    sort_click = with_total(ui, "Memory", SortKey::Memory, total).or(sort_click)
+                });
+                header.col(|ui| {
+                    let total = totals.map(|t| t.disk_text());
+                    sort_click = with_total(ui, "Disk", SortKey::Disk, total).or(sort_click)
                 });
             })
             .body(|mut body| {
@@ -1030,8 +1192,20 @@ impl Page {
                     if !grouped {
                         row.col(|ui| cell(ui, r.pid.to_string()));
                     }
-                    row.col(|ui| cell(ui, cpu_text(r.cpu, ready)));
-                    row.col(|ui| cell(ui, size_plain(r.mem)));
+                    let shaded = |ui: &mut egui::Ui, base: Color32, level: usize, text: String| {
+                        shade_cell(ui, base, level);
+                        cell(ui, text);
+                    };
+                    let cpu_level = if ready {
+                        shade_level(f64::from(r.cpu), &CPU_SHADE)
+                    } else {
+                        0
+                    };
+                    let disk_level = r.disk.map_or(0, |d| shade_level(d, &DISK_SHADE));
+                    let mem_level = shade_level(mem_share(r.mem, mem_total), &MEM_SHADE);
+                    row.col(|ui| shaded(ui, DATA_CPU, cpu_level, cpu_text(r.cpu, ready)));
+                    row.col(|ui| shaded(ui, DATA_MEMORY, mem_level, size_plain(r.mem)));
+                    row.col(|ui| shaded(ui, DATA_DISK, disk_level, disk_text(r.disk)));
                     let response = row.response();
                     row_rule(&rule, response.rect);
                     if response.clicked() && click.is_none() {
@@ -1057,7 +1231,7 @@ impl Page {
             } else {
                 self.sort_key = key;
                 // Names and pids read naturally upwards, numbers biggest first.
-                self.descending = matches!(key, SortKey::Cpu | SortKey::Memory);
+                self.descending = matches!(key, SortKey::Cpu | SortKey::Memory | SortKey::Disk);
             }
         }
     }
@@ -1267,6 +1441,7 @@ mod tests {
             lower_name: name.to_lowercase(),
             cpu,
             mem,
+            disk: None,
             run_secs: pid as u64,
             exe: None,
         }
@@ -1296,6 +1471,145 @@ mod tests {
         assert!((chrome.cpu - 3.0).abs() < 1e-6);
         assert_eq!(display_name(chrome), "Chrome (2)");
         assert_eq!(build_rows(&sample(), false, &none).len(), 4);
+    }
+
+    fn with_disk(mut p: Proc, disk: f64) -> Proc {
+        p.disk = Some(disk);
+        p
+    }
+
+    #[test]
+    fn grouping_sums_disk() {
+        let procs = vec![
+            with_disk(p(10, "chrome.exe", 1.0, 100), 1_500_000.0),
+            with_disk(p(11, "Chrome.exe", 2.0, 200), 500_000.0),
+            with_disk(p(20, "code.exe", 5.0, 50), 10.0),
+        ];
+        let grouped = build_rows(&procs, true, &none);
+        assert_eq!(grouped[0].disk, Some(2_000_000.0));
+        assert_eq!(grouped[1].disk, Some(10.0));
+        let flat = build_rows(&procs, false, &none);
+        assert_eq!(flat.len(), 3);
+        assert_eq!(flat[0].disk, Some(1_500_000.0));
+    }
+
+    #[test]
+    fn sorts_by_disk_with_name_ties() {
+        let procs = vec![
+            with_disk(p(3, "b.exe", 1.0, 5), 10.0),
+            with_disk(p(2, "a.exe", 1.0, 5), 10.0),
+            with_disk(p(1, "c.exe", 1.0, 5), 900.0),
+        ];
+        let mut rows = build_rows(&procs, false, &none);
+        sort_rows(&mut rows, SortKey::Disk, true);
+        let order: Vec<u32> = rows.iter().map(|r| r.pid).collect();
+        assert_eq!(order, vec![1, 2, 3]);
+        sort_rows(&mut rows, SortKey::Disk, false);
+        let order: Vec<u32> = rows.iter().map(|r| r.pid).collect();
+        assert_eq!(order, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn shade_levels_follow_fixed_steps() {
+        // Below the first step there is no tint; each step reached adds one level, at most 4.
+        assert_eq!(shade_level(0.0, &CPU_SHADE), 0);
+        assert_eq!(shade_level(0.99, &CPU_SHADE), 0);
+        assert_eq!(shade_level(1.0, &CPU_SHADE), 1);
+        assert_eq!(shade_level(9.9, &CPU_SHADE), 1);
+        assert_eq!(shade_level(10.0, &CPU_SHADE), 2);
+        assert_eq!(shade_level(25.0, &CPU_SHADE), 3);
+        assert_eq!(shade_level(50.0, &CPU_SHADE), 4);
+        assert_eq!(shade_level(100.0, &CPU_SHADE), 4);
+        // Disk: 0.1 / 1 / 10 / 100 MB/s.
+        assert_eq!(shade_level(99_999.0, &DISK_SHADE), 0);
+        assert_eq!(shade_level(100_000.0, &DISK_SHADE), 1);
+        assert_eq!(shade_level(1_000_000.0, &DISK_SHADE), 2);
+        assert_eq!(shade_level(10_000_000.0, &DISK_SHADE), 3);
+        assert_eq!(shade_level(100_000_000.0, &DISK_SHADE), 4);
+        // Memory: share of the installed RAM; unknown total never shades.
+        let gb = 1024 * 1024 * 1024;
+        assert_eq!(shade_level(mem_share(gb, 16 * gb), &MEM_SHADE), 2);
+        assert_eq!(shade_level(mem_share(8 * gb, 16 * gb), &MEM_SHADE), 4);
+        assert_eq!(shade_level(mem_share(8 * gb, 0), &MEM_SHADE), 0);
+    }
+
+    #[test]
+    fn shade_tint_is_transparent_at_level_zero_and_grows() {
+        assert_eq!(shade_color(DATA_DISK, 0).a(), 0);
+        let alphas: Vec<u8> = (0..=SHADE_STEPS)
+            .map(|l| shade_color(DATA_DISK, l).a())
+            .collect();
+        assert!(alphas.windows(2).all(|w| w[0] < w[1]));
+        // A level past the top is clamped instead of panicking.
+        assert_eq!(shade_color(DATA_CPU, 9).a(), alphas[SHADE_STEPS]);
+    }
+
+    #[test]
+    fn header_totals_text() {
+        let t = Totals {
+            cpu: 34.4,
+            mem_used: 8 * 1024 * 1024 * 1024,
+            mem_total: 16 * 1024 * 1024 * 1024,
+            disk_active: Some(12.6),
+            disk_bps: 5_000_000.0,
+        };
+        assert_eq!(t.cpu_text(), "34%");
+        assert_eq!(t.mem_text().as_deref(), Some("50%"));
+        assert_eq!(t.disk_text(), "13%");
+        let no_counter = Totals {
+            disk_active: None,
+            ..t
+        };
+        assert_eq!(no_counter.disk_text(), "4.8 MB/s");
+        // Unknown RAM total: no total at all, not "0%".
+        let unknown = Totals { mem_total: 0, ..t };
+        assert_eq!(unknown.mem_text(), None);
+    }
+
+    #[test]
+    fn disk_cell_waits_for_the_baseline() {
+        assert_eq!(disk_text(None), "...");
+        assert_eq!(disk_text(Some(0.0)), "0 B/s");
+    }
+
+    #[test]
+    fn disk_rate_needs_a_previous_sighting() {
+        let id = |pid| {
+            Some(ProcessIdentity {
+                pid,
+                created: u64::from(pid),
+            })
+        };
+        let mut base = DiskBaseline::default();
+        // First refresh: nothing was seen before, so no rate.
+        assert_eq!(base.rate(id(1), 4_000_000, 2.0), None);
+        base.commit([1].into_iter().filter_map(id));
+        // Second refresh: pid 1 gets a rate; pid 2 started in between and reports lifetime
+        // I/O as its first delta, so it still has none.
+        assert_eq!(base.rate(id(1), 4_000_000, 2.0), Some(2_000_000.0));
+        assert_eq!(base.rate(id(2), 900_000_000, 2.0), None);
+        assert_eq!(base.rate(None, 10, 2.0), None);
+        assert_eq!(base.rate(id(1), 10, 0.0), None);
+        base.commit([1, 2].into_iter().filter_map(id));
+        assert_eq!(base.rate(id(2), 100, 2.0), Some(50.0));
+        // A process that disappeared is dropped; a reused pid with a new start time is new.
+        base.commit([2].into_iter().filter_map(id));
+        assert_eq!(base.rate(id(1), 100, 2.0), None);
+        let reused = Some(ProcessIdentity {
+            pid: 2,
+            created: 99,
+        });
+        assert_eq!(base.rate(reused, 100, 2.0), None);
+    }
+
+    #[test]
+    fn group_disk_ignores_processes_without_a_rate() {
+        let new_proc = p(12, "chrome.exe", 0.0, 10);
+        let procs = vec![with_disk(p(10, "chrome.exe", 1.0, 100), 500.0), new_proc];
+        let rows = build_rows(&procs, true, &none);
+        assert_eq!(rows[0].disk, Some(500.0));
+        let only_new = build_rows(&[p(12, "chrome.exe", 0.0, 10)], true, &none);
+        assert_eq!(only_new[0].disk, None);
     }
 
     #[test]

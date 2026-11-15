@@ -6,9 +6,13 @@
 //! Intel: the control library `ControlLib.dll` (IGCL) that recent Arc and Iris Xe drivers
 //! install. It gives temperature and an energy counter, so power appears from the second
 //! reading on; it gives no clocks here.
+//!
+//! Every call here runs on the sampler thread, never the UI thread.
 
-use std::ffi::c_void;
+use std::alloc::Layout;
+use std::ffi::{c_void, CStr};
 use std::ptr::null_mut;
+use std::sync::Mutex;
 
 use windows::core::{s, w, PCWSTR};
 use windows::Win32::Foundation::{FreeLibrary, HMODULE};
@@ -68,10 +72,11 @@ pub enum VendorGpu {
 }
 
 impl VendorGpu {
-    /// `None` when the vendor's library is missing, fails to start or has no sensor.
-    pub fn open(vendor: Vendor) -> Option<VendorGpu> {
+    /// `None` when the vendor's library is missing, fails to start, cannot tell which of its
+    /// GPUs is the one named `name`, or has no sensor for it.
+    pub fn open(vendor: Vendor, name: &str) -> Option<VendorGpu> {
         match vendor {
-            Vendor::Amd => Adl::open().map(VendorGpu::Amd),
+            Vendor::Amd => Adl::open(name).map(VendorGpu::Amd),
             Vendor::Intel => Igcl::open().map(VendorGpu::Intel),
             Vendor::Nvidia | Vendor::Other => None,
         }
@@ -89,6 +94,34 @@ impl VendorGpu {
             VendorGpu::Amd(a) => a.read(),
             VendorGpu::Intel(i) => i.read(),
         }
+    }
+}
+
+/// The library for the GPU the sampler shows, reopened when that GPU changes.
+#[derive(Default)]
+pub struct VendorCache {
+    key: Option<(Vendor, String)>,
+    gpu: Option<VendorGpu>,
+}
+
+impl VendorCache {
+    pub fn get(&mut self, vendor: Vendor, name: &str) -> Option<&mut VendorGpu> {
+        self.get_with(vendor, name, VendorGpu::open)
+    }
+
+    fn get_with(
+        &mut self,
+        vendor: Vendor,
+        name: &str,
+        open: impl FnOnce(Vendor, &str) -> Option<VendorGpu>,
+    ) -> Option<&mut VendorGpu> {
+        if self.key.as_ref().map(|(v, n)| (*v, n.as_str())) != Some((vendor, name)) {
+            // Drop the old library before opening: only one `Adl` may live at a time.
+            self.gpu = None;
+            self.gpu = open(vendor, name);
+            self.key = Some((vendor, name.to_string()));
+        }
+        self.gpu.as_mut()
     }
 }
 
@@ -112,6 +145,8 @@ impl Drop for Lib {
 // ---- AMD (ADL) ----
 
 const ADL_OK: i32 = 0;
+const ADL_MAX_PATH: usize = 256;
+const ADL_MAX_ROWS: i32 = 128;
 const PM_SENSORS: usize = 256;
 // Indices into the PM log, from ADL_PMLOG_SENSORS in the ADL SDK.
 const PM_GFX_CLOCK: usize = 1;
@@ -135,22 +170,59 @@ struct PmLog {
     sensors: [PmSensor; PM_SENSORS],
 }
 
+/// `AdapterInfo` from the ADL SDK, Windows layout (1572 bytes). Only some fields are read.
+#[repr(C)]
+#[allow(dead_code)]
+struct AdapterInfo {
+    size: i32,
+    index: i32,
+    udid: [u8; ADL_MAX_PATH],
+    bus: i32,
+    device: i32,
+    function: i32,
+    vendor_id: i32,
+    name: [u8; ADL_MAX_PATH],
+    display_name: [u8; ADL_MAX_PATH],
+    present: i32,
+    exist: i32,
+    driver_path: [u8; ADL_MAX_PATH],
+    driver_path_ext: [u8; ADL_MAX_PATH],
+    pnp: [u8; ADL_MAX_PATH],
+    os_display_index: i32,
+}
+
 type AdlAlloc = extern "system" fn(i32) -> *mut c_void;
 type AdlCreate = unsafe extern "C" fn(AdlAlloc, i32, *mut *mut c_void) -> i32;
 type AdlDestroy = unsafe extern "C" fn(*mut c_void) -> i32;
 type AdlCount = unsafe extern "C" fn(*mut c_void, *mut i32) -> i32;
-type AdlActive = unsafe extern "C" fn(*mut c_void, i32, *mut i32) -> i32;
+type AdlInfoGet = unsafe extern "C" fn(*mut c_void, *mut AdapterInfo, i32) -> i32;
 type AdlPmLog = unsafe extern "C" fn(*mut c_void, i32, *mut PmLog) -> i32;
 /// Overdrive N temperature and Overdrive 6 power share this shape.
 type AdlSensor = unsafe extern "C" fn(*mut c_void, i32, i32, *mut i32) -> i32;
 
-/// ADL's allocator callback. We call no ADL function that returns such a buffer, so the
-/// memory it asks for at start-up is never handed back and is not freed.
+/// What ADL's allocator callback handed out, freed after the context is destroyed. ADL has
+/// no free callback, so this memory is ours. Only one `Adl` lives at a time (`VendorCache`
+/// drops the old one first), so everything listed belongs to it.
+static ADL_ALLOCS: Mutex<Vec<(usize, Layout)>> = Mutex::new(Vec::new());
+
 extern "system" fn adl_alloc(size: i32) -> *mut c_void {
-    match std::alloc::Layout::from_size_align(size.max(0) as usize, 16) {
-        // SAFETY: the layout has a non-zero size.
-        Ok(layout) if layout.size() > 0 => unsafe { std::alloc::alloc(layout).cast() },
-        _ => null_mut(),
+    let Ok(layout) = Layout::from_size_align(size.max(1) as usize, 16) else {
+        return null_mut();
+    };
+    // SAFETY: the layout has a non-zero size.
+    let p = unsafe { std::alloc::alloc(layout) };
+    if !p.is_null() {
+        let mut allocs = ADL_ALLOCS.lock().unwrap_or_else(|e| e.into_inner());
+        allocs.push((p as usize, layout));
+    }
+    p.cast()
+}
+
+fn free_adl_allocs() {
+    let mut allocs = ADL_ALLOCS.lock().unwrap_or_else(|e| e.into_inner());
+    for (p, layout) in allocs.drain(..) {
+        // SAFETY: allocated by `adl_alloc` with this layout and freed once.
+        unsafe { std::alloc::dealloc(p as *mut u8, layout) };
     }
 }
 
@@ -213,31 +285,75 @@ impl AdlFns {
     }
 }
 
-/// The first active adapter with a temperature or power reading, and what it shares.
-/// shortcut: on a PC with two AMD GPUs this can pick the one that is not the main GPU;
-/// match the adapter's PCI location to the main GPU if that comes up.
-fn pick_adapter(
-    fns: &AdlFns,
-    active: AdlActive,
-    ctx: *mut c_void,
-    count: i32,
-) -> Option<(i32, Shares)> {
-    (0..count.clamp(0, 64)).find_map(|i| {
-        let mut on = 0;
-        // SAFETY: `on` is a valid out-parameter.
-        if unsafe { active(ctx, i, &mut on) } != ADL_OK || on == 0 {
-            return None;
-        }
-        let r = fns.read(ctx, i);
-        let shares = Shares {
-            temp: r.temp_c.is_some(),
-            power: r.power_w.is_some(),
-        };
-        (shares.temp || shares.power).then_some((i, shares))
-    })
+/// One row of ADL's adapter list. ADL lists one row per display output, so a GPU can have
+/// several rows that share its PCI location.
+#[derive(Clone, Debug, PartialEq)]
+struct AmdAdapter {
+    index: i32,
+    pci: (i32, i32, i32),
+    name: String,
 }
 
-/// A loaded `atiadlxx.dll` with one adapter chosen.
+fn c_text(bytes: &[u8]) -> String {
+    CStr::from_bytes_until_nul(bytes).map_or_else(
+        |_| String::from_utf8_lossy(bytes).into_owned(),
+        |c| c.to_string_lossy().into_owned(),
+    )
+}
+
+/// The adapter rows ADL reports, keeping each row's own `iAdapterIndex`. Rows without a
+/// UDID are placeholders and skipped. Rows are not filtered on "active": a GPU that drives
+/// no display (a laptop's dedicated GPU) reports inactive but still has sensors.
+fn adapter_rows(info: AdlInfoGet, ctx: *mut c_void, count: i32) -> Vec<AmdAdapter> {
+    let n = count.clamp(0, ADL_MAX_ROWS) as usize;
+    if n == 0 {
+        return Vec::new();
+    }
+    let row_size = std::mem::size_of::<AdapterInfo>();
+    let mut rows: Vec<AdapterInfo> = (0..n)
+        .map(|_| {
+            // SAFETY: AdapterInfo holds only integers and byte arrays, so zeros are valid.
+            let mut row: AdapterInfo = unsafe { std::mem::zeroed() };
+            row.size = row_size as i32;
+            row
+        })
+        .collect();
+    // SAFETY: `rows` holds `n` writable entries and the size passed says exactly that.
+    if unsafe { info(ctx, rows.as_mut_ptr(), (n * row_size) as i32) } != ADL_OK {
+        return Vec::new();
+    }
+    rows.iter()
+        .filter(|r| r.udid[0] != 0)
+        .map(|r| AmdAdapter {
+            index: r.index,
+            pci: (r.bus, r.device, r.function),
+            name: c_text(&r.name),
+        })
+        .collect()
+}
+
+/// The ADL index of the GPU named `name`: the one GPU (rows grouped by PCI location) with
+/// that name, or the only AMD GPU when no name matches. `None` when that is ambiguous, for
+/// example two cards of the same model: no reading is better than another card's.
+fn pick_adapter(rows: &[AmdAdapter], name: &str) -> Option<i32> {
+    let mut gpus: Vec<&AmdAdapter> = Vec::new();
+    for row in rows {
+        if !gpus.iter().any(|g| g.pci == row.pci) {
+            gpus.push(row);
+        }
+    }
+    let named: Vec<&AmdAdapter> = gpus
+        .iter()
+        .copied()
+        .filter(|g| g.name.trim().eq_ignore_ascii_case(name.trim()))
+        .collect();
+    match (named.as_slice(), gpus.as_slice()) {
+        ([one], _) | ([], [one]) => Some(one.index),
+        _ => None,
+    }
+}
+
+/// A loaded `atiadlxx.dll` with the shown GPU's adapter chosen.
 pub struct Adl {
     _lib: Lib,
     context: *mut c_void,
@@ -248,16 +364,16 @@ pub struct Adl {
 }
 
 impl Adl {
-    fn open() -> Option<Adl> {
+    fn open(name: &str) -> Option<Adl> {
         let lib = Lib(Some(load_system(w!("atiadlxx.dll"))?));
         let h = lib.0?;
         // SAFETY: every alias matches the ADL SDK prototype of that export.
-        let (create, destroy, count, active, fns) = unsafe {
+        let (create, destroy, count, info, fns) = unsafe {
             (
                 export::<AdlCreate>(h, s!("ADL2_Main_Control_Create"))?,
                 export::<AdlDestroy>(h, s!("ADL2_Main_Control_Destroy"))?,
                 export::<AdlCount>(h, s!("ADL2_Adapter_NumberOfAdapters_Get"))?,
-                export::<AdlActive>(h, s!("ADL2_Adapter_Active_Get"))?,
+                export::<AdlInfoGet>(h, s!("ADL2_Adapter_AdapterInfo_Get"))?,
                 AdlFns {
                     pm_log: export(h, s!("ADL2_New_QueryPMLogData_Get")),
                     odn_temp: export(h, s!("ADL2_OverdriveN_Temperature_Get")),
@@ -265,26 +381,31 @@ impl Adl {
                 },
             )
         };
-        let mut context = null_mut();
-        // SAFETY: a valid callback and out-parameter; 1 lists connected adapters only.
-        if unsafe { create(adl_alloc, 1, &mut context) } != ADL_OK || context.is_null() {
-            return None;
-        }
         let mut adl = Adl {
             _lib: lib,
-            context,
-            destroy: Some(destroy),
+            context: null_mut(),
+            destroy: None,
             fns,
             adapter: 0,
             shares: Shares::default(),
         };
-        let mut n = 0;
-        // SAFETY: the context is live and `n` is a valid out-parameter.
-        if unsafe { count(context, &mut n) } != ADL_OK {
+        // SAFETY: a valid callback and out-parameter; 1 lists connected adapters only.
+        if unsafe { create(adl_alloc, 1, &mut adl.context) } != ADL_OK || adl.context.is_null() {
             return None;
         }
-        (adl.adapter, adl.shares) = pick_adapter(&fns, active, context, n)?;
-        Some(adl)
+        adl.destroy = Some(destroy);
+        let mut n = 0;
+        // SAFETY: the context is live and `n` is a valid out-parameter.
+        if unsafe { count(adl.context, &mut n) } != ADL_OK {
+            return None;
+        }
+        adl.adapter = pick_adapter(&adapter_rows(info, adl.context, n), name)?;
+        let r = adl.fns.read(adl.context, adl.adapter);
+        adl.shares = Shares {
+            temp: r.temp_c.is_some(),
+            power: r.power_w.is_some(),
+        };
+        (adl.shares.temp || adl.shares.power).then_some(adl)
     }
 
     fn read(&self) -> Option<NvmlReading> {
@@ -299,6 +420,10 @@ impl Drop for Adl {
             // SAFETY: the context was created in `open` and is destroyed once, before the
             // library is freed by `_lib`.
             unsafe { destroy(self.context) };
+        }
+        // Only a real library can have called `adl_alloc`; fakes in tests never do.
+        if self._lib.0.is_some() {
+            free_adl_allocs();
         }
     }
 }
@@ -352,6 +477,21 @@ fn handles(f: CtlEnum, parent: *mut c_void) -> Vec<*mut c_void> {
     }
     out.truncate(n as usize);
     out
+}
+
+type IntelSensors = (Vec<*mut c_void>, Option<*mut c_void>);
+
+/// Temperature sensors and the first power domain of the only Intel GPU.
+/// shortcut: with two Intel GPUs (an integrated one and an Arc card) we cannot yet tell
+/// which one the sampler shows, so there is no reading rather than a possibly wrong one.
+/// Match the PCI location from `ctlGetDeviceProperties` to lift this.
+fn pick_intel(devices: &[*mut c_void], temps: CtlEnum, power: CtlEnum) -> Option<IntelSensors> {
+    let [device] = devices else {
+        return None;
+    };
+    let t = handles(temps, *device);
+    let p = handles(power, *device).first().copied();
+    (!t.is_empty() || p.is_some()).then_some((t, p))
 }
 
 /// Average power between two energy counter samples (µJ, µs): µJ per µs is watts.
@@ -421,17 +561,7 @@ impl Igcl {
             last: None,
             shares: Shares::default(),
         };
-        // shortcut: takes the first Intel adapter with a sensor; on a PC with two Intel GPUs
-        // that can be the other one. Match the adapter's PCI location if that comes up.
-        let (temps, power) = handles(devices, api)
-            .into_iter()
-            .map(|d| {
-                (
-                    handles(temp_enum, d),
-                    handles(power_enum, d).first().copied(),
-                )
-            })
-            .find(|(t, p)| !t.is_empty() || p.is_some())?;
+        let (temps, power) = pick_intel(&handles(devices, api), temp_enum, power_enum)?;
         igcl.shares = Shares {
             temp: !temps.is_empty(),
             power: power.is_some(),
@@ -487,6 +617,7 @@ impl Drop for Igcl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ptr::without_provenance_mut as fake_handle;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn adl(fns: AdlFns) -> Adl {
@@ -523,17 +654,6 @@ mod tests {
         ADL_OK
     }
 
-    unsafe extern "C" fn pm_temp_only(_: *mut c_void, _: i32, out: *mut PmLog) -> i32 {
-        // SAFETY: as above.
-        unsafe {
-            (*out).sensors[PM_TEMP_EDGE] = PmSensor {
-                supported: 1,
-                value: 55,
-            }
-        };
-        ADL_OK
-    }
-
     unsafe extern "C" fn odn_temp(_: *mut c_void, _: i32, kind: i32, v: *mut i32) -> i32 {
         assert_eq!(kind, ODN_TEMP_CORE);
         // SAFETY: valid out-parameter.
@@ -547,10 +667,32 @@ mod tests {
         ADL_OK
     }
 
-    unsafe extern "C" fn second_active(_: *mut c_void, i: i32, on: *mut i32) -> i32 {
-        // SAFETY: valid out-parameter.
-        unsafe { *on = (i == 1) as i32 };
+    /// Four rows with non-sequential indices: two outputs of one RX 7800 XT, one
+    /// placeholder without a UDID, and an integrated Radeon.
+    unsafe extern "C" fn info_rows(_: *mut c_void, out: *mut AdapterInfo, size: i32) -> i32 {
+        assert_eq!(size as usize, 4 * std::mem::size_of::<AdapterInfo>());
+        // SAFETY: the caller passes four writable rows.
+        let rows = unsafe { std::slice::from_raw_parts_mut(out, 4) };
+        for (row, (index, bus, udid, name)) in rows.iter_mut().zip([
+            (5, 3, true, "AMD Radeon RX 7800 XT"),
+            (7, 3, true, "AMD Radeon RX 7800 XT"),
+            (8, 9, false, ""),
+            (9, 12, true, "AMD Radeon(TM) Graphics"),
+        ]) {
+            row.index = index;
+            row.bus = bus;
+            row.udid[0] = udid as u8;
+            row.name[..name.len()].copy_from_slice(name.as_bytes());
+        }
         ADL_OK
+    }
+
+    fn row(index: i32, bus: i32, name: &str) -> AmdAdapter {
+        AmdAdapter {
+            index,
+            pci: (bus, 0, 0),
+            name: name.into(),
+        }
     }
 
     #[test]
@@ -582,8 +724,8 @@ mod tests {
     #[test]
     fn missing_library_or_vendor_gives_none() {
         assert!(load_system(w!("toolboks-no-such-gpu-library.dll")).is_none());
-        assert!(VendorGpu::open(Vendor::Other).is_none());
-        assert!(VendorGpu::open(Vendor::Nvidia).is_none());
+        assert!(VendorGpu::open(Vendor::Other, "x").is_none());
+        assert!(VendorGpu::open(Vendor::Nvidia, "x").is_none());
     }
 
     #[test]
@@ -616,28 +758,108 @@ mod tests {
     }
 
     #[test]
-    fn amd_missing_sensor_is_not_shared() {
-        let fns = AdlFns {
-            pm_log: Some(pm_temp_only),
-            ..NO_ADL
+    fn missing_sensor_is_not_shared() {
+        let shares = Shares {
+            temp: true,
+            power: false,
         };
-        let (adapter, shares) = pick_adapter(&fns, second_active, null_mut(), 4).unwrap();
-        assert_eq!(adapter, 1);
-        assert_eq!(
-            shares,
-            Shares {
-                temp: true,
-                power: false
-            }
-        );
         assert_eq!(shares.missing(), vec!["Power"]);
         assert_eq!(Shares::default().missing(), vec!["Temp", "Power"]);
-        assert!(pick_adapter(&NO_ADL, second_active, null_mut(), 4).is_none());
+    }
+
+    #[test]
+    fn adapter_info_layout_and_rows() {
+        assert_eq!(std::mem::size_of::<AdapterInfo>(), 1572);
+        let rows = adapter_rows(info_rows, null_mut(), 4);
+        assert_eq!(
+            rows,
+            vec![
+                row(5, 3, "AMD Radeon RX 7800 XT"),
+                row(7, 3, "AMD Radeon RX 7800 XT"),
+                row(9, 12, "AMD Radeon(TM) Graphics"),
+            ]
+        );
+        // The shown GPU is picked by name and the row's own index is used.
+        assert_eq!(pick_adapter(&rows, "AMD Radeon RX 7800 XT"), Some(5));
+        assert_eq!(pick_adapter(&rows, "AMD Radeon(TM) Graphics"), Some(9));
+        // Two AMD GPUs and neither name matches: no guess.
+        assert_eq!(pick_adapter(&rows, "Radeon"), None);
+        assert!(adapter_rows(info_rows, null_mut(), 0).is_empty());
+    }
+
+    #[test]
+    fn amd_pick_is_never_a_guess() {
+        // The only AMD GPU, even when the names are spelled differently.
+        let one = [
+            row(0, 3, "AMD Radeon RX 6600"),
+            row(1, 3, "AMD Radeon RX 6600"),
+        ];
+        assert_eq!(pick_adapter(&one, "Radeon RX 6600 (Microsoft)"), Some(0));
+        // Two cards of the same model: unknown which one is shown.
+        let twins = [
+            row(0, 3, "AMD Radeon RX 6600"),
+            row(1, 4, "AMD Radeon RX 6600"),
+        ];
+        assert_eq!(pick_adapter(&twins, "AMD Radeon RX 6600"), None);
+        assert_eq!(pick_adapter(&[], "AMD Radeon RX 6600"), None);
+    }
+
+    #[test]
+    fn adl_allocations_are_freed() {
+        let p = adl_alloc(64);
+        assert!(!p.is_null());
+        let listed = |p: *mut c_void| {
+            ADL_ALLOCS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(a, _)| *a == p as usize)
+        };
+        assert!(listed(p));
+        free_adl_allocs();
+        assert!(!listed(p));
+    }
+
+    #[test]
+    fn cache_reopens_only_when_the_gpu_changes() {
+        let mut cache = VendorCache::default();
+        let mut opens = 0;
+        let mut open = |_: Vendor, _: &str| {
+            opens += 1;
+            Some(VendorGpu::Amd(adl(NO_ADL)))
+        };
+        assert!(cache.get_with(Vendor::Amd, "RX 6600", &mut open).is_some());
+        assert!(cache.get_with(Vendor::Amd, "RX 6600", &mut open).is_some());
+        assert!(cache
+            .get_with(Vendor::Amd, "RX 7800 XT", &mut open)
+            .is_some());
+        assert!(cache
+            .get_with(Vendor::Intel, "RX 7800 XT", &mut open)
+            .is_some());
+        assert_eq!(opens, 3);
+        // A failed open is kept until the GPU changes, so it is not retried every second.
+        let mut empty = VendorCache::default();
+        assert!(empty.get_with(Vendor::Amd, "A", |_, _| None).is_none());
+        assert!(empty
+            .get_with(Vendor::Amd, "A", |_, _| panic!("reopened"))
+            .is_none());
     }
 
     unsafe extern "C" fn intel_temp(h: *mut c_void, c: *mut f64) -> u32 {
         // SAFETY: valid out-parameter; the fake handles are 1 and 2.
         unsafe { *c = if h as usize == 1 { 50.0 } else { 70.0 } };
+        CTL_OK
+    }
+
+    /// Every fake device has one sensor or domain, whose handle is the device's plus 100.
+    unsafe extern "C" fn one_each(parent: *mut c_void, n: *mut u32, out: *mut *mut c_void) -> u32 {
+        // SAFETY: valid out-parameters; `out` is null on the count call.
+        unsafe {
+            if !out.is_null() {
+                *out = fake_handle(parent as usize + 100);
+            }
+            *n = 1;
+        }
         CTL_OK
     }
 
@@ -654,6 +876,15 @@ mod tests {
     }
 
     #[test]
+    fn intel_only_one_gpu_is_read() {
+        let (temps, power) = pick_intel(&[fake_handle(1)], one_each, one_each).unwrap();
+        assert_eq!(temps, vec![fake_handle::<c_void>(101)]);
+        assert_eq!(power, Some(fake_handle(101)));
+        assert!(pick_intel(&[fake_handle(1), fake_handle(2)], one_each, one_each).is_none());
+        assert!(pick_intel(&[], one_each, one_each).is_none());
+    }
+
+    #[test]
     fn intel_hottest_sensor_and_power_from_energy() {
         let mut igcl = Igcl {
             _lib: Lib(None),
@@ -663,11 +894,8 @@ mod tests {
                 temp: intel_temp,
                 energy: intel_energy,
             },
-            temps: vec![
-                std::ptr::without_provenance_mut(1),
-                std::ptr::without_provenance_mut(2),
-            ],
-            power: Some(std::ptr::without_provenance_mut(3)),
+            temps: vec![fake_handle(1), fake_handle(2)],
+            power: Some(fake_handle(3)),
             last: None,
             shares: Shares::default(),
         };
@@ -682,8 +910,9 @@ mod tests {
     #[ignore]
     fn live_read() {
         for v in [Vendor::Amd, Vendor::Intel] {
-            let Some(mut g) = VendorGpu::open(v) else {
-                println!("{v:?}: no library");
+            let mut cache = VendorCache::default();
+            let Some(g) = cache.get(v, "") else {
+                println!("{v:?}: no library or no single GPU");
                 continue;
             };
             println!("{v:?}: {:?}", g.shares());

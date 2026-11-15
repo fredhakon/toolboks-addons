@@ -13,7 +13,7 @@ use sysinfo::{DiskRefreshKind, Disks, Networks, ProcessRefreshKind, ProcessesToU
 
 use super::gpu::{GpuBasic, GpuReader};
 use super::nvml::{Nvml, NvmlReading};
-use super::vendor_gpu::{Vendor, VendorGpu};
+use super::vendor_gpu::{Vendor, VendorCache};
 use windows::core::w;
 use windows::Win32::System::Performance::{
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue,
@@ -749,8 +749,10 @@ impl Sampler {
                 let clock = CpuClock::new();
                 let mut gpu_reader = GpuReader::new();
                 let nvml = Nvml::open();
-                // Opened on the first AMD or Intel sample, so other PCs never load them.
-                let mut vendor_gpu: Option<Option<VendorGpu>> = None;
+                // AMD and Intel libraries open on the first sample of such a GPU and reopen
+                // when the shown GPU changes; other PCs never load them. Their calls run here
+                // on the sampler thread, never the UI thread.
+                let mut vendor_gpu = VendorCache::default();
                 let mut last_tick = Instant::now();
                 let mut deadline = last_tick + TICK;
 
@@ -814,9 +816,7 @@ impl Sampler {
                                     merge_gpu(basic, nv, Vec::new())
                                 }
                                 vendor => {
-                                    let lib = vendor_gpu
-                                        .get_or_insert_with(|| VendorGpu::open(vendor))
-                                        .as_mut();
+                                    let lib = vendor_gpu.get(vendor, &basic.name);
                                     let missing = lib
                                         .as_ref()
                                         .map(|l| l.shares())

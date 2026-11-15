@@ -18,7 +18,7 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `5a1fee118f98b7e6e677836ec64003e5c3589497` (host staging,
+Host dependencies pin commit `a96b0ab766648033af8937ac12ed269b58d4bbd7` (host staging,
 protocol 3, minimum host 0.12.5). They are not on host main yet. Upgrade all four git
 dependencies together, regenerate `Cargo.lock`, review compatibility and rerun checks.
 

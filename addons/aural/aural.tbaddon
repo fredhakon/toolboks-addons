@@ -11,7 +11,7 @@
     "author": "Toolboks",
     "publisher": "Toolboks",
     "category": "Audio",
-    "icon": "activity",
+    "icon": "mic",
     "accent": "#8B5CF6",
     "api_version": 2,
     "min_toolboks_version": "0.12.5",

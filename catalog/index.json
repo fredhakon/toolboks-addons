@@ -44,7 +44,7 @@
       "long_description": "Event Watch reads the Windows event logs and explains what is going on, with a closer look at crashes and restarts. It reads crash dump headers to name the stop code. It never clears your logs and changes nothing on your PC.",
       "publisher": "Toolboks",
       "category": "System tools",
-      "icon": "grid",
+      "icon": "shield",
       "accent": "#A48ACA",
       "screenshots": [],
       "capabilities": [
@@ -75,7 +75,7 @@
       "long_description": "Memory Cleaner shows how your memory is used, which apps hold the most, and how close Windows is to running short. It can trim the memory that idle apps are not using, by hand or automatically when memory is under real pressure, and it keeps a short history. Trimming moves memory into the cache and never closes an app. One advanced action, clearing the low-priority cache, changes how Windows manages memory for the whole PC: it asks for administrator rights in a separate window and only runs when you confirm there. Nothing is stored between runs.",
       "publisher": "Toolboks",
       "category": "System tools",
-      "icon": "leaf",
+      "icon": "chip",
       "accent": "#A48ACA",
       "screenshots": [],
       "capabilities": [
@@ -137,7 +137,7 @@
       "publisher": "Toolboks",
       "byline": "by aural",
       "category": "Audio",
-      "icon": "activity",
+      "icon": "mic",
       "accent": "#8B5CF6",
       "screenshots": [],
       "capabilities": [
@@ -194,7 +194,7 @@
       "long_description": "Debloater explains optional Windows changes in plain language, so you can turn off what you do not need. Nothing is changed until you choose it, and supported changes can be undone during the session. It changes your own account's settings: privacy and advertising switches, startup entries and installed apps. Changes that need administrator rights are listed but not available yet.",
       "publisher": "Toolboks",
       "category": "System tools",
-      "icon": "wrench",
+      "icon": "sliders",
       "accent": "#A48ACA",
       "screenshots": [],
       "capabilities": [
@@ -226,7 +226,7 @@
       "long_description": "Choose the Gaming profile changes to apply, follow guided Windows and NVIDIA settings, and restore the settings Toolboks applied.",
       "publisher": "Toolboks",
       "category": "System",
-      "icon": "activity",
+      "icon": "gauge",
       "accent": "#8B5CF6",
       "screenshots": [],
       "capabilities": [

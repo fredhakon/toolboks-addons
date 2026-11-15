@@ -229,13 +229,21 @@ tool: reading the real state of every item, the plain-words review, applying and
 current-user changes (privacy and advertising switches, startup entries, installed apps for your
 own account), and the guided tour.
 
-**What does not work yet.** Items that need administrator rights (machine-wide registry values,
-services, scheduled tasks, restore points) are listed and marked "Needs admin", but cannot be
-changed. The built-in tool restarted the whole app as administrator; protocol 3 add-ons never
-run elevated. These changes need the protocol 3 helper: one operation per kind of change, each
-with a preview built from the catalog (never from the request), a confirmation window owned by
-the helper, and undo steps that survive an update or removal. That design is tracked in a
-follow-up issue and nothing here pretends to do it. Real UAC validation is still required.
+**Administrator changes (host issue #145), family by family.** Protocol 3 add-ons never run
+elevated, so a change that needs administrator rights goes to the separate helper, which shows its
+own Confirm / Cancel window and only then runs the engine. The request names catalog items by id;
+the preview text is built from the catalog, never from the request; undo steps are accepted only
+for registry locations the catalog itself lists.
+
+- **Done: Privacy and ads.** Applying items that write the machine-wide registry, the "Create a
+  restore point first" switch, and undoing a run that touched a machine-wide value all go through
+  the helper (`debloat` operation, kinds `registry_apply` and `registry_undo`). Items that only
+  change your own account still run in the add-on without any prompt.
+- **Not yet: Services, Tasks, Startup entries that need administrator rights.** Still listed and
+  marked "Needs admin", but off, until their helper operations exist.
+
+Real UAC validation of the new operations has not been done; the owner chose to test on use and
+report anything found.
 
 The built-in tool stays in the host until the final removal and "Restore your tools" step (host
 #94). Measure with `cargo run --locked -p addon-repo -- measure debloater`.

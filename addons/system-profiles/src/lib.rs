@@ -42,8 +42,8 @@ pub struct Gaming {
     log: VecDeque<String>,
     status: Option<Result<(), String>>,
     message: Option<String>,
-    /// What would change, per choice, for exactly the current selection. Apply needs it.
-    preview: Option<Vec<(String, Vec<String>)>>,
+    /// The last review. Apply needs one made for exactly the current state (see `ReviewKey`).
+    preview: Option<Review>,
 }
 
 struct Guide {
@@ -156,9 +156,77 @@ fn saved_selection(preferences: &BTreeMap<String, serde_json::Value>) -> BTreeSe
         .collect()
 }
 
-/// Apply is only offered once the user has seen the changes for the current selection.
-fn can_apply(busy: bool, has_changes: bool, reviewed: bool) -> bool {
-    !busy && has_changes && reviewed
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReviewMode {
+    Apply,
+    Recovery,
+}
+
+/// What a review was made for. Apply unlocks only while this equals the current state.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ReviewKey {
+    mode: ReviewMode,
+    selected: Vec<&'static str>,
+    enable_protection: bool,
+}
+
+/// What would change, per heading, for the state in `key`.
+struct Review {
+    key: ReviewKey,
+    groups: Vec<(String, Vec<String>)>,
+}
+
+const PROTECTION_LINE: &str =
+    "Turned on for the Windows drive. Windows keeps it enabled after a profile restore.";
+
+fn review_key(
+    recovery: bool,
+    selected: &BTreeSet<&'static str>,
+    enable_protection: bool,
+) -> ReviewKey {
+    ReviewKey {
+        mode: if recovery {
+            ReviewMode::Recovery
+        } else {
+            ReviewMode::Apply
+        },
+        selected: selected.iter().copied().collect(),
+        enable_protection,
+    }
+}
+
+/// Keeps a review only if it was made for the current state.
+fn current_review(review: Option<Review>, key: &ReviewKey) -> Option<Review> {
+    review.filter(|review| review.key == *key)
+}
+
+/// The apply review: the System Protection change (if chosen) first, then each choice's values.
+fn apply_review(key: &ReviewKey, by_choice: Vec<(&'static str, Vec<String>)>) -> Review {
+    let mut groups = Vec::new();
+    if key.enable_protection {
+        groups.push((
+            "System Protection".to_string(),
+            vec![PROTECTION_LINE.into()],
+        ));
+    }
+    groups.extend(
+        by_choice
+            .into_iter()
+            .map(|(title, lines)| (title.to_string(), lines)),
+    );
+    Review {
+        key: key.clone(),
+        groups,
+    }
+}
+
+/// Apply is only offered after a review of exactly this apply selection. A recovery review or
+/// a review of an older selection never counts.
+fn can_apply(busy: bool, key: &ReviewKey, review: Option<&Review>) -> bool {
+    !busy
+        && key.mode == ReviewMode::Apply
+        && (!key.selected.is_empty() || key.enable_protection)
+        && review.is_some_and(|review| review.key == *key)
 }
 
 /// Text badge: the label carries the meaning, the colour only backs it up.
@@ -314,9 +382,8 @@ impl Gaming {
                 }
             }
         });
-        if changed {
-            self.preview = None;
-        }
+        let key = review_key(recovery, &self.selected, self.enable_protection);
+        self.preview = current_review(self.preview.take(), &key);
         let has_changes = !self.selected.is_empty() || self.enable_protection;
         let reviewed = self.preview.is_some();
         let review_label = if recovery {
@@ -335,31 +402,26 @@ impl Gaming {
         {
             self.preview = Some(if recovery {
                 let lines = engine::review_backup().unwrap_or_else(|error| vec![error]);
-                vec![("Saved registry edits".to_string(), lines)]
+                Review {
+                    key: key.clone(),
+                    groups: vec![("Saved registry edits".to_string(), lines)],
+                }
             } else {
                 let selected: Vec<_> = CHOICES
                     .iter()
                     .filter(|choice| self.selected.contains(choice.id))
                     .map(|choice| choice.id)
                     .collect();
-                engine::preview_by_choice(&selected)
-                    .into_iter()
-                    .map(|(title, lines)| (title.to_string(), lines))
-                    .collect()
+                apply_review(&key, engine::preview_by_choice(&selected))
             });
         }
-        if let Some(groups) = &self.preview {
+        let unlocked = can_apply(busy, &key, self.preview.as_ref());
+        if let Some(Review { groups, .. }) = &self.preview {
             ui.label(
                 RichText::new("Now, then new value")
                     .size(theme::TEXT_CAPTION)
                     .color(theme::MUTED),
             );
-            if groups.is_empty() && !recovery {
-                ui.label(
-                    RichText::new("No registry edits. System Protection will be turned on.")
-                        .color(theme::MUTED),
-                );
-            }
             for (title, lines) in groups {
                 ui.label(RichText::new(title).strong());
                 for line in lines {
@@ -370,15 +432,12 @@ impl Gaming {
         ui.add_space(theme::SPACE_XS);
         ui.horizontal_wrapped(|ui| {
             if !recovery {
-                let apply = if reviewed {
+                let apply = if unlocked {
                     primary("Apply Gaming profile")
                 } else {
                     egui::Button::new("Apply Gaming profile")
                 };
-                if ui
-                    .add_enabled(can_apply(busy, has_changes, reviewed), apply)
-                    .clicked()
-                {
+                if ui.add_enabled(unlocked, apply).clicked() {
                     let selected = CHOICES
                         .iter()
                         .filter(|choice| self.selected.contains(choice.id))
@@ -406,7 +465,7 @@ impl Gaming {
                 self.message = open(engine::root().as_os_str()).err();
             }
         });
-        if !recovery && !reviewed {
+        if !recovery && !unlocked {
             ui.label(
                 RichText::new("Review changes first. Apply unlocks for exactly what you reviewed.")
                     .color(theme::MUTED),
@@ -638,10 +697,109 @@ mod tests {
     }
 
     #[test]
-    fn apply_needs_a_review_of_the_current_selection() {
-        assert!(!can_apply(false, true, false));
-        assert!(!can_apply(false, false, true));
-        assert!(!can_apply(true, true, true));
-        assert!(can_apply(false, true, true));
+    fn measured_or_mixed_needs_a_named_source() {
+        for choice in CHOICES {
+            if matches!(choice.evidence, Some(Evidence::Measured | Evidence::Mixed)) {
+                assert!(
+                    !choice.source.contains("No controlled measurement"),
+                    "{} claims evidence without a source",
+                    choice.id
+                );
+            }
+        }
+    }
+
+    fn ids(list: &[&'static str]) -> BTreeSet<&'static str> {
+        list.iter().copied().collect()
+    }
+
+    fn reviewed(key: &ReviewKey) -> Review {
+        apply_review(key, Vec::new())
+    }
+
+    #[test]
+    fn a_review_of_the_current_apply_selection_unlocks_apply() {
+        let key = review_key(false, &ids(&["power"]), false);
+        assert!(!can_apply(false, &key, None));
+        let review = reviewed(&key);
+        assert!(can_apply(false, &key, Some(&review)));
+        assert!(!can_apply(true, &key, Some(&review)));
+    }
+
+    #[test]
+    fn changing_the_selection_or_protection_invalidates_the_review() {
+        let before = review_key(false, &ids(&["power"]), false);
+        let review = reviewed(&before);
+        for after in [
+            review_key(false, &ids(&["power", "location"]), false),
+            review_key(false, &ids(&[]), false),
+            review_key(false, &ids(&["power"]), true),
+        ] {
+            assert!(!can_apply(false, &after, Some(&review)));
+            assert!(current_review(Some(reviewed(&before)), &after).is_none());
+        }
+        assert!(current_review(Some(reviewed(&before)), &before).is_some());
+    }
+
+    #[test]
+    fn selection_order_does_not_change_the_key() {
+        assert_eq!(
+            review_key(false, &ids(&["power", "location"]), false),
+            review_key(false, &ids(&["location", "power"]), false)
+        );
+    }
+
+    #[test]
+    fn a_recovery_review_never_enables_apply() {
+        let recovery = review_key(true, &ids(&["power"]), false);
+        let review = Review {
+            key: recovery.clone(),
+            groups: Vec::new(),
+        };
+        assert!(!can_apply(false, &recovery, Some(&review)));
+        let apply = review_key(false, &ids(&["power"]), false);
+        assert!(!can_apply(false, &apply, Some(&review)));
+        assert!(current_review(Some(review), &apply).is_none());
+    }
+
+    #[test]
+    fn protection_alone_can_be_reviewed_then_applied() {
+        let key = review_key(false, &ids(&[]), true);
+        assert!(!can_apply(false, &key, None));
+        let review = reviewed(&key);
+        assert_eq!(review.groups.len(), 1);
+        assert_eq!(review.groups[0].0, "System Protection");
+        assert!(can_apply(false, &key, Some(&review)));
+        let nothing = review_key(false, &ids(&[]), false);
+        assert!(!can_apply(false, &nothing, Some(&reviewed(&nothing))));
+    }
+
+    #[test]
+    fn protection_is_listed_before_the_choices() {
+        let key = review_key(false, &ids(&["power"]), true);
+        let review = apply_review(
+            &key,
+            vec![("Activate Ultimate Performance", vec!["x".into()])],
+        );
+        let titles: Vec<_> = review
+            .groups
+            .iter()
+            .map(|(title, _)| title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            ["System Protection", "Activate Ultimate Performance"]
+        );
+        let key = review_key(false, &ids(&["power"]), false);
+        assert_eq!(apply_review(&key, Vec::new()).groups.len(), 0);
+    }
+
+    #[test]
+    fn a_saved_selection_starts_unreviewed() {
+        let mut preferences = BTreeMap::new();
+        preferences.insert("selected".to_string(), serde_json::json!(["power"]));
+        let key = review_key(false, &saved_selection(&preferences), false);
+        assert!(Gaming::default().preview.is_none());
+        assert!(!can_apply(false, &key, Gaming::default().preview.as_ref()));
     }
 }

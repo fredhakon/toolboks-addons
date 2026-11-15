@@ -22,7 +22,8 @@ pub enum Evidence {
     /// Our own controlled measurement shows a gain. Nothing qualifies yet.
     #[allow(dead_code)]
     Measured,
-    /// Sources or tests disagree, or the gain is small.
+    /// Only with a named source or our own measurement; none qualifies yet.
+    #[allow(dead_code)]
     Mixed,
     /// No controlled measurement found.
     Unproven,
@@ -86,13 +87,13 @@ pub struct Choice {
 }
 
 pub const CHOICES: &[Choice] = &[
-    Choice { id: "game-mode", title: "Turn on Game Mode", detail: "Enable Game Mode for your Windows account.", group: Group::Performance, evidence: Some(Evidence::Mixed), why: "Windows favours the running game over background work. Independent tests show small or no gain.", source: NO_MEASUREMENT },
-    Choice { id: "game-bar-capture", title: "Turn off Game DVR", detail: "Disable Game Bar recording for your account.", group: Group::Performance, evidence: Some(Evidence::Mixed), why: "Background capture has a small cost while you play. The gain from turning it off is small.", source: NO_MEASUREMENT },
+    Choice { id: "game-mode", title: "Turn on Game Mode", detail: "Enable Game Mode for your Windows account.", group: Group::Performance, evidence: Some(Evidence::Unproven), why: "Tells Windows to favour the running game. No controlled measurement of a gain was found.", source: NO_MEASUREMENT },
+    Choice { id: "game-bar-capture", title: "Turn off Game DVR", detail: "Disable Game Bar recording for your account.", group: Group::Performance, evidence: Some(Evidence::Unproven), why: "Stops Game Bar background recording for your account, so you lose that capture. No controlled measurement of a gain was found.", source: NO_MEASUREMENT },
     Choice { id: "scheduler", title: "Apply gaming scheduler settings", detail: "Set Games scheduling to High, Win32PrioritySeparation to 0x26, and SystemResponsiveness to 10. Changes can affect other apps.", group: Group::Performance, evidence: Some(Evidence::Unproven), why: "These are Windows' own scheduling settings. No controlled benchmark shows a gain.", source: NO_MEASUREMENT },
-    Choice { id: "power", title: "Activate Ultimate Performance", detail: "Create and activate a new Ultimate Performance plan. Power use and heat can increase.", group: Group::Performance, evidence: Some(Evidence::Mixed), why: "Can cut latency and clock-speed ramp-up on desktops. No frame-rate gain is proven, and laptops pay more in power and heat.", source: NO_MEASUREMENT },
+    Choice { id: "power", title: "Activate Ultimate Performance", detail: "Create and activate a new Ultimate Performance plan. Power use and heat can increase.", group: Group::Performance, evidence: Some(Evidence::Unproven), why: "Uses a power plan that limits power saving. No controlled measurement of a gain was found. Power use and heat rise, more on laptops.", source: NO_MEASUREMENT },
     Choice { id: "consumer-features", title: "Turn off suggested app installs", detail: "Applies to Windows Enterprise and Education.", group: Group::Privacy, evidence: None, why: "Stops Windows suggesting and installing promoted apps.", source: MS_CONNECTIONS },
     Choice { id: "diagnostic-data-minimum", title: "Limit Windows diagnostic data", detail: "Sets Required on Pro. Keeps a stricter existing setting.", group: Group::Privacy, evidence: None, why: "Reduces the diagnostic data Windows sends to Microsoft.", source: MS_CONNECTIONS },
-    Choice { id: "activity-history", title: "Turn off activity history policies", detail: "Stops publishing and uploading activity where Windows supports these policies.", group: Group::Privacy, evidence: None, why: "Stops Windows recording and uploading what you do on this PC.", source: MS_CONNECTIONS },
+    Choice { id: "activity-history", title: "Turn off activity history policies", detail: "Stops publishing and uploading activity where Windows supports these policies.", group: Group::Privacy, evidence: None, why: "Stops Windows publishing and uploading activity history where these policies are supported.", source: MS_CONNECTIONS },
     Choice { id: "location", title: "Turn off Windows Location", detail: "Blocks Windows location access for all users on Pro, Enterprise, and Education.", group: Group::Privacy, evidence: None, why: "Stops Windows and apps reading this PC's location.", source: MS_CONNECTIONS },
     Choice { id: "powershell-telemetry", title: "Turn off PowerShell 7 telemetry", detail: "Set the opt-out for your account. Sign out and back in before starting PowerShell 7.", group: Group::Privacy, evidence: None, why: "Stops PowerShell 7 sending usage data.", source: NO_SPEED_CLAIM },
     Choice { id: "storage-sense", title: "Turn off Storage Sense", detail: "Stops automatic storage cleanup for all users on Pro, Enterprise, and Education.", group: Group::Cleanup, evidence: None, why: "Stops Windows clearing temporary files by itself. Disk space may fill sooner.", source: NO_SPEED_CLAIM },

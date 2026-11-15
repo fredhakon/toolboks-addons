@@ -75,6 +75,9 @@ struct Conn {
     identity: Option<ProcessIdentity>,
     name: String,
     exe: Option<String>,
+    /// Image name of the owner's parent from the same snapshot, so a game a listed launcher
+    /// started is protected here too.
+    parent: Option<String>,
     proto: Proto,
     local: (IpAddr, u16),
     /// None for UDP and for listening sockets.
@@ -97,6 +100,39 @@ impl Conn {
 
     fn state_label(&self) -> &'static str {
         self.state.map_or("", state_text)
+    }
+
+    /// Planning gate: true when "End process" must stay off for this owner (Windows, this app,
+    /// or a game, launcher, anti-cheat process or a launcher's child).
+    fn end_blocked(&self, own_pid: u32) -> bool {
+        is_protected(self.pid, &self.name, self.parent.as_deref(), own_pid)
+    }
+
+    /// What the execution gate gets: the owner exactly as the snapshot saw it.
+    fn end_target(&self) -> Option<EndTarget> {
+        Some(EndTarget {
+            identity: self.identity?,
+            name: self.name.clone(),
+            parent: self.parent.clone(),
+        })
+    }
+}
+
+/// The process "End process" acts on: identity (pid + creation time), name and parent from one
+/// snapshot.
+#[derive(Clone, Debug, PartialEq)]
+struct EndTarget {
+    identity: ProcessIdentity,
+    name: String,
+    parent: Option<String>,
+}
+
+impl EndTarget {
+    /// Execution gate: `end_process` refuses a protected name or parent before opening the
+    /// process, and checks creation time and name on a pinned query handle before it opens the
+    /// process with terminate access.
+    fn end(&self) -> Result<(), ActionError> {
+        end_process(self.identity, &self.name, self.parent.as_deref())
     }
 }
 
@@ -346,16 +382,22 @@ fn copy_row(c: &Conn) -> String {
 fn name_rows(raw: Vec<Raw>, names: &HashMap<u32, Owner>) -> Vec<Conn> {
     raw.into_iter()
         .map(|r| {
-            let (name, exe, identity) = match names.get(&r.pid) {
-                Some(owner) => (owner.name.clone(), owner.exe.clone(), owner.identity),
-                None if r.pid == 0 => ("System".to_string(), None, None),
-                None => ("Unknown".to_string(), None, None),
+            let (name, exe, identity, parent) = match names.get(&r.pid) {
+                Some(owner) => (
+                    owner.name.clone(),
+                    owner.exe.clone(),
+                    owner.identity,
+                    owner.parent.clone(),
+                ),
+                None if r.pid == 0 => ("System".to_string(), None, None, None),
+                None => ("Unknown".to_string(), None, None, None),
             };
             Conn {
                 pid: r.pid,
                 identity,
                 name,
                 exe,
+                parent,
                 proto: r.proto,
                 local: r.local,
                 remote: r.remote,
@@ -369,6 +411,23 @@ struct Owner {
     name: String,
     exe: Option<String>,
     identity: Option<ProcessIdentity>,
+    /// Parent image name from the same refresh as `identity`.
+    parent: Option<String>,
+}
+
+/// The owner of `pid` as the refreshed `sys` saw it. The identity only exists when the process
+/// started before `sample_start`, so its name and parent describe that same process.
+fn owner_of(sys: &System, pid: u32, sample_start: u64) -> Option<Owner> {
+    let process = sys.process(sysinfo::Pid::from_u32(pid))?;
+    Some(Owner {
+        name: process.name().to_string_lossy().into_owned(),
+        exe: process.exe().map(|e| e.display().to_string()),
+        identity: sampled_identity(process, sample_start),
+        parent: process
+            .parent()
+            .and_then(|parent| sys.process(parent))
+            .map(|parent| parent.name().to_string_lossy().into_owned()),
+    })
 }
 
 /// What the Resolve button shows once the lookup is done.
@@ -547,17 +606,7 @@ impl Worker {
                         let pids: HashSet<_> = raw.iter().map(|row| row.pid).collect();
                         let names = pids
                             .into_iter()
-                            .filter_map(|pid| {
-                                let process = sys.process(sysinfo::Pid::from_u32(pid))?;
-                                Some((
-                                    pid,
-                                    Owner {
-                                        name: process.name().to_string_lossy().into_owned(),
-                                        exe: process.exe().map(|e| e.display().to_string()),
-                                        identity: sampled_identity(process, sample_start),
-                                    },
-                                ))
-                            })
+                            .filter_map(|pid| Some((pid, owner_of(&sys, pid, sample_start)?)))
                             .collect();
                         name_rows(raw, &names)
                     });
@@ -922,7 +971,7 @@ impl Page {
         ui.separator();
 
         let own_pid = std::process::id();
-        let protected = is_protected(c.pid, &c.name, None, own_pid);
+        let protected = c.end_blocked(own_pid);
         if c.identity.is_some_and(|id| self.denied.contains(&id)) {
             ui.label(
                 RichText::new("Windows denied the previous action for this process.")
@@ -936,7 +985,11 @@ impl Page {
         }
         if protected {
             ui.add_enabled(false, egui::Button::new("End process"));
-            ui.label(RichText::new(protected_note(&c.name, None)).weak().small());
+            ui.label(
+                RichText::new(protected_note(&c.name, c.parent.as_deref()))
+                    .weak()
+                    .small(),
+            );
         } else if self.frozen.is_some() || c.identity.is_none() {
             ui.add_enabled(false, egui::Button::new("End process"));
             let note = if self.frozen.is_some() {
@@ -1020,7 +1073,7 @@ impl Page {
     }
 
     fn start_end(&mut self, ctx: &egui::Context, c: &Conn) {
-        let Some(identity) = c.identity else {
+        let Some(target) = c.end_target() else {
             return;
         };
         if self.end_job.is_some() {
@@ -1028,13 +1081,13 @@ impl Page {
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
-        let (pid, name) = (c.pid, c.name.clone());
         let spawned = std::thread::Builder::new()
             .name("connection-end".into())
             .spawn(move || {
-                let r = end_process(identity, &name, None);
-                let line = result_line("Ended", &name, pid, r);
-                let _ = tx.send((line, identity, r == Err(ActionError::AccessDenied)));
+                let r = target.end();
+                let line = result_line("Ended", &target.name, target.identity.pid, r);
+                let denied = r == Err(ActionError::AccessDenied);
+                let _ = tx.send((line, target.identity, denied));
                 ctx.request_repaint();
             });
         if spawned.is_ok() {
@@ -1060,6 +1113,7 @@ mod tests {
             identity: None,
             name: name.to_string(),
             exe: None,
+            parent: None,
             proto: Proto::Tcp,
             local,
             remote,
@@ -1327,6 +1381,7 @@ mod tests {
                     pid: 7,
                     created: 123,
                 }),
+                parent: Some("launcher.exe".into()),
             },
         );
         let raw = vec![
@@ -1338,6 +1393,8 @@ mod tests {
         assert_eq!(named[0].name, "x.exe");
         assert_eq!(named[0].exe.as_deref(), Some("C:\\x.exe"));
         assert_eq!(named[0].identity.unwrap().created, 123);
+        assert_eq!(named[0].parent.as_deref(), Some("launcher.exe"));
+        assert_eq!(named[1].parent, None);
         let mut replacement = named[0].clone();
         replacement.identity.as_mut().unwrap().created += 1;
         assert_ne!(named[0].key(), replacement.key());
@@ -1345,6 +1402,113 @@ mod tests {
         assert_eq!(named[2].name, "Unknown");
         assert_eq!(resolved_text(&None), "No name found");
         assert_eq!(resolved_text(&Some("h.example".into())), "h.example");
+    }
+
+    #[test]
+    fn a_launchers_child_is_refused_by_both_end_gates() {
+        let own_pid = 1;
+        // Pids are multiples of 4 on Windows, so this one never names a real process.
+        let pid = u32::MAX - 1;
+        let mut game = conn(pid, "IndieGame.exe", (v4(0, 0, 0, 0), 1), None);
+        game.identity = Some(ProcessIdentity { pid, created: 5 });
+        game.parent = Some(r"C:\Steam\steam.exe".into());
+        // Planning gate: the button stays off and the note names the reason.
+        assert!(game.end_blocked(own_pid));
+        // Execution gate: the parent travels with the target and is refused before any
+        // handle exists.
+        let target = game.end_target().expect("verified owner");
+        assert_eq!(target.parent.as_deref(), Some(r"C:\Steam\steam.exe"));
+        let note = "Protected: started by a game launcher, Toolboks leaves it alone.";
+        assert_eq!(target.end(), Err(ActionError::Protected(note)));
+
+        // Listed games and anti-cheat stay refused whatever their parent.
+        for name in ["cs2.exe", "EasyAntiCheat.exe", "steam.exe"] {
+            let mut c = conn(pid, name, (v4(0, 0, 0, 0), 1), None);
+            c.identity = Some(ProcessIdentity { pid, created: 5 });
+            c.parent = Some("explorer.exe".into());
+            assert!(c.end_blocked(own_pid), "{name}");
+            assert!(
+                matches!(
+                    c.end_target().unwrap().end(),
+                    Err(ActionError::Protected(_))
+                ),
+                "{name}"
+            );
+        }
+
+        // An unlisted app under an unlisted parent is still allowed by both gates: the
+        // execution gate goes on to open the pid, which fails only because it is not real.
+        let mut app = conn(pid, "notepad.exe", (v4(0, 0, 0, 0), 1), None);
+        app.identity = Some(ProcessIdentity { pid, created: 5 });
+        app.parent = Some("explorer.exe".into());
+        assert!(!app.end_blocked(own_pid));
+        let r = app.end_target().unwrap().end();
+        assert!(!matches!(r, Err(ActionError::Protected(_))), "{r:?}");
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn end_target_is_tied_to_the_sampled_process() {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32/cmd.exe");
+        let mut child = Command::new(cmd)
+            .args(["/d", "/q", "/c", "set /p toolboks_test_wait="])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        let sample_start = snapshot_start();
+        let mut sys = System::new().unwrap();
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let owner = owner_of(&sys, child.id(), sample_start);
+        // A snapshot that began before the child started never vouches for it.
+        let early = owner_of(&sys, child.id(), 0).and_then(|o| o.identity);
+
+        let rows = owner.map(|o| {
+            let raw = vec![udp_raw(child.id(), (v4(127, 0, 0, 1), 9))];
+            name_rows(raw, &HashMap::from([(child.id(), o)]))
+        });
+        let outcome = rows.as_ref().and_then(|r| r[0].end_target()).map(|t| {
+            // The pid now names a process with another creation time: refused, nothing ended.
+            let reused = EndTarget {
+                identity: ProcessIdentity {
+                    created: t.identity.created - 1,
+                    ..t.identity
+                },
+                ..t.clone()
+            };
+            (t, reused.end())
+        });
+        let still_running = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(early, None);
+        let (target, reused) = outcome.expect("own child sampled with an identity");
+        assert_eq!(target.identity.pid, child_pid);
+        // The parent is this test binary, sampled with the child.
+        let own_exe = std::env::current_exe().unwrap();
+        let own_name = own_exe.file_name().unwrap().to_string_lossy();
+        assert!(
+            target
+                .parent
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(&own_name)),
+            "{target:?}"
+        );
+        assert!(!rows.unwrap()[0].end_blocked(std::process::id()));
+        assert_eq!(reused, Err(ActionError::IdentityChanged));
+        assert!(still_running, "a refused end must leave the process alone");
     }
 
     #[test]

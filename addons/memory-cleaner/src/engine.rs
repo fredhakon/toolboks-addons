@@ -211,19 +211,22 @@ pub struct Inputs<'a> {
     pub min_bytes: u64,
 }
 
-/// One candidate per process that is big enough and can be identified.
-pub fn candidates(
-    inp: &Inputs,
-    identity_of: &dyn Fn(u32, &str) -> Option<Identity>,
-    plays_audio: &dyn Fn(u32) -> bool,
-) -> Vec<Candidate> {
+/// One candidate per process that is big enough and was identified by the snapshot. The
+/// identity's creation time is the one the snapshot recorded, never one read later: the parent
+/// name below comes from the same snapshot, and a later read could pair it with a new process
+/// that reused the pid. Every action checks this creation time before it opens the process.
+pub fn candidates(inp: &Inputs, plays_audio: &dyn Fn(u32) -> bool) -> Vec<Candidate> {
     let name_of = |pid: u32| inp.procs.iter().find(|p| p.pid == pid).map(|p| &p.name);
     let foreground_name = inp.foreground_pid.and_then(name_of);
     inp.procs
         .iter()
         .filter(|p| p.working_set >= inp.min_bytes)
         .filter_map(|p| {
-            let identity = identity_of(p.pid, &p.name)?;
+            let identity = Identity {
+                pid: p.pid,
+                created: p.created?,
+                name: p.name.clone(),
+            };
             let in_front_app = foreground_name.is_some_and(|f| f.eq_ignore_ascii_case(&p.name));
             Some(Candidate {
                 identity,
@@ -404,7 +407,7 @@ impl Memory {
             system_idle: activity::system_idle(),
             min_bytes: policy.min_priority_bytes,
         };
-        let cands = candidates(&inputs, &actions::identity_of, &actions::plays_audio);
+        let cands = candidates(&inputs, &actions::plays_audio);
         let plan = actions::plan(&cands, &policy, &self.cooldowns, now);
 
         if plan.is_empty() {
@@ -576,15 +579,8 @@ mod tests {
             private: 0,
             count: 1,
             parent: None,
+            created: Some(1000 + u64::from(pid)),
         }
-    }
-
-    fn ident(pid: u32, name: &str) -> Option<Identity> {
-        Some(Identity {
-            pid,
-            created: 1,
-            name: name.to_string(),
-        })
     }
 
     fn reading(zero_free: u64, standby: u64, ws: u64) -> RunMeasurement {
@@ -659,12 +655,15 @@ mod tests {
 
     #[test]
     fn candidates_use_activity_foreground_and_parents() {
+        let mut hidden = proc(5, "hidden.exe", 100);
+        // The snapshot could not tie it to a creation time (other user, or a reused pid).
+        hidden.created = None;
         let procs = vec![
             proc(1, "chrome.exe", 800),
             proc(2, "slack.exe", 300),
             proc(3, "tiny.exe", 10),
             proc(4, "child.exe", 200),
-            proc(5, "hidden.exe", 100),
+            hidden,
         ];
         let parents: HashMap<u32, u32> = [(4, 2)].into();
         let mut activity = Activity::new(0);
@@ -679,13 +678,12 @@ mod tests {
             system_idle: Some(Duration::from_secs(20)),
             min_bytes: 50 * MB,
         };
-        let cands = candidates(
-            &inp,
-            &|pid, name| if pid == 5 { None } else { ident(pid, name) },
-            &|pid| pid == 2,
-        );
+        let cands = candidates(&inp, &|pid| pid == 2);
         let names: Vec<&str> = cands.iter().map(|c| c.identity.name.as_str()).collect();
         assert_eq!(names, vec!["chrome.exe", "slack.exe", "child.exe"]);
+        // Each identity carries the creation time the snapshot recorded with its parent.
+        let created: Vec<u64> = cands.iter().map(|c| c.identity.created).collect();
+        assert_eq!(created, vec![1001, 1002, 1004]);
 
         let chrome = &cands[0];
         assert!(chrome.is_fullscreen, "the app in front is full screen");
@@ -695,6 +693,35 @@ mod tests {
         assert!(slack.plays_audio);
         assert_eq!(slack.idle_for, Some(Duration::from_secs(600)));
         assert_eq!(cands[2].parent_name.as_deref(), Some("slack.exe"));
+    }
+
+    #[test]
+    fn a_launchers_child_from_the_snapshot_is_never_planned() {
+        let launcher = proc(10, "steam.exe", 300);
+        let game = proc(11, "IndieGame.exe", 900);
+        let app = proc(12, "notepad.exe", 900);
+        let procs = vec![launcher, game, app];
+        let parents: HashMap<u32, u32> = [(11, 10), (12, 99)].into();
+        let activity = Activity::new(0);
+        let inp = Inputs {
+            procs: &procs,
+            parents: &parents,
+            activity: &activity,
+            now_ms: 3_600_000,
+            foreground_pid: None,
+            fullscreen: false,
+            system_idle: None,
+            min_bytes: 0,
+        };
+        let cands = candidates(&inp, &|_| false);
+        let plan = actions::plan(
+            &cands,
+            &policy_for(Trigger::Manual, 1, None),
+            &Cooldowns::new(),
+            Instant::now(),
+        );
+        assert!(plan.iter().all(|a| a.identity.pid == 12), "{plan:?}");
+        assert!(plan.iter().any(|a| a.identity.pid == 12), "{plan:?}");
     }
 
     #[test]
@@ -748,11 +775,7 @@ mod tests {
         };
         let now = Instant::now();
         let plan_with = |p: &Policy| {
-            let cands = candidates(
-                &inputs(p.min_priority_bytes),
-                &|pid, n| ident(pid, n),
-                &|_| false,
-            );
+            let cands = candidates(&inputs(p.min_priority_bytes), &|_| false);
             actions::plan(&cands, p, &Cooldowns::new(), now)
         };
         let manual = plan_with(&policy_for(Trigger::Manual, 99, None));

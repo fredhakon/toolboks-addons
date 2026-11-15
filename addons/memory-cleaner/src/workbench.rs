@@ -147,8 +147,8 @@ impl Selection {
 /// What "Trim selected" will do.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TrimPlan {
-    /// Trimmable processes: (pid, name).
-    pub targets: Vec<(u32, String)>,
+    /// Trimmable processes: (pid, name, parent name).
+    pub targets: Vec<(u32, String, Option<String>)>,
     /// Number of selected rows that contribute at least one target.
     pub groups: usize,
     /// Selected processes that are protected (system, own, excluded).
@@ -170,10 +170,10 @@ pub fn plan_trim(
         if !selected.contains(&key) {
             continue;
         }
-        if skip_reason(p.pid, &p.name, own_pid, exclusions).is_some() {
+        if skip_reason(p.pid, &p.name, p.parent.as_deref(), own_pid, exclusions).is_some() {
             skipped += 1;
         } else {
-            targets.push((p.pid, p.name.clone()));
+            targets.push((p.pid, p.name.clone(), p.parent.clone()));
             used_keys.insert(key);
         }
     }
@@ -220,6 +220,7 @@ mod tests {
             working_set: 10,
             private: 10,
             count: 1,
+            parent: None,
         }
     }
 
@@ -330,7 +331,7 @@ mod tests {
         let procs = vec![proc(100, "app.exe"), proc(101, "app.exe")];
         let sel: HashSet<String> = ["pid:101".to_string()].into_iter().collect();
         let plan = plan_trim(&procs, &sel, false, 1, &HashSet::new());
-        assert_eq!(plan.targets, vec![(101, "app.exe".to_string())]);
+        assert_eq!(plan.targets, vec![(101, "app.exe".to_string(), None)]);
         assert_eq!(plan.groups, 1);
     }
 

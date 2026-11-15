@@ -79,6 +79,8 @@ struct Proc {
     mem: u64,
     run_secs: u64,
     exe: Option<String>,
+    /// Image name of the parent process, if known (to protect children of game launchers).
+    parent: Option<String>,
 }
 
 /// One table row: a process, or all processes of one name when grouped.
@@ -94,6 +96,8 @@ struct Row {
     mem: u64,
     run_secs: u64,
     exe: Option<String>,
+    /// Parent image name of the first process in the row.
+    parent: Option<String>,
     /// True when every process in the row is protected.
     protected: bool,
 }
@@ -108,19 +112,20 @@ enum SortKey {
 
 /// True for processes Windows needs, this app itself, and game, launcher and anti-cheat
 /// processes. Protected processes are only ever opened with query access for the listing.
-pub(super) fn is_protected(pid: u32, name: &str, own_pid: u32) -> bool {
+/// `parent` is the parent's image name, if known.
+pub(super) fn is_protected(pid: u32, name: &str, parent: Option<&str>, own_pid: u32) -> bool {
     pid == own_pid
         || pid == 0
         || pid == 4
         || PROTECTED
             .iter()
             .any(|protected| name.eq_ignore_ascii_case(protected))
-        || protected_processes::protected_reason(name, None).is_some()
+        || protected_processes::protected_reason(name, parent).is_some()
 }
 
 /// Why a protected process is left alone, for hovers and the inspector.
-pub(super) fn protected_note(name: &str) -> &'static str {
-    protected_processes::protected_reason(name, None).map_or(PROTECTED_NOTE, |p| p.describe())
+pub(super) fn protected_note(name: &str, parent: Option<&str>) -> &'static str {
+    protected_processes::protected_reason(name, parent).map_or(PROTECTED_NOTE, |p| p.describe())
 }
 
 /// Stable key of a row: lowercase name when grouped, process identity when not.
@@ -170,6 +175,7 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     mem: p.mem,
                     run_secs: p.run_secs,
                     exe: p.exe.clone(),
+                    parent: p.parent.clone(),
                     protected: is_prot,
                 });
             }
@@ -335,7 +341,7 @@ pub(super) fn result_line(
         Ok(()) => format!("{done} {name} (pid {pid})"),
         Err(ActionError::AccessDenied) => format!("{name} (pid {pid}): Access denied"),
         Err(ActionError::AlreadyLow) => format!("{name} (pid {pid}): Priority is already low"),
-        Err(ActionError::Protected) => format!("{name} (pid {pid}): {}", protected_note(name)),
+        Err(ActionError::Protected(note)) => format!("{name} (pid {pid}): {note}"),
         Err(ActionError::IdentityChanged) => {
             format!("{name} (pid {pid}): Windows could not verify the selected process")
         }
@@ -353,7 +359,8 @@ pub(super) fn result_line(
 pub(super) enum ActionError {
     AlreadyLow,
     /// Windows, this app, or a game or anti-cheat process: never opened for write access.
-    Protected,
+    /// Carries the reason shown to the user.
+    Protected(&'static str),
     AccessDenied,
     IdentityChanged,
     Failed,
@@ -404,17 +411,53 @@ pub(super) fn sampled_identity(
         .then_some(ProcessIdentity { pid, created })
 }
 
+/// True when the live image name still matches the sampled one and the process is still not
+/// protected, so a reused pid never gets a write-capable handle. Pure.
+fn live_name_ok(pid: u32, sampled: &str, live: &str, parent: Option<&str>, own_pid: u32) -> bool {
+    live.eq_ignore_ascii_case(sampled) && !is_protected(pid, live, parent, own_pid)
+}
+
 fn action_handle(
     identity: ProcessIdentity,
     expected_name: &str,
+    parent: Option<&str>,
     access: PROCESS_ACCESS_RIGHTS,
 ) -> Result<Handle, ActionError> {
-    // Refuse before a handle with write access exists; the check below repeats it on the
-    // verified image name.
-    if is_protected(identity.pid, expected_name, std::process::id()) {
-        return Err(ActionError::Protected);
+    let own_pid = std::process::id();
+    if is_protected(identity.pid, expected_name, parent, own_pid) {
+        return Err(ActionError::Protected(protected_note(
+            expected_name,
+            parent,
+        )));
     }
+    // Verify with a query-only handle first. While it stays open the pid cannot be reused, so
+    // the write-capable handle below belongs to the verified process.
     // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
+    let query = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, identity.pid) }
+        .map(Handle)
+        .map_err(|e| classify(&e))?;
+    if creation_time(query.0).ok() != Some(identity.created) {
+        return Err(ActionError::IdentityChanged);
+    }
+
+    let mut image = vec![0u16; 32_768];
+    let mut len = image.len() as u32;
+    // SAFETY: the handle has query access and the output buffer holds `len` UTF-16 units.
+    unsafe {
+        QueryFullProcessImageNameW(
+            query.0,
+            PROCESS_NAME_WIN32,
+            PWSTR(image.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .map_err(|_| ActionError::IdentityChanged)?;
+    let image = String::from_utf16_lossy(&image[..len as usize]);
+    let live = image.rsplit('\\').next().unwrap_or_default();
+    if !live_name_ok(identity.pid, expected_name, live, parent, own_pid) {
+        return Err(ActionError::IdentityChanged);
+    }
+    // SAFETY: as above.
     let handle = unsafe {
         OpenProcess(
             access | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -424,34 +467,16 @@ fn action_handle(
     }
     .map(Handle)
     .map_err(|e| classify(&e))?;
-    if creation_time(handle.0).ok() != Some(identity.created) {
-        return Err(ActionError::IdentityChanged);
-    }
-
-    let mut image = vec![0u16; 32_768];
-    let mut len = image.len() as u32;
-    // SAFETY: the handle has query access and the output buffer holds `len` UTF-16 units.
-    unsafe {
-        QueryFullProcessImageNameW(
-            handle.0,
-            PROCESS_NAME_WIN32,
-            PWSTR(image.as_mut_ptr()),
-            &mut len,
-        )
-    }
-    .map_err(|_| ActionError::IdentityChanged)?;
-    let image = String::from_utf16_lossy(&image[..len as usize]);
-    let name = image.rsplit('\\').next().unwrap_or_default();
-    if !name.eq_ignore_ascii_case(expected_name)
-        || is_protected(identity.pid, name, std::process::id())
-    {
-        return Err(ActionError::IdentityChanged);
-    }
+    drop(query);
     Ok(handle)
 }
 
-pub(super) fn end_process(identity: ProcessIdentity, name: &str) -> Result<(), ActionError> {
-    let handle = action_handle(identity, name, PROCESS_TERMINATE)?;
+pub(super) fn end_process(
+    identity: ProcessIdentity,
+    name: &str,
+    parent: Option<&str>,
+) -> Result<(), ActionError> {
+    let handle = action_handle(identity, name, parent, PROCESS_TERMINATE)?;
     // SAFETY: the handle is valid and was opened with PROCESS_TERMINATE.
     unsafe { TerminateProcess(handle.0, 1) }.map_err(|e| classify(&e))
 }
@@ -481,10 +506,11 @@ fn lowering_keeps_idle_and_below_normal_priorities() {
 fn set_priority(
     identity: ProcessIdentity,
     name: &str,
+    parent: Option<&str>,
     class: u32,
     lower_only: bool,
 ) -> Result<u32, ActionError> {
-    let handle = action_handle(identity, name, PROCESS_SET_INFORMATION)?;
+    let handle = action_handle(identity, name, parent, PROCESS_SET_INFORMATION)?;
     // SAFETY: the handle is valid and was opened with the needed access.
     let previous = unsafe { GetPriorityClass(handle.0) };
     if previous == 0 {
@@ -547,7 +573,7 @@ fn run_action(action: Action) -> Done {
                 let result = p
                     .identity
                     .ok_or(ActionError::IdentityChanged)
-                    .and_then(|id| end_process(id, &p.name));
+                    .and_then(|id| end_process(id, &p.name, p.parent.as_deref()));
                 note(&mut done, p, "Ended", result);
             }
         }
@@ -557,8 +583,14 @@ fn run_action(action: Action) -> Done {
                     .identity
                     .ok_or(ActionError::IdentityChanged)
                     .and_then(|id| {
-                        set_priority(id, &p.name, BELOW_NORMAL_PRIORITY_CLASS.0, true)
-                            .map(|prev| (id, prev))
+                        set_priority(
+                            id,
+                            &p.name,
+                            p.parent.as_deref(),
+                            BELOW_NORMAL_PRIORITY_CLASS.0,
+                            true,
+                        )
+                        .map(|prev| (id, prev))
                     });
                 match result {
                     Ok((id, prev)) => {
@@ -577,7 +609,7 @@ fn run_action(action: Action) -> Done {
                     .identity
                     .ok_or(ActionError::IdentityChanged)
                     .and_then(|id| {
-                        set_priority(id, &p.name, *prev, false)?;
+                        set_priority(id, &p.name, p.parent.as_deref(), *prev, false)?;
                         done.restored.push(id);
                         Ok(())
                     });
@@ -662,6 +694,10 @@ impl Worker {
                                 mem: p.memory(),
                                 run_secs: p.run_time(),
                                 exe: p.exe().map(|e| e.display().to_string()),
+                                parent: p
+                                    .parent()
+                                    .and_then(|parent| sys.process(parent))
+                                    .map(|parent| parent.name().to_string_lossy().into_owned()),
                             }
                         })
                         .collect();
@@ -802,7 +838,7 @@ impl Page {
             self.rows = None;
         }
         let own_pid = std::process::id();
-        let protected = move |p: &Proc| is_protected(p.pid, &p.name, own_pid);
+        let protected = move |p: &Proc| is_protected(p.pid, &p.name, p.parent.as_deref(), own_pid);
         let procs = Arc::clone(self.frozen.as_ref().unwrap_or(&self.live));
         if self.rows.is_none() {
             let rows = build_rows(&procs, self.grouped, &protected);
@@ -1027,7 +1063,7 @@ impl Page {
                     let cell = |ui: &mut egui::Ui, text: String| {
                         let l = body_cell(ui, text, true, r.protected);
                         if r.protected {
-                            l.on_hover_text(protected_note(&r.name));
+                            l.on_hover_text(protected_note(&r.name, r.parent.as_deref()));
                         }
                     };
                     row.col(|ui| {
@@ -1039,7 +1075,7 @@ impl Page {
                     row.col(|ui| {
                         let l = body_cell(ui, display_name(r), false, r.protected);
                         if r.protected {
-                            l.on_hover_text(protected_note(&r.name));
+                            l.on_hover_text(protected_note(&r.name, r.parent.as_deref()));
                         }
                     });
                     if !grouped {
@@ -1146,9 +1182,9 @@ impl Page {
             let note = if chosen.iter().any(|p| p.identity.is_none() && !protected(p)) {
                 "Windows could not verify the selected processes."
             } else {
-                chosen
-                    .first()
-                    .map_or(PROTECTED_NOTE, |p| protected_note(&p.name))
+                chosen.first().map_or(PROTECTED_NOTE, |p| {
+                    protected_note(&p.name, p.parent.as_deref())
+                })
             };
             ui.label(RichText::new(note).weak().small());
         } else if !skipped.is_empty() {
@@ -1286,6 +1322,7 @@ mod tests {
             mem,
             run_secs: pid as u64,
             exe: None,
+            parent: None,
         }
     }
 
@@ -1411,55 +1448,89 @@ mod tests {
             ..identity
         };
 
-        assert_eq!(end_process(stale, &name), Err(ActionError::IdentityChanged));
         assert_eq!(
-            end_process(identity, "other.exe"),
+            end_process(stale, &name, None),
             Err(ActionError::IdentityChanged)
         );
         assert_eq!(
-            set_priority(stale, &name, BELOW_NORMAL_PRIORITY_CLASS.0, true),
+            end_process(identity, "other.exe", None),
+            Err(ActionError::IdentityChanged)
+        );
+        assert_eq!(
+            set_priority(stale, &name, None, BELOW_NORMAL_PRIORITY_CLASS.0, true),
             Err(ActionError::IdentityChanged)
         );
         assert!(child.try_wait().unwrap().is_none());
 
-        let previous = set_priority(identity, &name, BELOW_NORMAL_PRIORITY_CLASS.0, false).unwrap();
+        let previous =
+            set_priority(identity, &name, None, BELOW_NORMAL_PRIORITY_CLASS.0, false).unwrap();
         assert_eq!(
-            set_priority(identity, &name, previous, false),
+            set_priority(identity, &name, None, previous, false),
             Ok(BELOW_NORMAL_PRIORITY_CLASS.0)
         );
-        end_process(identity, &name).unwrap();
+        end_process(identity, &name, None).unwrap();
         assert_eq!(child.wait().unwrap().code(), Some(1));
     }
 
     #[test]
     fn game_and_anti_cheat_processes_are_refused_before_opening() {
         for name in ["steam.exe", "BEService.exe", "cs2.exe"] {
-            assert!(is_protected(500, name, 1), "{name}");
+            assert!(is_protected(500, name, None, 1), "{name}");
         }
+        assert!(is_protected(500, "IndieGame.exe", Some("steam.exe"), 1));
+        assert!(!is_protected(500, "notepad.exe", Some("explorer.exe"), 1));
         assert_eq!(
-            protected_note("vgc.exe"),
+            protected_note("vgc.exe", None),
             "Protected: anti-cheat process, Toolboks leaves it alone."
         );
-        assert_eq!(protected_note("csrss.exe"), PROTECTED_NOTE);
+        assert_eq!(
+            protected_note("IndieGame.exe", Some("Steam.exe")),
+            "Protected: started by a game launcher, Toolboks leaves it alone."
+        );
+        assert_eq!(protected_note("csrss.exe", None), PROTECTED_NOTE);
         // Pids are multiples of 4 on Windows, so no real process is touched here.
         let fake = ProcessIdentity {
             pid: u32::MAX - 1,
             created: 1,
         };
-        assert_eq!(end_process(fake, "cs2.exe"), Err(ActionError::Protected));
-        assert_eq!(
+        let refused = Err(ActionError::Protected(
+            "Protected: game process, Toolboks leaves it alone.",
+        ));
+        assert_eq!(end_process(fake, "cs2.exe", None), refused);
+        assert!(matches!(
+            end_process(fake, "IndieGame.exe", Some("EpicGamesLauncher.exe")),
+            Err(ActionError::Protected(_))
+        ));
+        assert!(matches!(
             set_priority(
                 fake,
                 "EasyAntiCheat.exe",
+                None,
                 BELOW_NORMAL_PRIORITY_CLASS.0,
                 true
             ),
-            Err(ActionError::Protected)
-        );
+            Err(ActionError::Protected(_))
+        ));
         assert_eq!(
-            result_line("Ended", "cs2.exe", 5, Err(ActionError::Protected)),
+            result_line("Ended", "cs2.exe", 5, refused),
             "cs2.exe (pid 5): Protected: game process, Toolboks leaves it alone."
         );
+    }
+
+    #[test]
+    fn live_name_gate_rejects_changed_or_protected_names() {
+        assert!(live_name_ok(40, "Chrome.exe", "chrome.exe", None, 1));
+        // The pid now belongs to another program.
+        assert!(!live_name_ok(40, "chrome.exe", "notepad.exe", None, 1));
+        assert!(!live_name_ok(40, "chrome.exe", "cs2.exe", None, 1));
+        // Same name, but protected through its launcher parent.
+        assert!(!live_name_ok(
+            40,
+            "game.exe",
+            "game.exe",
+            Some("steam.exe"),
+            1
+        ));
     }
 
     #[test]
@@ -1471,12 +1542,12 @@ mod tests {
             "Memory Compression",
             "dwm.exe",
         ] {
-            assert!(is_protected(500, name, 1), "{name}");
+            assert!(is_protected(500, name, None, 1), "{name}");
         }
-        assert!(is_protected(0, "anything", 1));
-        assert!(is_protected(1234, "whatever.exe", 1234));
-        assert!(!is_protected(777, "refused.exe", 1));
-        assert!(!is_protected(500, "chrome.exe", 1));
+        assert!(is_protected(0, "anything", None, 1));
+        assert!(is_protected(1234, "whatever.exe", None, 1234));
+        assert!(!is_protected(777, "refused.exe", None, 1));
+        assert!(!is_protected(500, "chrome.exe", None, 1));
     }
 
     #[test]

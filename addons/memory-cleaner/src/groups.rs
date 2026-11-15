@@ -300,6 +300,7 @@ mod tests {
             working_set: ws,
             private: 0,
             count: 1,
+            parent: None,
         }
     }
 

@@ -12,6 +12,8 @@ pub struct ProcInfo {
     pub private: u64,
     /// 1 for a single process; the number of processes in a grouped row.
     pub count: usize,
+    /// Image name of the parent process, if known (to protect children of game launchers).
+    pub parent: Option<String>,
 }
 
 /// Merges processes with the same name (case-insensitive) into one row each: memory is
@@ -97,6 +99,10 @@ impl Sampler {
                 working_set: p.memory(),
                 private: p.virtual_memory(),
                 count: 1,
+                parent: p
+                    .parent()
+                    .and_then(|pp| self.sys.process(pp))
+                    .map(|pp| pp.name().to_string_lossy().into_owned()),
             })
             .collect();
         let parents = self
@@ -175,6 +181,7 @@ mod tests {
             working_set,
             private,
             count: 1,
+            parent: None,
         }
     }
 

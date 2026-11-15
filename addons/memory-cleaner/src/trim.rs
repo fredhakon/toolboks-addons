@@ -5,13 +5,14 @@
 
 use std::collections::HashSet;
 
-use windows::core::HRESULT;
+use windows::core::{HRESULT, PWSTR};
 use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows::Win32::System::ProcessStatus::{
     EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+    OpenProcess, QueryFullProcessImageNameW, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
 };
 
 use protected_processes::{protected_reason, Protected};
@@ -61,10 +62,11 @@ impl SkipReason {
 }
 
 /// Why this process must not be trimmed, or `None` if it may be.
-/// `exclusions` holds lowercase process names.
+/// `parent` is the parent's image name, if known. `exclusions` holds lowercase process names.
 pub fn skip_reason(
     pid: u32,
     name: &str,
+    parent: Option<&str>,
     own_pid: u32,
     exclusions: &HashSet<String>,
 ) -> Option<SkipReason> {
@@ -73,9 +75,7 @@ pub fn skip_reason(
         Some(SkipReason::Own)
     } else if pid == 0 || pid == 4 || PROTECTED.contains(&lower.as_str()) {
         Some(SkipReason::System)
-    } else if let Some(p) = protected_reason(&lower, None) {
-        // shortcut: no parent name here, so children of launchers are only caught by the
-        // automatic path (`actions::check_eligibility`); pass the parent if rows ever carry it.
+    } else if let Some(p) = protected_reason(&lower, parent) {
         Some(SkipReason::Protected(p))
     } else if exclusions.contains(&lower) {
         Some(SkipReason::Excluded)
@@ -97,6 +97,55 @@ pub enum TrimError {
     AccessDenied,
     /// Anything else, typically the process exited in the meantime.
     Failed,
+    /// The live process is protected or no longer has the sampled name. No write-capable
+    /// handle was opened.
+    Refused,
+}
+
+/// Image file name of an open process, such as `chrome.exe`.
+pub fn image_name(handle: &Handle) -> Option<String> {
+    let mut image = vec![0u16; 32_768];
+    let mut len = image.len() as u32;
+    // SAFETY: the handle has query access and the buffer holds `len` UTF-16 units.
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle.0,
+            PROCESS_NAME_WIN32,
+            PWSTR(image.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()?;
+    let image = String::from_utf16_lossy(&image[..len as usize]);
+    Some(image.rsplit('\\').next().unwrap_or_default().to_string())
+}
+
+/// True when the live image name still matches the sampled one and still passes the gate,
+/// so a reused pid or a protected process never gets a write-capable handle. Pure.
+pub fn live_name_ok(
+    pid: u32,
+    sampled: &str,
+    live: &str,
+    parent: Option<&str>,
+    own_pid: u32,
+) -> bool {
+    live.eq_ignore_ascii_case(sampled)
+        && skip_reason(pid, live, parent, own_pid, &HashSet::new()).is_none()
+}
+
+fn classify(e: &windows::core::Error) -> TrimError {
+    if e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
+        TrimError::AccessDenied
+    } else {
+        TrimError::Failed
+    }
+}
+
+fn open(pid: u32, access: PROCESS_ACCESS_RIGHTS) -> Result<Handle, TrimError> {
+    // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
+    unsafe { OpenProcess(access, false, pid) }
+        .map(Handle)
+        .map_err(|e| classify(&e))
 }
 
 fn working_set(handle: &Handle) -> Option<u64> {
@@ -108,33 +157,21 @@ fn working_set(handle: &Handle) -> Option<u64> {
     Some(counters.WorkingSetSize as u64)
 }
 
-pub fn trim_process(pid: u32) -> Result<Trimmed, TrimError> {
-    // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
-    let handle = unsafe {
-        OpenProcess(
-            PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION,
-            false,
-            pid,
-        )
+/// Trims one process. `name` and `parent` are what the caller sampled; the live image name is
+/// checked with a query-only handle before any write-capable handle exists.
+pub fn trim_process(pid: u32, name: &str, parent: Option<&str>) -> Result<Trimmed, TrimError> {
+    let query = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let live = image_name(&query).ok_or(TrimError::Failed)?;
+    if !live_name_ok(pid, name, &live, parent, std::process::id()) {
+        return Err(TrimError::Refused);
     }
-    .map(Handle)
-    .map_err(|e| {
-        if e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
-            TrimError::AccessDenied
-        } else {
-            TrimError::Failed
-        }
-    })?;
+    // While `query` is open the pid cannot be reused, so this is the process checked above.
+    let handle = open(pid, PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION)?;
+    drop(query);
 
     let before = working_set(&handle).ok_or(TrimError::Failed)?;
     // SAFETY: the handle is valid and was opened with PROCESS_SET_QUOTA.
-    unsafe { EmptyWorkingSet(handle.0) }.map_err(|e| {
-        if e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
-            TrimError::AccessDenied
-        } else {
-            TrimError::Failed
-        }
-    })?;
+    unsafe { EmptyWorkingSet(handle.0) }.map_err(|e| classify(&e))?;
     let after = working_set(&handle).ok_or(TrimError::Failed)?;
     Ok(Trimmed { before, after })
 }
@@ -150,19 +187,19 @@ mod tests {
     #[test]
     fn protects_system_and_shell_processes_case_insensitively() {
         assert_eq!(
-            skip_reason(4, "System", 999, &none()),
+            skip_reason(4, "System", None, 999, &none()),
             Some(SkipReason::System)
         );
         assert_eq!(
-            skip_reason(500, "CSRSS.exe", 999, &none()),
+            skip_reason(500, "CSRSS.exe", None, 999, &none()),
             Some(SkipReason::System)
         );
         assert_eq!(
-            skip_reason(600, "Explorer.EXE", 999, &none()),
+            skip_reason(600, "Explorer.EXE", None, 999, &none()),
             Some(SkipReason::System)
         );
         assert_eq!(
-            skip_reason(0, "anything", 999, &none()),
+            skip_reason(0, "anything", None, 999, &none()),
             Some(SkipReason::System)
         );
     }
@@ -171,7 +208,7 @@ mod tests {
     fn own_pid_is_skipped_even_if_excluded() {
         let ex: HashSet<String> = ["toolboks.exe".to_string()].into();
         assert_eq!(
-            skip_reason(77, "toolboks.exe", 77, &ex),
+            skip_reason(77, "toolboks.exe", None, 77, &ex),
             Some(SkipReason::Own)
         );
     }
@@ -180,26 +217,55 @@ mod tests {
     fn honours_exclusions_by_lowercase_name() {
         let ex: HashSet<String> = ["chrome.exe".to_string()].into();
         assert_eq!(
-            skip_reason(10, "Chrome.exe", 999, &ex),
+            skip_reason(10, "Chrome.exe", None, 999, &ex),
             Some(SkipReason::Excluded)
         );
-        assert_eq!(skip_reason(11, "firefox.exe", 999, &ex), None);
+        assert_eq!(skip_reason(11, "firefox.exe", None, 999, &ex), None);
     }
 
     #[test]
     fn game_and_anti_cheat_processes_are_protected_even_when_excluded() {
         let ex: HashSet<String> = ["cs2.exe".to_string()].into();
         assert_eq!(
-            skip_reason(20, "CS2.exe", 999, &ex),
+            skip_reason(20, "CS2.exe", None, 999, &ex),
             Some(SkipReason::Protected(Protected::KnownGame))
         );
-        let reason = skip_reason(21, "EasyAntiCheat.exe", 999, &none());
+        let reason = skip_reason(21, "EasyAntiCheat.exe", None, 999, &none());
         assert_eq!(reason, Some(SkipReason::Protected(Protected::AntiCheat)));
         assert_eq!(
             reason.unwrap().describe(),
             "Protected: anti-cheat process, Toolboks leaves it alone."
         );
-        assert_eq!(skip_reason(22, "chrome.exe", 999, &none()), None);
+        assert_eq!(skip_reason(22, "chrome.exe", None, 999, &none()), None);
+    }
+
+    #[test]
+    fn manual_trim_gate_protects_children_of_launchers() {
+        assert_eq!(
+            skip_reason(30, "IndieGame.exe", Some("steam.exe"), 999, &none()),
+            Some(SkipReason::Protected(Protected::ChildOfLauncher))
+        );
+        assert_eq!(
+            skip_reason(31, "notepad.exe", Some("explorer.exe"), 999, &none()),
+            None
+        );
+    }
+
+    #[test]
+    fn live_name_gate_rejects_changed_or_protected_names() {
+        assert!(live_name_ok(40, "Chrome.exe", "chrome.exe", None, 999));
+        // The pid now belongs to another program.
+        assert!(!live_name_ok(40, "chrome.exe", "cs2.exe", None, 999));
+        assert!(!live_name_ok(40, "chrome.exe", "notepad.exe", None, 999));
+        // Same name, but now protected through its launcher parent.
+        assert!(!live_name_ok(
+            40,
+            "game.exe",
+            "game.exe",
+            Some("EpicGamesLauncher.exe"),
+            999
+        ));
+        assert!(!live_name_ok(40, "vgc.exe", "vgc.exe", None, 999));
     }
 
     #[test]
@@ -208,7 +274,7 @@ mod tests {
             .args(["/C", "ping -n 6 127.0.0.1 > nul"])
             .spawn()
             .expect("spawn child");
-        let result = trim_process(child.id());
+        let result = trim_process(child.id(), "cmd.exe", None);
         let _ = child.kill();
         let _ = child.wait();
 
@@ -223,6 +289,6 @@ mod tests {
     #[test]
     fn missing_process_fails_cleanly() {
         // Pids are multiples of 4 on Windows, so this one is never valid.
-        assert!(trim_process(u32::MAX - 1).is_err());
+        assert!(trim_process(u32::MAX - 1, "gone.exe", None).is_err());
     }
 }

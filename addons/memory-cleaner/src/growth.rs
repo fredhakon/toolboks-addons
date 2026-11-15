@@ -474,6 +474,7 @@ mod tests {
             working_set,
             private: 0,
             count: 1,
+            parent: None,
         }
     }
 

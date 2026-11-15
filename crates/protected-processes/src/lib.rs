@@ -1,9 +1,10 @@
 //! Processes that Toolboks add-ons must never open for write access, trim, re-prioritise or
 //! end: anti-cheat services, game launchers, well-known games and anything a launcher started.
 //!
-//! Touching these can get a player flagged by anti-cheat or make a game stutter, so the check is
-//! deliberately broad. It is pure name matching; whether an app runs full screen is a runtime
-//! check the callers make themselves.
+//! Touching these can get a player flagged by anti-cheat or make a game stutter. The tables are
+//! a best-effort subset of well-known names, not a complete list of every game: an unlisted game
+//! is still protected when a listed launcher started it, and Memory Cleaner's automatic runs
+//! also skip any full-screen app (a runtime check the callers make themselves).
 
 /// Anti-cheat services and helpers. Lowercase image names without `.exe`.
 const ANTI_CHEAT: &[&str] = &[
@@ -115,8 +116,9 @@ fn normalize(image_name: &str) -> String {
     }
 }
 
-/// Why this process must never be changed, or `None` if it is not a known game process.
-/// Names may be bare (`steam`), image names (`Steam.exe`) or full paths; case is ignored.
+/// Why this process must never be changed, or `None` if it matches no table and its parent is
+/// not a listed launcher. `None` does not prove it is not a game: the tables are a best-effort
+/// subset. Names may be bare (`steam`), image names (`Steam.exe`) or full paths; case is ignored.
 pub fn protected_reason(image_name: &str, parent_name: Option<&str>) -> Option<Protected> {
     let name = normalize(image_name);
     let is = |list: &[&str], n: &str| list.contains(&n);

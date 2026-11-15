@@ -170,3 +170,24 @@ administrator rights and stores nothing: the graphs live in memory while the add
 The built-in copy stays in the host until the final removal and "Restore your tools" step (host
 #94). Measure with `cargo run --locked -p addon-repo -- measure resource-monitor`.
 
+## Audio Gainer / Aural (host #93)
+
+`addons/aural` builds `aural.exe`, keeping ID `toolboks.aural`, the title Audio Gainer, the
+byline "by aural" and the built-in provider's behavior. The host's `src/native/aural.rs` and its
+`routing` and `settings` modules moved over unchanged apart from imports (the `egui` crate
+instead of `eframe::egui`) and making the type public; 27 of its own unit tests moved with it.
+It needs no administrator rights.
+
+- **Capabilities:** `live_audio` (reads the microphone and plays to chosen outputs) and
+  `local_preferences` (its settings under `audio_settings_v1`, kept by the host).
+- **Background.** `host-services.json` sets `background: true`: an input that is running keeps
+  running, and device discovery keeps going, while the window is hidden. Aural reports that in
+  `has_background_work`, as it did in the host.
+- Sending audio to another app still needs a separately installed virtual cable driver.
+- The repo tool now treats both `host-services.json` keys (`pages`, `background`) as optional,
+  so `catalog-update` no longer panics for add-ons that set only one of them.
+
+The built-in provider and its legacy 0.1 package stay in the host until the final removal and
+"Restore your tools" step (host #94). Measure with
+`cargo run --locked -p addon-repo -- measure aural`.
+

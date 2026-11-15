@@ -1,0 +1,17 @@
+[package]
+name = "aural"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Audio Gainer by aural - native Toolboks add-on for microphone level, monitoring and routing"
+
+[dependencies]
+cpal = "0.15.3"
+egui = { version = "0.37", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+toolboks-addon-sdk.workspace = true
+toolboks-shared.workspace = true
+
+[dev-dependencies]
+toolboks-addon-proto.workspace = true

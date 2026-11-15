@@ -20,9 +20,18 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `a96b0ab766648033af8937ac12ed269b58d4bbd7` (host staging,
-protocol 3, minimum host 0.12.5). They are not on host main yet. Upgrade all four git
-dependencies together, regenerate `Cargo.lock`, review compatibility and rerun checks.
+Host dependencies pin commit `6256466565c46300eae6643d1983acc1932a0d44`, the commit of the
+released host **v0.13.2** (protocol 3, minimum host 0.12.5). Every add-on is built against a
+host that users can actually have.
+
+**When to move the pin:** only to a commit that is in a published host release on `main`, and only
+when an add-on needs something the newer host added (a new SDK field, a new shared helper, a
+protocol change) or a host fix that affects the add-ons' tests. A host release that does not
+touch `sdk/` or `shared/` needs no move. **How:** edit the `rev` of all five host git dependencies
+in the root `Cargo.toml` to the new release commit (`gh release view vX.Y.Z --repo Gusseti/toolboks
+--json targetCommitish`), run `cargo update -p toolboks-addon-sdk -p toolboks-addon-proto -p
+toolboks-shared -p toolboks-catalog -p toolboks-debloat-engine`, then run the checks below for the
+whole workspace and open the PR into `staging`.
 
 ## Build and test
 

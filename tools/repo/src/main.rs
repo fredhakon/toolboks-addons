@@ -38,8 +38,45 @@ fn package(name: &str) -> Package {
     Package::parse(&fs::read(path).unwrap(), "0.12.5").expect("host manifest validation")
 }
 
+/// The sidebar icons the host can draw for an add-on. The names `grid`, `home`, `menu` and `gear`
+/// belong to the Add-ons, Home, hamburger and Settings entries and are not for add-ons.
+const ICONS: [&str; 9] = [
+    "activity", "storage", "macro", "chip", "shield", "mic", "gauge", "sliders", "layers",
+];
+
+/// Every add-on in the catalog needs an icon the host can draw, and no two may share one: the
+/// sidebar is scanned by icon first. `list` is (add-on id, icon).
+fn icon_problem(list: &[(&str, &str)]) -> Option<String> {
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    for (id, icon) in list {
+        if !ICONS.contains(icon) {
+            return Some(format!(
+                "{id}: icon `{icon}` is not one the host draws (use one of {ICONS:?})"
+            ));
+        }
+        if let Some((other, _)) = seen.iter().find(|(o, i)| i == icon && o != id) {
+            return Some(format!("{id} and {other} both use the icon `{icon}`"));
+        }
+        seen.push((id, icon));
+    }
+    None
+}
+
+fn check_icons(index: &Index) {
+    let list: Vec<(&str, &str)> = index
+        .entries
+        .iter()
+        .map(|e| (e.id.as_str(), e.icon.as_str()))
+        .collect();
+    if let Some(problem) = icon_problem(&list) {
+        panic!("{problem}");
+    }
+}
+
 fn validate() {
-    Index::parse(&fs::read("catalog/index.json").unwrap()).expect("host catalog validation");
+    let index =
+        Index::parse(&fs::read("catalog/index.json").unwrap()).expect("host catalog validation");
+    check_icons(&index);
     for dir in fs::read_dir("addons").unwrap() {
         let dir = dir.unwrap();
         if dir.file_type().unwrap().is_dir() {
@@ -116,5 +153,24 @@ fn main() {
         _ => panic!(
             "usage: addon-repo validate | measure <name> | catalog-update <name> <version> <owner/repo> <exe>"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icons_must_be_known_and_unique() {
+        assert_eq!(icon_problem(&[("a", "chip"), ("b", "mic")]), None);
+        // The same add-on may list several versions with one icon.
+        assert_eq!(icon_problem(&[("a", "chip"), ("a", "chip")]), None);
+        assert!(icon_problem(&[("a", "chip"), ("b", "chip")])
+            .unwrap()
+            .contains("both use the icon"));
+        assert!(icon_problem(&[("a", "grid")])
+            .unwrap()
+            .contains("not one the host draws"));
+        assert!(icon_problem(&[("a", "gear")]).is_some());
     }
 }

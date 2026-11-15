@@ -12,7 +12,10 @@ use toolboks_debloat_engine::{
     catalog,
     model::{Applicable, Env, Hive, Item, RegValue, Risk, State},
     plan::{self, Applied, Outcome, Run, UndoOp},
-    restore::{self, WinRestore},
+    restore::{self, RestoreStatus, WinRestore},
+    services::{self, ServiceDef, StartType, WinServices},
+    tasks::{self, TaskDef, WinTasks},
+    ChangeError,
 };
 
 /// The one administrator operation name. The request's `kind` says which change.
@@ -183,6 +186,10 @@ pub fn prepare_admin(request: &AdminRequest) -> Result<Box<dyn AdminChange>, Str
     match value["kind"].as_str() {
         Some("registry_apply") => prepare_registry_apply(&value),
         Some("registry_undo") => prepare_registry_undo(&value),
+        Some("service_set") => prepare_service_set(&value),
+        Some("service_undo") => prepare_service_undo(&value),
+        Some("task_set") => prepare_task_set(&value),
+        Some("task_undo") => prepare_task_undo(&value),
         _ => Err("The administrator request was not understood.".into()),
     }
 }
@@ -382,6 +389,471 @@ impl AdminChange for RegistryUndo {
     }
 }
 
+// ---- restore points, services and tasks: the codec ------------------------------------------
+
+/// A restore point result as JSON.
+pub fn restore_json(status: &RestoreStatus) -> Value {
+    match status {
+        RestoreStatus::Created { sequence } => json!({ "status": "created", "sequence": sequence }),
+        RestoreStatus::SkippedRecent { sequence } => {
+            json!({ "status": "skipped", "sequence": sequence })
+        }
+        RestoreStatus::ProtectionOff => json!({ "status": "protection_off" }),
+        RestoreStatus::NeedsAdmin => json!({ "status": "needs_admin" }),
+        RestoreStatus::Failed(error) => json!({ "status": "failed", "error": error }),
+    }
+}
+
+pub fn restore_from_json(value: &Value) -> Option<RestoreStatus> {
+    let sequence = value["sequence"].as_u64().unwrap_or(0);
+    match value["status"].as_str()? {
+        "created" => Some(RestoreStatus::Created { sequence }),
+        "skipped" => Some(RestoreStatus::SkippedRecent { sequence }),
+        "protection_off" => Some(RestoreStatus::ProtectionOff),
+        "needs_admin" => Some(RestoreStatus::NeedsAdmin),
+        "failed" => Some(RestoreStatus::Failed(
+            value["error"]
+                .as_str()
+                .unwrap_or("Windows refused")
+                .to_owned(),
+        )),
+        _ => None,
+    }
+}
+
+fn start_name(start: StartType) -> Option<&'static str> {
+    match start {
+        StartType::Auto => Some("auto"),
+        StartType::AutoDelayed => Some("auto_delayed"),
+        StartType::Manual => Some("manual"),
+        StartType::Disabled => Some("disabled"),
+        StartType::Other(_) => None,
+    }
+}
+
+fn start_from(name: &str) -> Option<StartType> {
+    match name {
+        "auto" => Some(StartType::Auto),
+        "auto_delayed" => Some(StartType::AutoDelayed),
+        "manual" => Some(StartType::Manual),
+        "disabled" => Some(StartType::Disabled),
+        _ => None,
+    }
+}
+
+pub fn service_by_id(id: &str) -> Option<&'static ServiceDef> {
+    services::catalog().iter().find(|def| def.id == id)
+}
+
+pub fn task_by_id(id: &str) -> Option<&'static TaskDef> {
+    tasks::catalog().iter().find(|def| def.id == id)
+}
+
+pub fn service_step_json(step: &services::UndoStep) -> Value {
+    json!({ "id": step.id, "previous": start_name(step.previous) })
+}
+
+/// A service undo step back from JSON. The name comes from the catalog, never from the request.
+pub fn service_step_from(value: &Value) -> Result<services::UndoStep, String> {
+    let def = value["id"]
+        .as_str()
+        .and_then(service_by_id)
+        .filter(|def| !services::is_never_offered(def.name))
+        .ok_or("An undo step names a service this add-on does not offer.")?;
+    let previous = value["previous"]
+        .as_str()
+        .and_then(start_from)
+        .ok_or("An undo step has a start type this add-on does not write.")?;
+    Ok(services::UndoStep {
+        id: def.id,
+        name: def.name,
+        previous,
+    })
+}
+
+pub fn task_step_json(step: &tasks::UndoStep) -> Value {
+    json!({ "id": step.id, "was_enabled": step.was_enabled })
+}
+
+/// A task undo step back from JSON. The path comes from the catalog, never from the request.
+pub fn task_step_from(value: &Value) -> Result<tasks::UndoStep, String> {
+    let def = value["id"]
+        .as_str()
+        .and_then(task_by_id)
+        .filter(|def| !tasks::is_never_offered(def.path))
+        .ok_or("An undo step names a task this add-on does not offer.")?;
+    let was_enabled = value["was_enabled"]
+        .as_bool()
+        .ok_or("An undo step does not say whether the task was on.")?;
+    Ok(tasks::UndoStep {
+        id: def.id,
+        path: def.path,
+        was_enabled,
+    })
+}
+
+/// The outcome of one change, as the page needs it to rebuild the engine's own result.
+fn change_json<T>(
+    result: &Result<T, ChangeError<T>>,
+    restore: Option<&RestoreStatus>,
+    step: impl Fn(&T) -> Value,
+) -> Value {
+    let restore = restore.map(restore_json).unwrap_or(Value::Null);
+    match result {
+        Ok(done) => json!({ "ok": true, "step": step(done), "restore": restore }),
+        Err(error) => json!({
+            "ok": false,
+            "message": error.message,
+            "recovery": error.recovery.as_ref().map(&step),
+            "restore": restore,
+        }),
+    }
+}
+
+/// The helper's answer back into `Result<UndoStep, ChangeError<UndoStep>>` plus the restore point.
+#[allow(clippy::type_complexity)]
+pub fn change_from_json<T>(
+    value: &Value,
+    step: impl Fn(&Value) -> Result<T, String>,
+) -> (Result<T, ChangeError<T>>, Option<RestoreStatus>) {
+    let restore = restore_from_json(&value["restore"]);
+    if value["ok"].as_bool() == Some(true) {
+        return match step(&value["step"]) {
+            Ok(done) => (Ok(done), restore),
+            Err(message) => (Err(message.into()), restore),
+        };
+    }
+    let recovery = value["recovery"]
+        .is_object()
+        .then(|| step(&value["recovery"]).ok())
+        .flatten();
+    let message = value["message"]
+        .as_str()
+        .unwrap_or("The change stopped unexpectedly.")
+        .to_owned();
+    (Err(ChangeError { message, recovery }), restore)
+}
+
+pub fn service_set_request(id: &str, restore_point: bool) -> String {
+    json!({ "kind": "service_set", "id": id, "restore_point": restore_point }).to_string()
+}
+
+pub fn service_undo_request(steps: &[services::UndoStep]) -> String {
+    json!({
+        "kind": "service_undo",
+        "steps": steps.iter().map(service_step_json).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+pub fn task_set_request(id: &str, enable: bool, restore_point: bool) -> String {
+    json!({ "kind": "task_set", "id": id, "enable": enable, "restore_point": restore_point })
+        .to_string()
+}
+
+pub fn task_undo_request(steps: &[tasks::UndoStep]) -> String {
+    json!({
+        "kind": "task_undo",
+        "steps": steps.iter().map(task_step_json).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+/// How an undo batch ended: how many steps worked, and the ones to keep for another try.
+pub fn undo_batch_from_json<T>(
+    value: &Value,
+    step: impl Fn(&Value) -> Result<T, String>,
+) -> (usize, Vec<T>) {
+    let kept: Vec<T> = value["kept"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| step(entry).ok())
+        .collect();
+    (value["done"].as_u64().unwrap_or(0) as usize, kept)
+}
+
+/// Undoes steps in the order given (newest first), skipping any step whose key already failed so
+/// an older value is never put back over a newer one that is still in place.
+fn undo_batch<T, K: PartialEq>(
+    steps: Vec<T>,
+    key: impl Fn(&T) -> K,
+    mut undo_one: impl FnMut(&T) -> Result<(), String>,
+) -> (usize, Vec<T>) {
+    let (mut done, mut kept, mut blocked): (usize, Vec<T>, Vec<K>) = (0, Vec::new(), Vec::new());
+    for step in steps {
+        let step_key = key(&step);
+        if !blocked.contains(&step_key) && undo_one(&step).is_ok() {
+            done += 1;
+        } else {
+            blocked.push(step_key);
+            kept.push(step);
+        }
+    }
+    (done, kept)
+}
+
+// ---- services and tasks: the helper ----------------------------------------------------------
+
+struct ServiceSet {
+    def: &'static ServiceDef,
+    restore_point: bool,
+    description: String,
+}
+
+struct ServiceUndo {
+    steps: Vec<services::UndoStep>,
+    description: String,
+}
+
+struct TaskSet {
+    def: &'static TaskDef,
+    enable: bool,
+    restore_point: bool,
+    description: String,
+}
+
+struct TaskUndo {
+    steps: Vec<tasks::UndoStep>,
+    description: String,
+}
+
+fn risk_word(risk: Risk) -> &'static str {
+    match risk {
+        Risk::Safe => "Safe",
+        Risk::Careful => "Careful",
+    }
+}
+
+fn restore_line(restore_point: bool) -> &'static str {
+    if restore_point {
+        "\nWindows will create a restore point first. This can take about 20 seconds.\n"
+    } else {
+        ""
+    }
+}
+
+fn service_set_description(def: &ServiceDef, restore_point: bool) -> String {
+    limited(format!(
+        "Switch this Windows service off?\n\n\u{2022} {} ({}, all users of this PC)\n  {}\n  Could stop working: {}\n  Its start type becomes: {}\n{}\nWindows checks the service again before changing it.\nYou can undo this in Toolboks until you close it.",
+        def.title,
+        risk_word(def.risk),
+        def.what_changes,
+        def.could_break,
+        def.target.label(),
+        restore_line(restore_point)
+    ))
+}
+
+fn task_set_description(def: &TaskDef, enable: bool, restore_point: bool) -> String {
+    limited(format!(
+        "Switch this scheduled task {}?\n\n\u{2022} {} ({}, all users of this PC)\n  {}\n  Could stop working: {}\n  Task: {}\n{}\nWindows checks the task again before changing it.\nYou can undo this in Toolboks until you close it.",
+        if enable { "on" } else { "off" },
+        def.title,
+        risk_word(def.risk),
+        def.what_changes,
+        def.could_break,
+        def.path,
+        restore_line(restore_point)
+    ))
+}
+
+fn service_undo_description(steps: &[services::UndoStep]) -> String {
+    let mut text = String::from("Put these Windows services back?\n");
+    for step in steps {
+        let title = service_by_id(step.id).map_or(step.id, |def| def.title);
+        text.push_str(&format!(
+            "\n\u{2022} {title}\n  Start type \u{2192} {}\n",
+            step.previous.label()
+        ));
+    }
+    limited(text)
+}
+
+fn task_undo_description(steps: &[tasks::UndoStep]) -> String {
+    let mut text = String::from("Put these scheduled tasks back?\n");
+    for step in steps {
+        let title = task_by_id(step.id).map_or(step.id, |def| def.title);
+        text.push_str(&format!(
+            "\n\u{2022} {title}\n  \u{2192} {}\n",
+            if step.was_enabled { "on" } else { "off" }
+        ));
+    }
+    limited(text)
+}
+
+fn prepare_service_set(value: &Value) -> Result<Box<dyn AdminChange>, String> {
+    let def = value["id"]
+        .as_str()
+        .and_then(service_by_id)
+        .filter(|def| !services::is_never_offered(def.name))
+        .ok_or("The request names a service this add-on does not offer.")?;
+    let restore_point = value["restore_point"].as_bool().unwrap_or(false);
+    Ok(Box::new(ServiceSet {
+        def,
+        restore_point,
+        description: service_set_description(def, restore_point),
+    }))
+}
+
+fn prepare_task_set(value: &Value) -> Result<Box<dyn AdminChange>, String> {
+    let def = value["id"]
+        .as_str()
+        .and_then(task_by_id)
+        .filter(|def| !tasks::is_never_offered(def.path))
+        .ok_or("The request names a task this add-on does not offer.")?;
+    let enable = value["enable"]
+        .as_bool()
+        .ok_or("The request does not say whether to switch the task on or off.")?;
+    let restore_point = value["restore_point"].as_bool().unwrap_or(false);
+    Ok(Box::new(TaskSet {
+        def,
+        enable,
+        restore_point,
+        description: task_set_description(def, enable, restore_point),
+    }))
+}
+
+fn steps_list(value: &Value) -> Result<&Vec<Value>, String> {
+    value["steps"]
+        .as_array()
+        .filter(|list| !list.is_empty() && list.len() <= MAX_STEPS)
+        .ok_or_else(|| "There is nothing to undo.".to_string())
+}
+
+fn prepare_service_undo(value: &Value) -> Result<Box<dyn AdminChange>, String> {
+    let steps = steps_list(value)?
+        .iter()
+        .map(service_step_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Box::new(ServiceUndo {
+        description: service_undo_description(&steps),
+        steps,
+    }))
+}
+
+fn prepare_task_undo(value: &Value) -> Result<Box<dyn AdminChange>, String> {
+    let steps = steps_list(value)?
+        .iter()
+        .map(task_step_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Box::new(TaskUndo {
+        description: task_undo_description(&steps),
+        steps,
+    }))
+}
+
+/// Makes the restore point when asked. `Some(status)` is a restore point result for the page.
+fn maybe_restore_point(restore_point: bool, what: &str) -> Option<RestoreStatus> {
+    restore_point.then(|| {
+        restore::create(
+            &mut WinRestore,
+            &format!("toolboks: {what}"),
+            backend::detect_env().elevated,
+        )
+    })
+}
+
+fn blocked_by_restore(status: &Option<RestoreStatus>) -> Option<String> {
+    status
+        .as_ref()
+        .filter(|status| restore::is_blocking(status))
+        .map(restore::status_text)
+}
+
+impl AdminChange for ServiceSet {
+    fn capability(&self) -> &str {
+        "system_tuning"
+    }
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+    fn apply(self: Box<Self>) -> Result<String, String> {
+        let point = maybe_restore_point(
+            self.restore_point,
+            &format!("switch off service {}", self.def.title),
+        );
+        let result: Result<services::UndoStep, ChangeError<services::UndoStep>> =
+            match blocked_by_restore(&point) {
+                Some(text) => Err(text.into()),
+                None => services::set_off(&mut WinServices, self.def),
+            };
+        Ok(change_json(&result, point.as_ref(), service_step_json).to_string())
+    }
+}
+
+impl AdminChange for ServiceUndo {
+    fn capability(&self) -> &str {
+        "system_tuning"
+    }
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+    fn apply(self: Box<Self>) -> Result<String, String> {
+        let (done, kept) = undo_batch(
+            self.steps,
+            |step| step.name,
+            |step| services::undo(&mut WinServices, step),
+        );
+        Ok(json!({
+            "done": done,
+            "kept": kept.iter().map(service_step_json).collect::<Vec<_>>(),
+        })
+        .to_string())
+    }
+}
+
+impl AdminChange for TaskSet {
+    fn capability(&self) -> &str {
+        "system_tuning"
+    }
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+    fn apply(self: Box<Self>) -> Result<String, String> {
+        let (def, enable, restore_point) = (self.def, self.enable, self.restore_point);
+        // Task Scheduler uses COM, which must not be initialised on the window's thread.
+        let worker = std::thread::spawn(move || {
+            let point = maybe_restore_point(restore_point, &format!("switch task {}", def.title));
+            let result = match blocked_by_restore(&point) {
+                Some(text) => Err(text.into()),
+                None => tasks::set_enabled(&mut WinTasks, def, enable),
+            };
+            change_json(&result, point.as_ref(), task_step_json).to_string()
+        });
+        worker
+            .join()
+            .map_err(|_| "The task change stopped unexpectedly.".to_string())
+    }
+}
+
+impl AdminChange for TaskUndo {
+    fn capability(&self) -> &str {
+        "system_tuning"
+    }
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+    fn apply(self: Box<Self>) -> Result<String, String> {
+        let steps = self.steps;
+        let worker = std::thread::spawn(move || {
+            let (done, kept) = undo_batch(
+                steps,
+                |step| step.path,
+                |step| tasks::undo(&mut WinTasks, step),
+            );
+            json!({
+                "done": done,
+                "kept": kept.iter().map(task_step_json).collect::<Vec<_>>(),
+            })
+            .to_string()
+        });
+        worker
+            .join()
+            .map_err(|_| "The task undo stopped unexpectedly.".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +995,136 @@ mod tests {
         assert_eq!(run.applied.len(), 1);
         assert_eq!(run.applied[0].outcome, Outcome::Done);
         assert_eq!(run.undo, vec![op]);
+    }
+
+    #[test]
+    fn restore_results_round_trip() {
+        for status in [
+            RestoreStatus::Created { sequence: 3 },
+            RestoreStatus::SkippedRecent { sequence: 4 },
+            RestoreStatus::ProtectionOff,
+            RestoreStatus::NeedsAdmin,
+            RestoreStatus::Failed("no".into()),
+        ] {
+            assert_eq!(restore_from_json(&restore_json(&status)), Some(status));
+        }
+        assert_eq!(restore_from_json(&Value::Null), None);
+    }
+
+    #[test]
+    fn service_and_task_steps_come_back_from_the_catalog() {
+        let def = services::catalog()
+            .iter()
+            .find(|def| !services::is_never_offered(def.name))
+            .unwrap();
+        let step = services::UndoStep {
+            id: def.id,
+            name: def.name,
+            previous: StartType::AutoDelayed,
+        };
+        assert_eq!(service_step_from(&service_step_json(&step)).unwrap(), step);
+        let mut other = service_step_json(&step);
+        other["id"] = json!("nope");
+        assert!(service_step_from(&other).is_err());
+        let mut odd = service_step_json(&step);
+        odd["previous"] = json!("boot");
+        assert!(service_step_from(&odd).is_err());
+
+        let def = tasks::catalog()
+            .iter()
+            .find(|def| !tasks::is_never_offered(def.path))
+            .unwrap();
+        let step = tasks::UndoStep {
+            id: def.id,
+            path: def.path,
+            was_enabled: true,
+        };
+        assert_eq!(task_step_from(&task_step_json(&step)).unwrap(), step);
+        let mut other = task_step_json(&step);
+        other["id"] = json!("nope");
+        assert!(task_step_from(&other).is_err());
+    }
+
+    #[test]
+    fn a_change_result_survives_the_trip_with_its_recovery_step() {
+        let def = tasks::catalog().first().unwrap();
+        let step = tasks::UndoStep {
+            id: def.id,
+            path: def.path,
+            was_enabled: false,
+        };
+        let ok: Result<tasks::UndoStep, ChangeError<tasks::UndoStep>> = Ok(step.clone());
+        let json = change_json(&ok, Some(&RestoreStatus::ProtectionOff), task_step_json);
+        let (back, point) = change_from_json(&json, task_step_from);
+        assert_eq!(back.unwrap(), step);
+        assert_eq!(point, Some(RestoreStatus::ProtectionOff));
+
+        let failed: Result<tasks::UndoStep, ChangeError<tasks::UndoStep>> = Err(ChangeError {
+            message: "Windows refused".into(),
+            recovery: Some(step.clone()),
+        });
+        let json = change_json(&failed, None, task_step_json);
+        let (back, point) = change_from_json(&json, task_step_from);
+        let error = back.unwrap_err();
+        assert_eq!(error.message, "Windows refused");
+        assert_eq!(error.recovery, Some(step));
+        assert_eq!(point, None);
+    }
+
+    #[test]
+    fn an_undo_batch_never_puts_an_older_value_over_a_failed_newer_one() {
+        // Newest first: b2 fails, so the older b1 for the same key must be kept, not applied.
+        let steps = vec![("a", 1), ("b", 2), ("a", 3)];
+        let (done, kept) = undo_batch(
+            steps,
+            |step| step.0,
+            |step| {
+                if step.1 == 1 {
+                    Err("no".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(done, 1);
+        assert_eq!(kept, vec![("a", 1), ("a", 3)]);
+        let (done_json, kept_json) = (
+            json!({ "done": done, "kept": [] }),
+            undo_batch_from_json(&json!({ "done": 1, "kept": [] }), |_| Ok(1)),
+        );
+        assert_eq!(done_json["done"], 1);
+        assert_eq!(kept_json.0, 1);
+    }
+
+    #[test]
+    fn service_and_task_requests_are_validated_and_previewed_from_the_catalog() {
+        let service = services::catalog()
+            .iter()
+            .find(|def| !services::is_never_offered(def.name))
+            .unwrap();
+        let change = prepare_admin(&request(&service_set_request(service.id, true))).unwrap();
+        let text = change.description();
+        assert!(text.contains(service.title) && text.contains(service.could_break));
+        assert!(text.contains("restore point") && text.len() < 8000);
+        assert!(prepare_admin(&request(&service_set_request("nope", false))).is_err());
+
+        let task = tasks::catalog()
+            .iter()
+            .find(|def| !tasks::is_never_offered(def.path))
+            .unwrap();
+        let change = prepare_admin(&request(&task_set_request(task.id, false, false))).unwrap();
+        assert!(change.description().contains(task.path));
+        assert!(change.description().contains("off"));
+        assert!(prepare_admin(&request(&task_set_request("nope", true, false))).is_err());
+        assert!(prepare_admin(&request(r#"{"kind":"task_set","id":"x"}"#)).is_err());
+
+        let step = services::UndoStep {
+            id: service.id,
+            name: service.name,
+            previous: StartType::Manual,
+        };
+        let undo = prepare_admin(&request(&service_undo_request(&[step]))).unwrap();
+        assert!(undo.description().contains("Manual"));
+        assert!(prepare_admin(&request(r#"{"kind":"task_undo","steps":[]}"#)).is_err());
     }
 }

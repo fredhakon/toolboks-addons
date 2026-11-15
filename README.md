@@ -239,8 +239,15 @@ for registry locations the catalog itself lists.
   restore point first" switch, and undoing a run that touched a machine-wide value all go through
   the helper (`debloat` operation, kinds `registry_apply` and `registry_undo`). Items that only
   change your own account still run in the add-on without any prompt.
-- **Not yet: Services, Tasks, Startup entries that need administrator rights.** Still listed and
-  marked "Needs admin", but off, until their helper operations exist.
+- **Done: Services and Tasks.** Switching one service off or one task on or off, the restore point
+  switch on those pages, and undo (one step, the newest step of one service, or all) go through the
+  helper (kinds `service_set`, `service_undo`, `task_set`, `task_undo`). The helper looks the
+  service or task up in the catalog by id (the service name and task path never come from the
+  request), refuses names the engine never offers, and runs the unchanged engine. Task Scheduler
+  work runs on its own thread inside the helper because it uses COM. An undo batch is undone newest
+  first and never puts an older value over a newer one that failed.
+- **Not yet: startup entries that need administrator rights** (all-users entries). Still listed
+  and marked "Needs admin", but off.
 
 Real UAC validation of the new operations has not been done; the owner chose to test on use and
 report anything found.

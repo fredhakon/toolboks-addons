@@ -4,7 +4,7 @@
 // model::Group::Apps is not constructed anywhere yet; drop this once the curated list is used.
 
 use std::collections::HashSet;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 
 use toolboks_addon_sdk::{AdminOutcome, AdminRequest, HostRequest, NativeAddon, TutorialStep};
 
@@ -25,6 +25,10 @@ mod tutorial;
 enum AdminKind {
     RegistryApply,
     RegistryUndo,
+    ServiceSet,
+    ServiceUndo,
+    TaskSet,
+    TaskUndo,
 }
 
 /// State of the Apps page. Package calls are slow, so they run on worker threads and report
@@ -175,6 +179,18 @@ pub struct Debloater {
     next_request: u64,
     /// The request that has been sent and not answered yet, and what it was for.
     admin_pending: Option<(u64, AdminKind)>,
+    /// Where the answer to a service or task request goes, so the page's existing job handling
+    /// shows it exactly as it showed the answer of a worker thread.
+    service_tx: Option<Sender<ServiceJob>>,
+    task_tx: Option<Sender<TaskJob>>,
+    /// The title of the item a pending set request is about.
+    pending_title: String,
+    /// An undo that is waiting for the helper: the steps it was asked to undo (newest first) and the
+    /// steps that were left alone (oldest first).
+    service_batch: Vec<services::UndoStep>,
+    service_rest: Vec<services::UndoStep>,
+    task_batch: Vec<tasks::UndoStep>,
+    task_rest: Vec<tasks::UndoStep>,
 }
 
 impl Debloater {
@@ -199,6 +215,13 @@ impl Debloater {
             request: None,
             next_request: 0,
             admin_pending: None,
+            service_tx: None,
+            task_tx: None,
+            pending_title: String::new(),
+            service_batch: Vec::new(),
+            service_rest: Vec::new(),
+            task_batch: Vec::new(),
+            task_rest: Vec::new(),
         }
     }
 }

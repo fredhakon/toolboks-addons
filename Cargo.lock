@@ -294,6 +294,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "event-watch"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui_extras",
+ "serde_json",
+ "toolboks-addon-proto",
+ "toolboks-addon-sdk",
+ "toolboks-shared",
+ "windows",
+]
+
+[[package]]
 name = "fearless_simd"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

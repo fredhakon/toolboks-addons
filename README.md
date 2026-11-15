@@ -113,3 +113,18 @@ bytes, three spawn-to-first-frame stdio timings, and suspended working set/priva
 after five seconds. The result is process-only and excludes the installer, named pipes and
 host drawing. No catalog writes or signatures occur. Full pilot evidence and remaining
 checks are in the paired host PR under `docs/reviews/88/`.
+
+## Event Watch (host #91)
+
+`addons/event-watch` builds `event-watch.exe`, keeping ID `toolboks.event-watch`, the three
+pages Live, Crashes and Summary, and the built-in tool's behavior. The code is the host's
+`src/tools/events/` moved over; the only changes are the imports (`toolboks_shared::ui` instead
+of the host's own module) and the add-on entry point in `src/lib.rs`. It only reads: Windows
+event logs and crash dump headers, no administrator rights, nothing is cleared or changed. A
+log the user cannot read is reported in the page header as before. Its guided tour has the same
+six steps. Suspending releases the loaded events; they are read again on return. The tool has no
+saved settings today, so nothing needs migrating.
+
+The built-in copy stays in the host until the final removal and "Restore your tools" step (host
+#94), so users never lose the tab or see it twice. Measure it with
+`cargo run --locked -p addon-repo -- measure event-watch`.

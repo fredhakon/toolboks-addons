@@ -7,7 +7,7 @@ use egui::Color32;
 
 use super::memlist::Lists;
 use super::stats::ProcInfo;
-use super::trim::skip_reason;
+use super::trim::{skip_reason, TrimTarget};
 use toolboks_shared::ui::{BarPart, ACCENT, AMBER, GREEN};
 
 /// Physical memory split into the four memory lists.
@@ -147,8 +147,8 @@ impl Selection {
 /// What "Trim selected" will do.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TrimPlan {
-    /// Trimmable processes: (pid, name, parent name).
-    pub targets: Vec<(u32, String, Option<String>)>,
+    /// Trimmable processes as the snapshot saw them (creation time and parent included).
+    pub targets: Vec<TrimTarget>,
     /// Number of selected rows that contribute at least one target.
     pub groups: usize,
     /// Selected processes that are protected (system, own, excluded).
@@ -173,7 +173,12 @@ pub fn plan_trim(
         if skip_reason(p.pid, &p.name, p.parent.as_deref(), own_pid, exclusions).is_some() {
             skipped += 1;
         } else {
-            targets.push((p.pid, p.name.clone(), p.parent.clone()));
+            targets.push(TrimTarget {
+                pid: p.pid,
+                created: p.created,
+                name: p.name.clone(),
+                parent: p.parent.clone(),
+            });
             used_keys.insert(key);
         }
     }
@@ -221,6 +226,7 @@ mod tests {
             private: 10,
             count: 1,
             parent: None,
+            created: Some(u64::from(pid)),
         }
     }
 
@@ -331,8 +337,40 @@ mod tests {
         let procs = vec![proc(100, "app.exe"), proc(101, "app.exe")];
         let sel: HashSet<String> = ["pid:101".to_string()].into_iter().collect();
         let plan = plan_trim(&procs, &sel, false, 1, &HashSet::new());
-        assert_eq!(plan.targets, vec![(101, "app.exe".to_string(), None)]);
+        assert_eq!(
+            plan.targets,
+            vec![TrimTarget {
+                pid: 101,
+                created: Some(101),
+                name: "app.exe".to_string(),
+                parent: None,
+            }]
+        );
         assert_eq!(plan.groups, 1);
+    }
+
+    #[test]
+    fn plan_carries_the_snapshot_identity_and_skips_launcher_children() {
+        let mut game = proc(200, "IndieGame.exe");
+        game.parent = Some("steam.exe".to_string());
+        let mut app = proc(201, "app.exe");
+        app.parent = Some("explorer.exe".to_string());
+        app.created = Some(77);
+        let sel: HashSet<String> = ["pid:200", "pid:201"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let plan = plan_trim(&[game, app], &sel, false, 1, &HashSet::new());
+        assert_eq!(plan.skipped, 1, "the launcher's child is never a target");
+        assert_eq!(
+            plan.targets,
+            vec![TrimTarget {
+                pid: 201,
+                created: Some(77),
+                name: "app.exe".to_string(),
+                parent: Some("explorer.exe".to_string()),
+            }]
+        );
     }
 
     #[test]

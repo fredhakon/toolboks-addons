@@ -14,6 +14,11 @@ pub struct ProcInfo {
     pub count: usize,
     /// Image name of the parent process, if known (to protect children of game launchers).
     pub parent: Option<String>,
+    /// Creation time (FILETIME) of the process this snapshot saw, or `None` when it could not
+    /// be read or the pid may have been reused while the snapshot was taken. Actions open a
+    /// process only when its live creation time equals this, so the parent and name above
+    /// always describe the process that is changed.
+    pub created: Option<u64>,
 }
 
 /// Merges processes with the same name (case-insensitive) into one row each: memory is
@@ -78,6 +83,7 @@ impl Sampler {
 
     /// Full refresh: totals and the process list.
     pub fn refresh(&mut self) -> Snapshot {
+        let sample_start = super::trim::snapshot_start();
         self.sys.refresh_memory();
         let totals = Totals {
             total: self.sys.total_memory(),
@@ -103,6 +109,11 @@ impl Sampler {
                     .parent()
                     .and_then(|pp| self.sys.process(pp))
                     .map(|pp| pp.name().to_string_lossy().into_owned()),
+                created: super::trim::snapshot_created(
+                    p.pid().as_u32(),
+                    p.start_time(),
+                    sample_start,
+                ),
             })
             .collect();
         let parents = self
@@ -182,7 +193,20 @@ mod tests {
             private,
             count: 1,
             parent: None,
+            created: None,
         }
+    }
+
+    #[test]
+    fn snapshot_ties_processes_to_their_creation_time() {
+        let snap = Sampler::new().expect("sampler").refresh();
+        let own = snap
+            .processes
+            .iter()
+            .find(|p| p.pid == std::process::id())
+            .expect("own process in the snapshot");
+        // The test process started long before this snapshot, so it is vouched for.
+        assert!(own.created.is_some(), "{own:?}");
     }
 
     #[test]

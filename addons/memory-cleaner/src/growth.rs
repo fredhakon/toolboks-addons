@@ -475,6 +475,7 @@ mod tests {
             private: 0,
             count: 1,
             parent: None,
+            created: None,
         }
     }
 

@@ -642,12 +642,13 @@ impl Memory {
                 skipped: plan.skipped,
                 failed: 0,
             };
-            for (pid, name, parent) in &plan.targets {
-                if skip_reason(*pid, name, parent.as_deref(), own_pid, &exclusions).is_some() {
+            for target in &plan.targets {
+                let parent = target.parent.as_deref();
+                if skip_reason(target.pid, &target.name, parent, own_pid, &exclusions).is_some() {
                     result.skipped += 1;
                     continue;
                 }
-                match trim_process(*pid, name, parent.as_deref()) {
+                match trim_process(target) {
                     Ok(t) => {
                         result.trimmed += 1;
                         result.before += t.before;

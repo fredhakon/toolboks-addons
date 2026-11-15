@@ -15,18 +15,18 @@ use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
 use windows::core::HRESULT;
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, FILETIME, HANDLE};
+use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows::Win32::System::ProcessStatus::{
     EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
 };
 use windows::Win32::System::Threading::{
-    GetProcessInformation, GetProcessTimes, OpenProcess, ProcessMemoryPriority,
-    SetProcessInformation, MEMORY_PRIORITY, MEMORY_PRIORITY_INFORMATION, PROCESS_ACCESS_RIGHTS,
+    GetProcessInformation, OpenProcess, ProcessMemoryPriority, SetProcessInformation,
+    MEMORY_PRIORITY, MEMORY_PRIORITY_INFORMATION, PROCESS_ACCESS_RIGHTS,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::trim::{image_name, live_name_ok, skip_reason, SkipReason, Trimmed};
+use super::trim::{creation_time, image_name, live_name_ok, skip_reason, SkipReason, Trimmed};
 use toolboks_shared::win::Handle;
 
 /// Memory priority applied to idle background apps (MEMORY_PRIORITY_LOW).
@@ -469,19 +469,11 @@ fn classify(e: &windows::core::Error) -> ActionError {
     }
 }
 
-fn filetime(t: FILETIME) -> u64 {
-    (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
-}
-
-fn creation_time(handle: HANDLE) -> windows::core::Result<u64> {
-    let (mut created, mut exited, mut kernel, mut user) = Default::default();
-    // SAFETY: the handle has query access and all four outputs are valid FILETIME buffers.
-    unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) }?;
-    Ok(filetime(created))
-}
-
-/// Identity of a running process (pid, creation time, given image name), or `None` if it cannot
-/// be opened (protected, other user) or has no creation time.
+/// Identity of whatever process holds `pid` right now (pid, creation time, given image name), or
+/// `None` if it cannot be opened (protected, other user) or has no creation time. Only for
+/// rechecking a known identity: an identity for a process from a snapshot takes the creation
+/// time the snapshot recorded (`ProcInfo::created`), so a reused pid never inherits the old
+/// process's sampled parent.
 pub fn identity_of(pid: u32, name: &str) -> Option<Identity> {
     // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
@@ -503,7 +495,8 @@ fn open_verified(id: &Identity, access: PROCESS_ACCESS_RIGHTS) -> Result<Handle,
     }
     // Verify with a query-only handle first. While it stays open the pid cannot be reused, so
     // the write-capable handle below belongs to the verified process. Its parent was checked
-    // when the action was planned and cannot change for this pid and creation time.
+    // when the action was planned; the identity's creation time comes from the same snapshot
+    // as that parent, so a matching creation time means the parent check was about this process.
     // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
     let query = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, id.pid) }
         .map(Handle)

@@ -667,6 +667,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "resource-monitor"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui_extras",
+ "serde_json",
+ "sysinfo",
+ "toolboks-addon-proto",
+ "toolboks-addon-sdk",
+ "toolboks-shared",
+ "windows",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

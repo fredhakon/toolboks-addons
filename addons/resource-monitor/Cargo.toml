@@ -1,0 +1,20 @@
+[package]
+name = "resource-monitor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Resource Monitor - native Toolboks add-on with live CPU, memory, GPU, disk, network and power graphs"
+
+[dependencies]
+egui = { version = "0.37", default-features = false }
+egui_extras = { version = "0.37", default-features = false }
+serde_json.workspace = true
+sysinfo = { version = "0.40.0", features = ["gpu"] }
+toolboks-addon-sdk.workspace = true
+toolboks-shared.workspace = true
+
+[dev-dependencies]
+toolboks-addon-proto.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_LibraryLoader", "Win32_System_Performance", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Shell"] }

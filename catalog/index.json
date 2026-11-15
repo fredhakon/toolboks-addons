@@ -272,6 +272,42 @@
       "release_notes": "Release aural-v0.3.0.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.disk-manager",
+      "title": "Disk Manager",
+      "short_description": "Map storage and find large files. Keeps your last scan of each drive on this PC. Saved file names stay local; remembering scans can be turned off.",
+      "long_description": "Stratum's disk analysis, built for your Toolboks workspace. Scan any drive or folder, explore an interactive space map, find the largest files, filter by size and age, inspect file types, and export your findings. Analyze fragmentation, inspect Windows optimization history, defragment hard drives, or TRIM SSDs with administrator access. Optimization only runs when requested. Scans are read-only, run in the background, and can be cancelled. Links and junctions are skipped; access errors are reported transparently. Sizes are logical file lengths and may differ from allocated disk usage. Drive-changing optimization is unavailable pending host issue #132 and a rebuild against its protocol and elevated helper. Keeps your last scan of each drive on this PC, in the add-on data folder, never in preferences or online. Turn off Remember my last scan or use Delete saved scans to remove saved file names. Quick rescans compare folder times; in-place file size changes require Full rescan.",
+      "publisher": "Toolboks",
+      "byline": "by stratum",
+      "category": "Storage",
+      "icon": "storage",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "filesystem_read",
+        "local_preferences",
+        "user_exports",
+        "drive_optimize"
+      ],
+      "pages": [
+        "Overview",
+        "Largest files",
+        "File types",
+        "Scan details",
+        "Optimization"
+      ],
+      "background": true,
+      "kind": "native",
+      "version": "0.3.0",
+      "min_toolboks_version": "0.12.5",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/disk-manager-v0.3.0/disk-manager.exe",
+      "size": 3755008,
+      "sha256": "d8dd40822b2cbbb373088945d0007723320a4c17ebc7de2ef9383915cc28ac50",
+      "release_notes": "Release disk-manager-v0.3.0.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

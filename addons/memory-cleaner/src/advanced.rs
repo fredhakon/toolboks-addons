@@ -14,7 +14,7 @@ use super::groups::color_for;
 use super::growth::Hint;
 use super::stats::{format_bytes, group_by_name, sort_and_filter, ProcInfo, SortKey};
 use super::style::{panel, section, section_with_note, stat_row};
-use super::trim::{skip_reason, trim_process, SkipReason};
+use super::trim::{skip_reason, trim_process, SkipReason, TrimError};
 use super::workbench::{
     legend, list_bar_parts, list_segments, plan_trim, row_key, share_of, trim_summary,
 };
@@ -271,7 +271,7 @@ impl Memory {
                     let key = row_key(grouped, p);
                     let is_selected = selection.contains(&key);
                     row.set_selected(is_selected);
-                    let reason = skip_reason(p.pid, &p.name, own_pid, exclusions);
+                    let reason = skip_reason(p.pid, &p.name, p.parent.as_deref(), own_pid, exclusions);
                     row.col(|ui| {
                         let mut on = is_selected;
                         if ui.checkbox(&mut on, "").changed() {
@@ -320,9 +320,12 @@ impl Memory {
                             .on_hover_text(hint.text());
                     });
                     row.col(|ui| {
-                        // System and shell processes are always protected, so they show as
-                        // ticked and locked.
-                        let locked = matches!(reason, Some(SkipReason::System | SkipReason::Own));
+                        // System, shell, game and anti-cheat processes are always protected, so
+                        // they show as ticked and locked.
+                        let locked = matches!(
+                            reason,
+                            Some(SkipReason::System | SkipReason::Own | SkipReason::Protected(_))
+                        );
                         let mut protected = reason.is_some();
                         let tick = ui
                             .add_enabled(!locked, egui::Checkbox::without_text(&mut protected))
@@ -431,8 +434,14 @@ impl Memory {
             private += p.private;
             first.get_or_insert(p);
             if !matches!(
-                skip_reason(p.pid, &p.name, own_pid, &self.exclusions),
-                Some(SkipReason::System | SkipReason::Own)
+                skip_reason(
+                    p.pid,
+                    &p.name,
+                    p.parent.as_deref(),
+                    own_pid,
+                    &self.exclusions
+                ),
+                Some(SkipReason::System | SkipReason::Own | SkipReason::Protected(_))
             ) {
                 names.insert(p.name.to_lowercase());
             }
@@ -462,7 +471,15 @@ impl Memory {
             format!("{} items", rows.len())
         };
         let single_reason = (rows.len() == 1 && plan.targets.is_empty())
-            .then(|| skip_reason(first.pid, &first.name, own_pid, &self.exclusions))
+            .then(|| {
+                skip_reason(
+                    first.pid,
+                    &first.name,
+                    first.parent.as_deref(),
+                    own_pid,
+                    &self.exclusions,
+                )
+            })
             .flatten();
         let all_protected = !names.is_empty() && names.iter().all(|n| self.exclusions.contains(n));
 
@@ -625,17 +642,19 @@ impl Memory {
                 skipped: plan.skipped,
                 failed: 0,
             };
-            for (pid, name) in &plan.targets {
-                if skip_reason(*pid, name, own_pid, &exclusions).is_some() {
+            for (pid, name, parent) in &plan.targets {
+                if skip_reason(*pid, name, parent.as_deref(), own_pid, &exclusions).is_some() {
                     result.skipped += 1;
                     continue;
                 }
-                match trim_process(*pid) {
+                match trim_process(*pid, name, parent.as_deref()) {
                     Ok(t) => {
                         result.trimmed += 1;
                         result.before += t.before;
                         result.after += t.after;
                     }
+                    // The live process is protected or no longer the one selected.
+                    Err(TrimError::Refused) => result.skipped += 1,
                     Err(_) => result.failed += 1,
                 }
             }

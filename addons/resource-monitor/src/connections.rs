@@ -22,8 +22,8 @@ use windows::Win32::Networking::WinSock::{
 };
 
 use super::processes::{
-    confirm_text, end_process, is_protected, kv, result_line, sampled_identity, snapshot_start,
-    sort_arrow, visible, ActionError, ProcessIdentity, INSPECTOR_WIDTH, PROTECTED_NOTE, REFRESH,
+    confirm_text, end_process, is_protected, kv, protected_note, result_line, sampled_identity,
+    snapshot_start, sort_arrow, visible, ActionError, ProcessIdentity, INSPECTOR_WIDTH, REFRESH,
     ROW_HEIGHT,
 };
 use toolboks_shared::ui::{
@@ -922,7 +922,7 @@ impl Page {
         ui.separator();
 
         let own_pid = std::process::id();
-        let protected = is_protected(c.pid, &c.name, own_pid);
+        let protected = is_protected(c.pid, &c.name, None, own_pid);
         if c.identity.is_some_and(|id| self.denied.contains(&id)) {
             ui.label(
                 RichText::new("Windows denied the previous action for this process.")
@@ -936,7 +936,7 @@ impl Page {
         }
         if protected {
             ui.add_enabled(false, egui::Button::new("End process"));
-            ui.label(RichText::new(PROTECTED_NOTE).weak().small());
+            ui.label(RichText::new(protected_note(&c.name, None)).weak().small());
         } else if self.frozen.is_some() || c.identity.is_none() {
             ui.add_enabled(false, egui::Button::new("End process"));
             let note = if self.frozen.is_some() {
@@ -1032,7 +1032,7 @@ impl Page {
         let spawned = std::thread::Builder::new()
             .name("connection-end".into())
             .spawn(move || {
-                let r = end_process(identity, &name);
+                let r = end_process(identity, &name, None);
                 let line = result_line("Ended", &name, pid, r);
                 let _ = tx.send((line, identity, r == Err(ActionError::AccessDenied)));
                 ctx.request_repaint();

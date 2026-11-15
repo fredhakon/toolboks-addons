@@ -8,6 +8,7 @@ description = "Memory Cleaner - native Toolboks add-on that shows and trims memo
 [dependencies]
 egui = { version = "0.37", default-features = false }
 egui_extras = { version = "0.37", default-features = false }
+protected-processes.workspace = true
 serde_json.workspace = true
 sysinfo = "0.40.0"
 toolboks-addon-sdk.workspace = true

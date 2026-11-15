@@ -575,6 +575,7 @@ mod tests {
             working_set: mb * MB,
             private: 0,
             count: 1,
+            parent: None,
         }
     }
 

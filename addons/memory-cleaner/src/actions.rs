@@ -14,20 +14,19 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use windows::core::{HRESULT, PWSTR};
+use windows::core::HRESULT;
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, FILETIME, HANDLE};
 use windows::Win32::System::ProcessStatus::{
     EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
 };
 use windows::Win32::System::Threading::{
     GetProcessInformation, GetProcessTimes, OpenProcess, ProcessMemoryPriority,
-    QueryFullProcessImageNameW, SetProcessInformation, MEMORY_PRIORITY,
-    MEMORY_PRIORITY_INFORMATION, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+    SetProcessInformation, MEMORY_PRIORITY, MEMORY_PRIORITY_INFORMATION, PROCESS_ACCESS_RIGHTS,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::trim::{skip_reason, Trimmed};
+use super::trim::{image_name, live_name_ok, skip_reason, SkipReason, Trimmed};
 use toolboks_shared::win::Handle;
 
 /// Memory priority applied to idle background apps (MEMORY_PRIORITY_LOW).
@@ -71,23 +70,6 @@ const EXTRA_PROTECTED: &[&str] = &[
     "textinputhost.exe",
     "runtimebroker.exe",
     "taskhostw.exe",
-];
-
-/// Known game launchers and anti-cheat services. Matched against the app and its parent.
-const LAUNCHERS: &[&str] = &[
-    "steam.exe",
-    "steamwebhelper.exe",
-    "epicgameslauncher.exe",
-    "battle.net.exe",
-    "eadesktop.exe",
-    "origin.exe",
-    "upc.exe",
-    "ubisoftconnect.exe",
-    "galaxyclient.exe",
-    "riotclientservices.exe",
-    "easyanticheat.exe",
-    "beservice.exe",
-    "vgc.exe",
 ];
 
 /// Who a process is. A pid alone is not enough: pids get reused.
@@ -188,6 +170,7 @@ pub enum Skip {
     NotIdle,
     PlaysAudio,
     Fullscreen,
+    /// A game, game launcher or anti-cheat process, or a child of a launcher.
     Launcher,
     TooSmall,
     Cooldown,
@@ -239,7 +222,9 @@ pub fn check_eligibility(
     if c.identity.pid == policy.own_pid {
         return Err(Skip::Own);
     }
-    if skip_reason(c.identity.pid, &name, policy.own_pid, &HashSet::new()).is_some()
+    // Game and anti-cheat processes are checked below together with their parent.
+    if skip_reason(c.identity.pid, &name, None, policy.own_pid, &HashSet::new())
+        == Some(SkipReason::System)
         || EXTRA_PROTECTED.contains(&name.as_str())
     {
         return Err(Skip::System);
@@ -256,11 +241,7 @@ pub fn check_eligibility(
     if c.is_fullscreen {
         return Err(Skip::Fullscreen);
     }
-    let parent_is_launcher = c
-        .parent_name
-        .as_ref()
-        .is_some_and(|p| LAUNCHERS.contains(&p.to_lowercase().as_str()));
-    if LAUNCHERS.contains(&name.as_str()) || parent_is_launcher {
+    if protected_processes::protected_reason(&name, c.parent_name.as_deref()).is_some() {
         return Err(Skip::Launcher);
     }
     if c.plays_audio {
@@ -516,32 +497,29 @@ pub fn identity_of(pid: u32, name: &str) -> Option<Identity> {
 
 /// Opens the process and verifies start time and image name before returning the handle.
 fn open_verified(id: &Identity, access: PROCESS_ACCESS_RIGHTS) -> Result<Handle, ActionError> {
+    // Game and anti-cheat processes are refused before any handle with write access exists.
+    if protected_processes::protected_reason(&id.name, None).is_some() {
+        return Err(ActionError::AccessDenied);
+    }
+    // Verify with a query-only handle first. While it stays open the pid cannot be reused, so
+    // the write-capable handle below belongs to the verified process. Its parent was checked
+    // when the action was planned and cannot change for this pid and creation time.
     // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
+    let query = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, id.pid) }
+        .map(Handle)
+        .map_err(|e| classify(&e))?;
+    if creation_time(query.0).ok() != Some(id.created) {
+        return Err(ActionError::IdentityChanged);
+    }
+    let live = image_name(&query).ok_or(ActionError::IdentityChanged)?;
+    if !live_name_ok(id.pid, &id.name, &live, None, std::process::id()) {
+        return Err(ActionError::IdentityChanged);
+    }
+    // SAFETY: as above.
     let handle = unsafe { OpenProcess(access | PROCESS_QUERY_LIMITED_INFORMATION, false, id.pid) }
         .map(Handle)
         .map_err(|e| classify(&e))?;
-    if creation_time(handle.0).ok() != Some(id.created) {
-        return Err(ActionError::IdentityChanged);
-    }
-    let mut image = vec![0u16; 32_768];
-    let mut len = image.len() as u32;
-    // SAFETY: the handle has query access and the buffer holds `len` UTF-16 units.
-    unsafe {
-        QueryFullProcessImageNameW(
-            handle.0,
-            PROCESS_NAME_WIN32,
-            PWSTR(image.as_mut_ptr()),
-            &mut len,
-        )
-    }
-    .map_err(|_| ActionError::IdentityChanged)?;
-    let image = String::from_utf16_lossy(&image[..len as usize]);
-    let name = image.rsplit('\\').next().unwrap_or_default();
-    if !name.eq_ignore_ascii_case(&id.name)
-        || skip_reason(id.pid, name, std::process::id(), &HashSet::new()).is_some()
-    {
-        return Err(ActionError::IdentityChanged);
-    }
+    drop(query);
     Ok(handle)
 }
 
@@ -749,6 +727,13 @@ mod tests {
         let mut child = cand(8, "game.exe", 500);
         child.parent_name = Some("EpicGamesLauncher.exe".into());
         assert_eq!(check(&child, Kind::Trim), Err(Skip::Launcher));
+        for name in ["BEService.exe", "vgc.exe", "cs2.exe"] {
+            assert_eq!(
+                check(&cand(8, name, 500), Kind::LowerPriority),
+                Err(Skip::Launcher),
+                "{name}"
+            );
+        }
     }
 
     #[test]

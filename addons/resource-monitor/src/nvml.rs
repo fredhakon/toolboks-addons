@@ -13,7 +13,8 @@ use windows::Win32::System::{
 };
 use windows::Win32::UI::Shell::{FOLDERID_ProgramFiles, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
-/// Extras only NVIDIA's driver library can give. Every field is `None` when unavailable.
+/// Extras only the GPU vendor's driver library can give (NVML here, ADL or IGCL in
+/// `vendor_gpu.rs`). Every field is `None` when unavailable.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NvmlReading {
     pub temp_c: Option<f32>,
@@ -48,7 +49,7 @@ pub struct Nvml {
 ///
 /// # Safety
 /// `T` must be the exact function-pointer type of the export.
-unsafe fn export<T: Copy>(lib: HMODULE, name: PCSTR) -> Option<T> {
+pub(crate) unsafe fn export<T: Copy>(lib: HMODULE, name: PCSTR) -> Option<T> {
     // SAFETY: `lib` is a live module handle and `name` is NUL-terminated.
     let p = unsafe { GetProcAddress(lib, name) }?;
     // SAFETY: caller guarantees `T` matches; both are pointer-sized fn pointers.

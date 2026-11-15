@@ -22,6 +22,8 @@ pub(super) const VIOLET: Color32 = DATA_MEMORY;
 pub(super) const SKY: Color32 = DATA_NETWORK;
 pub(super) const GREY: Color32 = DATA_SECOND;
 pub(super) const NONE: &str = "-";
+/// Value shown for a GPU reading the vendor driver does not give (AMD and Intel only).
+pub(super) const NOT_SHARED: &str = "Not shared";
 
 /// Memory in use as a percentage of the total; 0 when the total is unknown.
 pub(super) fn mem_percent(used: u64, total: u64) -> f32 {

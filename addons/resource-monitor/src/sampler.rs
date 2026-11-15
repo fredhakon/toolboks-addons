@@ -13,6 +13,7 @@ use sysinfo::{DiskRefreshKind, Disks, Networks, ProcessRefreshKind, ProcessesToU
 
 use super::gpu::{GpuBasic, GpuReader};
 use super::nvml::{Nvml, NvmlReading};
+use super::vendor_gpu::{Vendor, VendorGpu};
 use windows::core::w;
 use windows::Win32::System::Performance::{
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue,
@@ -113,7 +114,7 @@ pub struct SystemCounts {
     pub handles: u32,
 }
 
-/// The main GPU, merged from the generic readings and, on NVIDIA, the driver library.
+/// The main GPU, merged from the generic readings and the vendor's driver library.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GpuSample {
     pub name: String,
@@ -123,11 +124,13 @@ pub struct GpuSample {
     pub mem_total: Option<u64>,
     /// Load per engine type (3D, Copy, Video Decode, ...), 0 to 100 each.
     pub engines: Vec<(String, f32)>,
-    /// NVIDIA only; `None` on other GPUs or without the driver library.
+    /// From NVML, ADL (AMD) or IGCL (Intel); `None` without the driver library.
     pub temp_c: Option<f32>,
     pub power_w: Option<f32>,
     pub clock_mhz: Option<u32>,
     pub mem_clock_mhz: Option<u32>,
+    /// Stat labels ("Temp", "Power") this GPU's driver does not share. Always empty on NVIDIA.
+    pub not_shared: Vec<&'static str>,
 }
 
 /// One row of a top-processes list: processes with the same name (case-insensitive) are merged.
@@ -426,14 +429,8 @@ fn clamp_percent(v: f64) -> f32 {
     }
 }
 
-/// True when the GPU name or vendor says NVIDIA, so the driver library readings apply.
-fn is_nvidia(basic: &GpuBasic) -> bool {
-    let has = |s: &str| s.to_lowercase().contains("nvidia");
-    has(&basic.name) || basic.vendor.as_deref().is_some_and(has)
-}
-
-/// Combines the generic GPU readings with the optional NVIDIA driver readings.
-fn merge_gpu(basic: GpuBasic, nv: Option<NvmlReading>) -> GpuSample {
+/// Combines the generic GPU readings with the optional driver library readings.
+fn merge_gpu(basic: GpuBasic, nv: Option<NvmlReading>, not_shared: Vec<&'static str>) -> GpuSample {
     let nv = nv.unwrap_or_default();
     GpuSample {
         name: basic.name,
@@ -445,6 +442,7 @@ fn merge_gpu(basic: GpuBasic, nv: Option<NvmlReading>) -> GpuSample {
         power_w: nv.power_w,
         clock_mhz: nv.clock_mhz,
         mem_clock_mhz: nv.mem_clock_mhz,
+        not_shared,
     }
 }
 
@@ -751,6 +749,8 @@ impl Sampler {
                 let clock = CpuClock::new();
                 let mut gpu_reader = GpuReader::new();
                 let nvml = Nvml::open();
+                // Opened on the first AMD or Intel sample, so other PCs never load them.
+                let mut vendor_gpu: Option<Option<VendorGpu>> = None;
                 let mut last_tick = Instant::now();
                 let mut deadline = last_tick + TICK;
 
@@ -808,12 +808,23 @@ impl Sampler {
                         net_down_bps: bytes_per_second(down, secs),
                         net_up_bps: bytes_per_second(up, secs),
                         gpu: gpu_basic.map(|basic| {
-                            let nv = if is_nvidia(&basic) {
-                                nvml.as_ref().and_then(|n| n.read())
-                            } else {
-                                None
-                            };
-                            merge_gpu(basic, nv)
+                            match Vendor::of(&basic.name, basic.vendor.as_deref()) {
+                                Vendor::Nvidia => {
+                                    let nv = nvml.as_ref().and_then(|n| n.read());
+                                    merge_gpu(basic, nv, Vec::new())
+                                }
+                                vendor => {
+                                    let lib = vendor_gpu
+                                        .get_or_insert_with(|| VendorGpu::open(vendor))
+                                        .as_mut();
+                                    let missing = lib
+                                        .as_ref()
+                                        .map(|l| l.shares())
+                                        .unwrap_or_default()
+                                        .missing();
+                                    merge_gpu(basic, lib.and_then(|l| l.read()), missing)
+                                }
+                            }
                         }),
                         top: top.lock().map(|t| t.clone()).unwrap_or_default(),
                         drives,
@@ -1049,8 +1060,7 @@ mod tests {
             engines: vec![("3D".into(), 40.0)],
             per_process: Vec::new(),
         };
-        assert!(is_nvidia(&basic));
-        let plain = merge_gpu(basic.clone(), None);
+        let plain = merge_gpu(basic.clone(), None, Vec::new());
         assert_eq!(plain.name, "NVIDIA GeForce");
         assert_eq!(plain.load, Some(40.0));
         assert_eq!(plain.engines, basic.engines);
@@ -1061,17 +1071,20 @@ mod tests {
             clock_mhz: Some(1800),
             mem_clock_mhz: Some(7000),
         };
-        let full = merge_gpu(basic, Some(nv));
+        let full = merge_gpu(basic, Some(nv), Vec::new());
         assert_eq!(full.temp_c, Some(55.0));
         assert_eq!(full.power_w, Some(80.0));
         assert_eq!(full.clock_mhz, Some(1800));
         assert_eq!(full.mem_clock_mhz, Some(7000));
+        assert!(full.not_shared.is_empty());
         let amd = GpuBasic {
             name: "Radeon".into(),
             vendor: Some("AMD".into()),
             ..Default::default()
         };
-        assert!(!is_nvidia(&amd));
+        let amd = merge_gpu(amd, None, vec!["Temp", "Power"]);
+        assert_eq!(amd.temp_c, None);
+        assert_eq!(amd.not_shared, vec!["Temp", "Power"]);
     }
 
     /// Prints a few live readings; run with `cargo test prints_live_samples -- --ignored --nocapture`.

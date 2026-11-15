@@ -5,7 +5,7 @@ use egui::{self, Align, Color32, Layout, RichText, Vec2};
 use super::history::{History, Range};
 use super::overview::{
     cores_label, fmt_percent, fmt_rate, gpu_memory_label, nice_ceiling, peak_ceiling, DISK_FLOOR,
-    GPU_MISSING_AFTER, GREY, NET_FLOOR, NONE, SCROLL_GUTTER, SKY, VIOLET,
+    GPU_MISSING_AFTER, GREY, NET_FLOOR, NONE, NOT_SHARED, SCROLL_GUTTER, SKY, VIOLET,
 };
 use super::{power, Resource, Resources};
 use toolboks_shared::format::{clock, friendly_name, rate, size_plain, uptime};
@@ -307,6 +307,9 @@ impl Resources {
         }
         if let Some(c) = g.and_then(|g| g.mem_clock_mhz) {
             stats.push((format!("{c} MHz"), "Memory clock"));
+        }
+        for label in g.map_or(&[][..], |g| &g.not_shared) {
+            stats.push((NOT_SHARED.to_string(), label));
         }
         graph_card(
             ui,

@@ -1,3 +1,4 @@
 - Added a Rust workspace with a small Hello native add-on, SDK manifest and bounded protocol test host using the pinned Toolboks SDK, shared UI, protocol and catalog crates.
 - Added Windows PR checks and per-add-on tag releases with main-ancestry/version validation, tests of the release executable, SHA-256 assets and executable size reporting. Expected tag-rejection tests finish with a successful CI exit code. Build credentials stay read-only.
 - Added release-driven catalog PR automation using the host's format and compatibility metadata. Catalog publication requires owner review and offline signing; a repository-scoped CATALOG_PR_TOKEN is required for bot PRs.
+- Added `addon-repo measure` and `budgets.json` (host issue #97): exe size, time to the first frame and idle memory for every release executable, checked against the budgets locally and reported in the PR job summary.

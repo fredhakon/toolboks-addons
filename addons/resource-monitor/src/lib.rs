@@ -224,12 +224,23 @@ impl Resources {
     }
 }
 
+/// Applies the Toolboks look (fonts, text sizes, spacing, colours) the first time the add-on
+/// draws. The add-on runs in its own process, so the host's own set-up does not reach it.
+fn style_once(ctx: &egui::Context) {
+    let id = egui::Id::NULL.with("toolboks-style-applied");
+    if !ctx.data(|data| data.get_temp::<bool>(id)).unwrap_or(false) {
+        toolboks_shared::ui::apply_style(ctx);
+        ctx.data_mut(|data| data.insert_temp(id, true));
+    }
+}
+
 impl NativeAddon for Resources {
     fn ui(
         &mut self,
         ui: &mut egui::Ui,
         _preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
     ) -> bool {
+        style_once(ui.ctx());
         self.draw(ui, self.page);
         false
     }

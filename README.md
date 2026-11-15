@@ -217,3 +217,26 @@ rights.
 The built-in provider stays in the host until the final removal and "Restore your tools" step
 (host #94). Measure with `cargo run --locked -p addon-repo -- measure macro-manager`.
 
+## Debloater (host #92)
+
+`addons/debloater` builds `debloater.exe`, keeping ID `toolboks.debloater` and the five pages
+Privacy and ads, Apps, Startup, Tasks and Services. The host's `src/tools/debloat/` pages moved
+over with imports changed; the engine stays in the host's `toolboks-debloat-engine` crate, which
+this repo uses as a git dependency pinned with the others (System Profiles will use it too).
+
+**What works.** Everything that does not need administrator rights, exactly as in the built-in
+tool: reading the real state of every item, the plain-words review, applying and undoing
+current-user changes (privacy and advertising switches, startup entries, installed apps for your
+own account), and the guided tour.
+
+**What does not work yet.** Items that need administrator rights (machine-wide registry values,
+services, scheduled tasks, restore points) are listed and marked "Needs admin", but cannot be
+changed. The built-in tool restarted the whole app as administrator; protocol 3 add-ons never
+run elevated. These changes need the protocol 3 helper: one operation per kind of change, each
+with a preview built from the catalog (never from the request), a confirmation window owned by
+the helper, and undo steps that survive an update or removal. That design is tracked in a
+follow-up issue and nothing here pretends to do it. Real UAC validation is still required.
+
+The built-in tool stays in the host until the final removal and "Restore your tools" step (host
+#94). Measure with `cargo run --locked -p addon-repo -- measure debloater`.
+

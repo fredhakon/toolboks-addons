@@ -316,6 +316,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
+name = "debloater"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "serde_json",
+ "toolboks-addon-proto",
+ "toolboks-addon-sdk",
+ "toolboks-debloat-engine",
+ "toolboks-shared",
+]
+
+[[package]]
 name = "digest"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1460,6 +1472,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "toolboks-addon-sdk",
+]
+
+[[package]]
+name = "toolboks-debloat-engine"
+version = "0.1.0"
+source = "git+https://github.com/Gusseti/toolboks?rev=a96b0ab766648033af8937ac12ed269b58d4bbd7#a96b0ab766648033af8937ac12ed269b58d4bbd7"
+dependencies = [
+ "serde",
+ "toolboks-shared",
+ "windows 0.62.2",
 ]
 
 [[package]]

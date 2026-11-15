@@ -1,0 +1,16 @@
+[package]
+name = "debloater"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Debloater - native Toolboks add-on that explains and undoes optional Windows changes"
+
+[dependencies]
+egui = { version = "0.37", default-features = false }
+serde_json.workspace = true
+toolboks-addon-sdk.workspace = true
+toolboks-debloat-engine.workspace = true
+toolboks-shared.workspace = true
+
+[dev-dependencies]
+toolboks-addon-proto.workspace = true

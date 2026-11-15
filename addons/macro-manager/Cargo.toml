@@ -1,0 +1,19 @@
+[package]
+name = "macro-manager"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Macro Manager - native Toolboks add-on that records, edits and repeats keyboard and mouse actions"
+
+[dependencies]
+egui = { version = "0.37", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+toolboks-addon-sdk.workspace = true
+toolboks-shared.workspace = true
+
+[dev-dependencies]
+toolboks-addon-proto.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_WindowsAndMessaging"] }

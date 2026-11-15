@@ -312,7 +312,8 @@ The built-in provider stays in the host until the final removal and "Restore you
 
 Issue #32 asks whether the memory priority, targeted trim and low-priority cache purge actions
 help at all. `docs/RESEARCH-memory-cleaning.md` holds the protocol, the result tables (empty until
-measured on 8 GB and 16 GB+ PCs) and the decision rules; no benefit is claimed yet.
+measured on 8 GB and 16 GB+ PCs) and the decision rules; no benefit is claimed yet. Priority-only
+has no UI action, so only trim and purge are scripted.
 `scripts/bench-memory.ps1` collects the numbers (it does not run the action, needs no
 administrator rights and writes only under `-OutDir`); try it with `-Arm none -DryRun`.
 

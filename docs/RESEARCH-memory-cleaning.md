@@ -33,13 +33,25 @@ Each arm is what the owner presses in Memory Cleaner between the "before" and "a
 | Arm | Script `-Arm` | What it does | Admin | Code |
 |---|---|---|---|---|
 | Nothing | `none` | Control. No action, same waits and samples. | no | n/a |
-| Memory priority only | `priority` | Lowers the memory priority of idle background apps (`MEMORY_PRIORITY_LOW`) so Windows reclaims their pages first. Verifies pid, start time and image name before each app; undoable. No trim. | no | `actions.rs` |
-| Targeted trim | `trim` | Per-app, per-pid `EmptyWorkingSet` on idle background apps (never the foreground app, security software, launchers or anti-cheat). No system-wide empty. Pages go to the cache. | no | `actions.rs`, `trim.rs`, Advanced page |
+| Memory priority only | not offered | Lowers the memory priority of idle background apps (`MEMORY_PRIORITY_LOW`) so Windows reclaims their pages first. Verifies pid, start time and image name before each app; undoable. | no | `actions.rs` |
+| Targeted trim | `trim` | The **Trim idle apps** button on the Home page: lowers memory priority and then trims (`EmptyWorkingSet`, per app and per pid) the idle background apps that pass the idle policy. No system-wide empty. Pages go to the cache. | no | `engine.rs`, `actions.rs`, `trim.rs` |
 | Low-priority cache purge | `purge` | System-wide purge of only the lowest-priority standby pages (`SystemMemoryListInformation` command 5). A full standby purge, modified-list flush and empty-all are deliberately not offered. | yes, host admin helper (Confirm / Cancel window) | `memlist.rs` |
 
-The normal "Optimize" run is priority first, then trim (`engine.rs`). For the benchmark the
-`priority` and `trim` arms are run separately where the UI allows; if it does not, record in the
-notes column which button was used and treat that arm as "priority then trim".
+**Priority-only cannot be measured separately.** The UI has no priority-only action: the one
+manual button, "Trim idle apps" (`home.rs`), runs the plan from `engine.rs`, which lowers priority
+and then trims. The only other related control is "Undo priority change". So the `trim` arm is
+really "priority then trim", and the `priority` arm is not measurable until a build switch that
+runs the priority step alone exists (follow-up, not part of this issue). The script rejects
+`-Arm priority`.
+
+**Which trim path.** Use only **Trim idle apps** for the trim arm. It applies the idle policy
+(`Policy::manual` in `actions.rs`): the app in front, apps playing audio, full-screen apps, game
+launchers and anti-cheat, protected and excluded apps are skipped; an app must have had no input
+for 60 s and hold at least 100 MB; an app trimmed by the user in the last 10 minutes is skipped.
+The Advanced page's **Trim selected** is different: it trims exactly the processes the user
+selected and checks only `skip_reason` (the app itself, protected and excluded apps). It does not
+check foreground, idle time, audio or launchers. It is a different action and is not part of
+this benchmark.
 
 ## Metrics
 
@@ -47,7 +59,13 @@ Collected by `scripts/bench-memory.ps1` (one CSV row per run, before and after t
 
 - Available MB, commit %, standby (cache) MB, Page Faults/sec and Pages Input/sec (the hard
   fault proxy: pages read from disk).
-- App launch time after the action: milliseconds from `Start-Process` to a main window.
+- App launch time after the action: milliseconds from `Start-Process` until the process the
+  script started has a main window. Only that process is closed afterwards. If the app hands over
+  to another instance the value is NA; pick another `-App`.
+- The sample window: all counters come from one `Get-Counter` call (3 one-second samples,
+  averaged). The CSV records when each window started (`before_sampled_at`, `after_sampled_at`)
+  and `sample_seconds`. If the counters fail, `sample_mode` says `cim` and only Available MB and
+  commit % are filled.
 
 Collected by hand:
 
@@ -61,16 +79,26 @@ Collected by hand:
 ## Method
 
 1. Reboot. Log in, start nothing extra, wait for startup activity to settle.
-2. Idle 5 minutes (`-IdleSeconds 300`).
-3. Load the fixed workload (the same apps and documents on every run, written down below the
-   tables: for example browser with N tabs, chat app, editor, a launcher).
-4. Run `scripts/bench-memory.ps1 -Arm <arm> -Runs 5 -IdleSeconds 300 -Wait 30`. When it prints
-   `NOW`, press the matching button within 30 seconds (arm `none`: do nothing).
-5. 5 runs per arm. Randomise the arm order per machine (for example draw from a shuffled list);
-   reboot between arms so one arm does not warm the next.
-6. Same machine for all arms. Record RAM size, Windows build, CPU, disk type (the script writes
+2. Idle 5 minutes, then load the fixed workload (the same apps and documents on every run,
+   written down below the tables: for example browser with N tabs, chat app, editor, a launcher).
+3. Run `scripts/bench-memory.ps1 -Arm <none|trim|purge> -Runs 5 -IdleSeconds 660 -Wait 30`.
+   When it prints `NOW`, press the matching button within 30 seconds (arm `none`: do nothing).
+   For `trim` press **Trim idle apps**, not Trim selected.
+4. **Spacing of runs.** Manual trims skip an app trimmed in the last 10 minutes
+   (`MANUAL_COOLDOWN` in `actions.rs`). `-IdleSeconds 660` (11 minutes) before every run keeps
+   each run beyond that cooldown, and gives the apps the idle minute the policy needs. If you
+   shorten it, quit and restart Memory Cleaner between runs instead (its cooldowns live in
+   memory only).
+5. **Confirm the action happened.** After every `trim` run read the **Last run** card on the Home
+   page (what moved to cache, or "nothing to do"). After every `purge` run read the purge result
+   text. Fill the `action_confirmed` column of that CSV row with `yes` or `no`. A `no` run (the
+   tool had nothing eligible, or the purge failed) is repeated, not counted. Note the Last run
+   numbers in the notes next to the table.
+6. 5 confirmed runs per arm. Randomise the arm order per machine (for example draw from a
+   shuffled list); reboot between arms so one arm does not warm the next.
+7. Same machine for all arms. Record RAM size, Windows build, CPU, disk type (the script writes
    RAM and build into every row).
-7. Games: PresentMon or Game Bar capture per run as described above.
+8. Games: PresentMon or Game Bar capture per run as described above.
 
 Analysis: median per arm and metric, plus the spread (min to max) of the `none` arm as the
 noise band. Do not average away outliers; list them.
@@ -78,7 +106,7 @@ noise band. Do not average away outliers; list them.
 Run the script from a normal (non-admin) Windows PowerShell:
 
 ```
-powershell -ExecutionPolicy Bypass -File scripts\bench-memory.ps1 -Arm none -Runs 5 -IdleSeconds 300 -Wait 30
+powershell -ExecutionPolicy Bypass -File scripts\bench-memory.ps1 -Arm none -Runs 5 -IdleSeconds 660 -Wait 30
 ```
 
 Output: `%TEMP%\toolboks-bench\bench-memory.csv` (override with `-OutDir`). The script does not
@@ -87,14 +115,13 @@ perform the action, needs no administrator rights, uses no network and writes on
 
 ## Results
 
-Median over 5 runs per arm. Fill with `median (min-max)`.
+Median over 5 confirmed runs per arm. Fill with `median (min-max)`.
 
 ### App launch time (ms), `none` arm = noise band
 
 | Arm | 8 GB | 16 GB+ |
 |---|---|---|
 | none | TBD (owner PC) | TBD (owner PC) |
-| priority | TBD (owner PC) | TBD (owner PC) |
 | trim | TBD (owner PC) | TBD (owner PC) |
 | purge | TBD (owner PC) | TBD (owner PC) |
 
@@ -103,7 +130,6 @@ Median over 5 runs per arm. Fill with `median (min-max)`.
 | Arm | 8 GB | 16 GB+ |
 |---|---|---|
 | none | TBD (owner PC) | TBD (owner PC) |
-| priority | TBD (owner PC) | TBD (owner PC) |
 | trim | TBD (owner PC) | TBD (owner PC) |
 | purge | TBD (owner PC) | TBD (owner PC) |
 
@@ -112,7 +138,6 @@ Median over 5 runs per arm. Fill with `median (min-max)`.
 | Arm | 8 GB available | 8 GB standby | 16 GB+ available | 16 GB+ standby |
 |---|---|---|---|---|
 | none | TBD (owner PC) | TBD (owner PC) | TBD (owner PC) | TBD (owner PC) |
-| priority | TBD (owner PC) | TBD (owner PC) | TBD (owner PC) | TBD (owner PC) |
 | trim | TBD (owner PC) | TBD (owner PC) | TBD (owner PC) | TBD (owner PC) |
 | purge | TBD (owner PC) | TBD (owner PC) | TBD (owner PC) | TBD (owner PC) |
 
@@ -121,7 +146,6 @@ Median over 5 runs per arm. Fill with `median (min-max)`.
 | Arm | 8 GB | 16 GB+ |
 |---|---|---|
 | none | TBD (owner PC) | TBD (owner PC) |
-| priority | TBD (owner PC) | TBD (owner PC) |
 | trim | TBD (owner PC) | TBD (owner PC) |
 | purge | TBD (owner PC) | TBD (owner PC) |
 
@@ -134,10 +158,11 @@ Median over 5 runs per arm. Fill with `median (min-max)`.
 
 ## Decision rule (per action)
 
-An action (priority, trim, purge) is **kept** only if, against the `none` arm, on BOTH RAM
+An action (trim, purge) is **kept** only if, against the `none` arm, on BOTH RAM
 classes:
 
-1. the median improvement in app launch time or Pages Input/sec is beyond the noise band of
+1. the action was confirmed to have happened in each counted run (Last run card or purge
+   result), and the median improvement in app launch time or Pages Input/sec is beyond the noise band of
    the `none` arm, and
 2. there is no regression in game 1% low frame times (and none in launch time of the apps that
    were trimmed), and
@@ -157,8 +182,8 @@ Current behaviour, unchanged by this issue:
 
 - None of the four is on by default. Automatic cleaning is off by default
   (`scheduler.rs`, `home.rs` text "Off by default").
-- Memory priority and targeted trim run only when the user starts them (Optimize or Trim
-  selected), or, if the user turns it on, in automatic mode after sustained pressure
+- Memory priority and targeted trim run together, only when the user presses "Trim idle apps"
+  (or uses Trim selected on the Advanced page), or, if the user turns it on, in automatic mode after sustained pressure
   (60 s hold, at most once an hour, never the foreground app, never near the commit limit).
 - The low-priority cache purge is manual and needs administrator rights through the host helper.
 - The report wording after a run never says memory was freed; it shows what moved to cache and
@@ -167,8 +192,8 @@ Current behaviour, unchanged by this issue:
 | Action | Provisional label | Provisional decision |
 |---|---|---|
 | Nothing | n/a (control) | n/a |
-| Memory priority only | Unproven | Keep opt-in or manual. No benefit claimed. |
-| Targeted trim | Unproven | Keep opt-in or manual. No benefit claimed. |
+| Memory priority only | Unproven | Not separately measurable until a build switch exists. Stays inside Trim idle apps. No benefit claimed. |
+| Targeted trim (with priority) | Unproven | Keep opt-in or manual. No benefit claimed. |
 | Low-priority cache purge | Unproven | Keep manual, administrator only. No benefit claimed. |
 
 Nothing in this document or in the add-on may claim a benefit until the result tables are

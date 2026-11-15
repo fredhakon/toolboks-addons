@@ -5,17 +5,29 @@
 .DESCRIPTION
   The script never performs the memory action. For every run it does this:
     1. idle -IdleSeconds, then sample the memory counters ("before");
-    2. pause -Wait seconds: for arms priority, trim and purge press the matching button in
-       Memory Cleaner now (arm none: do nothing);
+    2. pause -Wait seconds: for arms trim and purge press the matching button in Memory Cleaner
+       now (arm none: do nothing);
     3. sample the counters again ("after");
-    4. start -App, time how long until it has a main window, then close it.
+    4. start -App, time how long until that process has a main window, then close it.
   One CSV row per run is appended to <OutDir>\bench-memory.csv. Needs no administrator rights,
   uses no network and writes only under -OutDir. Windows PowerShell 5.1 compatible.
 
-  Counter names are English; on a non-English Windows a failed counter is written as NA.
+  All counters are read in ONE Get-Counter call (3 one-second samples, averaged); the CSV records
+  the window (sampled_at, sample_seconds). If that call fails (for example a non-English Windows),
+  the counter columns are NA and Available MB / commit % come from CIM (sample_mode=cim).
+
+  Arm "priority" is not offered: Memory Cleaner has no priority-only action (Trim idle apps lowers
+  priority AND trims), so it cannot be measured separately until a build switch exists.
+
+  Only the process this script starts is timed and closed. If the app hands over to another
+  instance (the started process exits without a window) launch_ms is NA and nothing else is closed.
+  Choose an -App that does not do this.
+
+  Column action_confirmed is for you: after each run read the Last run card (or the purge result)
+  in Memory Cleaner and fill it in (yes / no); runs where the action did not happen are repeated.
 
 .EXAMPLE
-  .\bench-memory.ps1 -Arm trim -Runs 5 -IdleSeconds 300 -Wait 30
+  .\bench-memory.ps1 -Arm trim -Runs 5 -IdleSeconds 660 -Wait 30
 
 .EXAMPLE
   .\bench-memory.ps1 -Arm none -DryRun
@@ -23,7 +35,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('none', 'priority', 'trim', 'purge')]
+    [ValidateSet('none', 'trim', 'purge')]
     [string]$Arm,
     [string]$App = 'notepad.exe',
     [ValidateRange(1, 100)]
@@ -41,13 +53,12 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $CsvPath = Join-Path $OutDir 'bench-memory.csv'
-$SampleCount = 3          # one-second samples averaged for each rate counter
+$SampleCount = 3          # one-second samples averaged, all counters in one call
 $LaunchTimeoutMs = 30000
 
 $Action = switch ($Arm) {
     'none'     { 'do nothing' }
-    'priority' { 'press the memory priority action (Optimize / lower priority only, no trim)' }
-    'trim'     { 'press the targeted trim (Trim selected / Optimize with trim)' }
+    'trim'     { 'press "Trim idle apps" on the Home page (not "Trim selected"), then read the Last run card' }
     'purge'    { 'press "Clear low-priority cache" and confirm the administrator window' }
 }
 
@@ -59,27 +70,6 @@ if ($DryRun) {
     return
 }
 
-function Get-CounterValues {
-    # Averages each path over $SampleCount one-second samples; NA when a counter is unavailable.
-    # One counter at a time, so a single broken or localized counter does not blank the others.
-    param([string[]]$Paths)
-    $result = @{}
-    foreach ($p in $Paths) {
-        $result[$p] = $null
-        try {
-            $samples = Get-Counter -Counter $p -SampleInterval 1 -MaxSamples $SampleCount -ErrorAction Stop
-            $result[$p] = ($samples | ForEach-Object { $_.CounterSamples[0].CookedValue } | Measure-Object -Average).Average
-        } catch {
-            if (-not $script:WarnedCounters.ContainsKey($p)) {
-                $script:WarnedCounters[$p] = $true
-                Write-Warning "Counter $p unavailable: $($_.Exception.Message)"
-            }
-        }
-    }
-    return $result
-}
-
-$script:WarnedCounters = @{}
 $Counters = @{
     Available = '\Memory\Available MBytes'
     Commit    = '\Memory\% Committed Bytes In Use'
@@ -90,58 +80,81 @@ $Counters = @{
     StandbyC  = '\Memory\Standby Cache Core Bytes'
 }
 
+function Get-CounterValues {
+    # One Get-Counter call for all counters (same one-second samples for every number); returns
+    # path -> average over $SampleCount samples, or $null when the call fails.
+    param([string[]]$Paths)
+    try {
+        $samples = Get-Counter -Counter $Paths -SampleInterval 1 -MaxSamples $SampleCount -ErrorAction Stop
+    } catch {
+        Write-Warning "Counters unavailable, using CIM fallback: $($_.Exception.Message)"
+        return $null
+    }
+    $result = @{}
+    $all = @($samples | ForEach-Object { $_.CounterSamples })
+    foreach ($p in $Paths) {
+        $vals = @($all | Where-Object { $_.Path.EndsWith($p.ToLowerInvariant()) } | ForEach-Object { $_.CookedValue })
+        $result[$p] = if ($vals.Count -gt 0) { ($vals | Measure-Object -Average).Average } else { $null }
+    }
+    return $result
+}
+
 function Format-Number($v) {
     if ($null -eq $v) { return 'NA' }
     return ([double]$v).ToString('0.##', [Globalization.CultureInfo]::InvariantCulture)
 }
 
 function Get-Snapshot {
+    $startedAt = Get-Date
     $c = Get-CounterValues -Paths @($Counters.Values)
-    $standby = $null
-    $parts = @($c[$Counters.StandbyN], $c[$Counters.StandbyR], $c[$Counters.StandbyC]) | Where-Object { $null -ne $_ }
-    if (@($parts).Count -gt 0) { $standby = (($parts | Measure-Object -Sum).Sum) / 1MB }
-    $availableMb = $c[$Counters.Available]
-    $commitPct = $c[$Counters.Commit]
-    if ($null -eq $availableMb -or $null -eq $commitPct) {
-        # Fallback when the performance counters are broken: same two numbers from CIM (KB values).
+    $endedAt = Get-Date
+    $mode = 'counters'
+    if ($null -eq $c) {
+        # Fallback when the performance counters are broken: Available MB and commit % from CIM (KB values).
+        $mode = 'cim'
         $os = Get-CimInstance Win32_OperatingSystem
-        if ($null -eq $availableMb) { $availableMb = $os.FreePhysicalMemory / 1KB }
-        if ($null -eq $commitPct) { $commitPct = 100 * ($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / $os.TotalVirtualMemorySize }
+        $c = @{
+            $Counters.Available = $os.FreePhysicalMemory / 1KB
+            $Counters.Commit    = 100 * ($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / $os.TotalVirtualMemorySize
+        }
     }
+    $parts = @($Counters.StandbyN, $Counters.StandbyR, $Counters.StandbyC) | ForEach-Object { $c[$_] }
+    $standby = $null
+    if (@($parts | Where-Object { $null -eq $_ }).Count -eq 0) { $standby = (($parts | Measure-Object -Sum).Sum) / 1MB }
     return [pscustomobject]@{
-        AvailableMB = $availableMb
-        CommitPct   = $commitPct
+        AvailableMB = $c[$Counters.Available]
+        CommitPct   = $c[$Counters.Commit]
         StandbyMB   = $standby
         Faults      = $c[$Counters.Faults]
         PagesIn     = $c[$Counters.PagesIn]
+        Mode        = $mode
+        StartedAt   = $startedAt.ToString('o')
+        Seconds     = ($endedAt - $startedAt).TotalSeconds
     }
 }
 
 function Measure-AppLaunch {
-    # Milliseconds from Start-Process until a new process of the app has a main window; then closes it.
-    # shortcut: matches by image name, so an app that hands over to an already running instance reports NA.
-    $name = [IO.Path]::GetFileNameWithoutExtension($App)
-    $before = @(Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    # Milliseconds from Start-Process until the process WE started has a main window; then closes
+    # only that process. If it exits without a window (handed over to another instance) the result
+    # is NA and nothing else is touched. shortcut: child processes it spawned are not closed.
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $started = Start-Process -FilePath $App -PassThru
     $ms = $null
-    $mine = @()
     while ($sw.ElapsedMilliseconds -lt $LaunchTimeoutMs) {
-        $mine = @(Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id })
-        if ($mine | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero }) { $ms = $sw.ElapsedMilliseconds; break }
+        $started.Refresh()
+        if ($started.HasExited) { break }
+        if ($started.MainWindowHandle -ne [IntPtr]::Zero) { $ms = $sw.ElapsedMilliseconds; break }
         Start-Sleep -Milliseconds 10
     }
     $sw.Stop()
-    if ($null -eq $ms) { Write-Warning "No main window within ${LaunchTimeoutMs} ms." }
-    foreach ($p in $mine + @($started)) {
-        try {
-            $p.Refresh()
-            if (-not $p.HasExited) {
-                [void]$p.CloseMainWindow()
-                if (-not $p.WaitForExit(5000)) { $p.Kill() }
-            }
-        } catch { Write-Warning "Could not close pid $($p.Id): $($_.Exception.Message)" }
-    }
+    if ($null -eq $ms) { Write-Warning "No main window for the started process (exited or timed out after ${LaunchTimeoutMs} ms): launch_ms=NA. Pick another -App if this repeats." }
+    try {
+        $started.Refresh()
+        if (-not $started.HasExited) {
+            [void]$started.CloseMainWindow()
+            if (-not $started.WaitForExit(5000)) { $started.Kill() }
+        }
+    } catch { Write-Warning "Could not close pid $($started.Id): $($_.Exception.Message)" }
     return $ms
 }
 
@@ -170,6 +183,11 @@ for ($run = 1; $run -le $Runs; $run++) {
         run                = $run
         app                = $App
         launch_ms          = Format-Number $launch
+        action_confirmed   = if ($Arm -eq 'none') { 'n/a' } else { '' }
+        sample_mode        = $b.Mode + '/' + $a.Mode
+        sample_seconds     = Format-Number $b.Seconds
+        before_sampled_at  = $b.StartedAt
+        after_sampled_at   = $a.StartedAt
         before_available_mb = Format-Number $b.AvailableMB
         after_available_mb  = Format-Number $a.AvailableMB
         before_commit_pct   = Format-Number $b.CommitPct

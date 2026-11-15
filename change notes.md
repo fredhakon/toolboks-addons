@@ -18,3 +18,5 @@ Release blockers:
 - Debloater: the Privacy and ads items that need administrator rights, the restore point switch and undo of such a run now go through the protocol 3 administrator helper (a separate window with Confirm / Cancel). Services, Tasks and administrator startup entries are still off.
 - Debloater: switching services and scheduled tasks, the restore point switch on those pages, and their undo now go through the protocol 3 administrator helper (a separate window with Confirm / Cancel). Administrator startup entries are still off.
 - Debloater: all-users startup entries and their undo now go through the protocol 3 administrator helper. With this, every Debloater change that needs administrator rights works in the add-on through a separate confirmation window.
+
+- Disk Manager: the space map uses labelled file categories and distinct shades, readable text, bottom-aligned sizes and a filled selection marker. Map cells offer Show in Explorer by right-click, Shift+F10 or the menu key; missing items report the problem and open an existing parent. Windows Shell item IDs preserve paths without command-line interpolation.

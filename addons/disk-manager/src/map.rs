@@ -2,22 +2,29 @@ use crate::scanner::Node;
 use egui::{Color32, Vec2};
 const MIN_SIDE: f32 = 48.0;
 const HEIGHT: f32 = 300.0;
-const GAP: f32 = 5.0;
+const GAP: f32 = 4.0;
 struct Tile {
     id: usize,
     name: String,
     bytes: u64,
     rect: egui::Rect,
     color: Color32,
+    category: crate::category::Category,
+    column: usize,
 }
 /// Justified, full-height columns eliminate unused pockets while keeping every entry selectable.
 pub struct MapLayout {
     tiles: Vec<Tile>,
-    right_edges: Vec<f32>,
+    columns: usize,
     width: f32,
 }
 impl MapLayout {
+    #[cfg(test)]
     pub fn new(nodes: &[&Node]) -> Self {
+        Self::with_tree(nodes, &[])
+    }
+    pub fn with_tree(nodes: &[&Node], all: &[Node]) -> Self {
+        let categories = crate::category::folders(nodes, all);
         let largest = nodes.iter().map(|n| n.bytes).max().unwrap_or(0).max(1) as f64;
         let mut nodes = nodes.to_vec();
         nodes.sort_by_key(|n| std::cmp::Reverse(n.bytes));
@@ -28,6 +35,7 @@ impl MapLayout {
         let mut tiles = Vec::with_capacity(nodes.len());
         let mut width = 0.0_f32;
         let mut start = 0;
+        let mut columns = 0;
         while start < nodes.len() {
             let mut end = start + 1;
             let mut column = column_geometry(&areas[start..end]);
@@ -51,29 +59,24 @@ impl MapLayout {
                 );
                 tiles.push(Tile {
                     id: n.id,
+                    column: columns,
                     name: n.name.clone(),
                     bytes: n.bytes,
                     rect,
-                    color: crate::theme::DATA[3].gamma_multiply([0.28, 0.22, 0.18, 0.15][i % 4]),
+                    color: categories[&n.id].color(i),
+                    category: categories[&n.id],
                 });
                 y += height + GAP;
             }
             width += column_width + GAP;
             start = end;
+            columns += 1;
         }
         width = (width - GAP).max(0.0);
         tiles.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
-        let mut right = 0.0_f32;
-        let right_edges = tiles
-            .iter()
-            .map(|t| {
-                right = right.max(t.rect.right());
-                right
-            })
-            .collect();
         Self {
             tiles,
-            right_edges,
+            columns,
             width,
         }
     }
@@ -111,31 +114,48 @@ fn column_geometry(areas: &[f32]) -> (f32, Vec<f32>, f32) {
         .fold(1.0_f32, f32::max);
     (width, heights, worst)
 }
-pub fn show(ui: &mut egui::Ui, layout: &MapLayout) -> Option<usize> {
+#[derive(Default)]
+pub struct Interaction {
+    pub selected: Option<usize>,
+    menu: Option<(usize, egui::Pos2)>,
+    focus: Option<egui::Id>,
+}
+#[derive(Default)]
+pub struct Action {
+    pub open: Option<usize>,
+    pub reveal: Option<usize>,
+}
+fn menu_key(input: &mut egui::InputState) -> bool {
+    input.consume_key(egui::Modifiers::SHIFT, egui::Key::F10)
+        || input.consume_key(egui::Modifiers::NONE, egui::Key::Menu)
+}
+pub fn show(ui: &mut egui::Ui, layout: &MapLayout, state: &mut Interaction) -> Action {
     if layout.tiles.is_empty() {
         crate::theme::weak(ui, "This folder is empty.");
-        return None;
+        return Action::default();
     }
-    let mut clicked = None;
-    let scale = (ui.available_width() / layout.width).max(1.0);
+    let mut action = Action::default();
+    let gaps = GAP * layout.columns.saturating_sub(1) as f32;
+    let scale = ((ui.available_width() - gaps) / (layout.width - gaps)).max(1.0);
+    let gap_correction = GAP * (scale - 1.0);
+    let left = |t: &Tile| t.rect.left() * scale - t.column as f32 * gap_correction;
+    let right = |t: &Tile| t.rect.right() * scale - t.column as f32 * gap_correction;
     egui::ScrollArea::horizontal()
         .id_salt("disk-map-packed")
         .auto_shrink([false, true])
         .show_viewport(ui, |ui, viewport| {
             let (r, _) = ui.allocate_exact_size(
-                Vec2::new(layout.width * scale, HEIGHT),
+                Vec2::new((layout.width - gaps) * scale + gaps, HEIGHT),
                 egui::Sense::hover(),
             );
-            let first = layout
-                .right_edges
-                .partition_point(|right| *right * scale < viewport.left());
+            let first = layout.tiles.partition_point(|t| right(t) < viewport.left());
             for tile in layout.tiles[first..]
                 .iter()
-                .take_while(|t| t.rect.left() * scale <= viewport.right())
+                .take_while(|t| left(t) <= viewport.right())
             {
                 let rect = egui::Rect::from_min_max(
-                    r.min + Vec2::new(tile.rect.left() * scale, tile.rect.top()),
-                    r.min + Vec2::new(tile.rect.right() * scale, tile.rect.bottom()),
+                    r.min + Vec2::new(left(tile), tile.rect.top()),
+                    r.min + Vec2::new(right(tile), tile.rect.bottom()),
                 );
                 if !ui.is_rect_visible(rect) {
                     continue;
@@ -145,12 +165,35 @@ pub fn show(ui: &mut egui::Ui, layout: &MapLayout) -> Option<usize> {
                     ui.scope_id().with(("disk-map", tile.id)),
                     egui::Sense::click(),
                 );
-                ui.painter().rect_filled(rect, 4, crate::theme::WINDOW);
-                ui.painter().rect_filled(rect, 4, tile.color);
+                if response.clicked() || response.secondary_clicked() || response.has_focus() {
+                    state.selected = Some(tile.id);
+                    state.focus = Some(response.id);
+                }
+                if response.clicked() || response.secondary_clicked() {
+                    response.request_focus();
+                }
+                if response.secondary_clicked() {
+                    state.menu = Some((
+                        tile.id,
+                        response.interact_pointer_pos().unwrap_or(rect.center()),
+                    ));
+                }
+                if response.has_focus() && ui.input_mut(menu_key) {
+                    state.menu = Some((tile.id, rect.left_top() + Vec2::splat(12.0)));
+                }
+                ui.painter().rect_filled(rect, 6, tile.color);
+                let selected = state.selected == Some(tile.id);
+                if selected {
+                    let badge = egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), rect.bottom() - 23.0),
+                        rect.right_bottom(),
+                    );
+                    ui.painter().rect_filled(badge, 6, crate::theme::ACCENT);
+                }
                 if response.hovered() || response.has_focus() {
                     ui.painter().rect_stroke(
                         rect,
-                        4,
+                        6,
                         egui::Stroke::new(
                             1.5,
                             if response.has_focus() {
@@ -163,42 +206,200 @@ pub fn show(ui: &mut egui::Ui, layout: &MapLayout) -> Option<usize> {
                     );
                 }
                 let painter = ui.painter().with_clip_rect(rect.shrink(5.0));
-                painter.text(
-                    rect.min + Vec2::new(7.0, 7.0),
-                    egui::Align2::LEFT_TOP,
-                    &tile.name,
+                let mut job = egui::text::LayoutJob::simple(
+                    tile.name.clone(),
                     egui::FontId::proportional(12.0),
-                    crate::theme::TEXT,
+                    crate::category::text(tile.color),
+                    rect.width() - 14.0,
+                );
+                job.wrap.max_rows = 1;
+                job.wrap.break_anywhere = true;
+                let galley = painter.layout_job(job);
+                painter.galley(
+                    rect.min + Vec2::new(7.0, 7.0),
+                    galley,
+                    crate::category::text(tile.color),
                 );
                 painter.text(
-                    rect.min + Vec2::new(7.0, 26.0),
-                    egui::Align2::LEFT_TOP,
+                    rect.left_bottom() + Vec2::new(7.0, -7.0),
+                    egui::Align2::LEFT_BOTTOM,
                     crate::size(tile.bytes),
                     egui::FontId::proportional(11.0),
-                    crate::theme::TEXT,
+                    if selected {
+                        crate::category::text(crate::theme::ACCENT)
+                    } else {
+                        crate::category::text(tile.color)
+                    },
                 );
-                if response.clicked() {
-                    clicked = Some(tile.id);
+                if selected && rect.width() > 135.0 {
+                    painter.text(
+                        rect.right_bottom() + Vec2::new(-7.0, -7.0),
+                        egui::Align2::RIGHT_BOTTOM,
+                        "Selected",
+                        egui::FontId::proportional(11.0),
+                        crate::category::text(crate::theme::ACCENT),
+                    );
                 }
-                let label = format!("{} · {}", tile.name, crate::size(tile.bytes));
+                if response.clicked() {
+                    action.open = Some(tile.id);
+                }
+                let label = format!(
+                    "{} - {} - {}",
+                    tile.name,
+                    crate::size(tile.bytes),
+                    tile.category.label()
+                );
                 response.widget_info(|| {
                     egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), &label)
                 });
                 response.on_hover_text(label);
             }
         });
-    ui.add_space(5.0);
+    if let Some((id, position)) = state.menu {
+        let mut open = true;
+        egui::Popup::new(
+            ui.scope_id().with("map-menu"),
+            ui.ctx().clone(),
+            position,
+            ui.layer_id(),
+        )
+        .kind(egui::PopupKind::Menu)
+        .open_bool(&mut open)
+        .show(|ui| {
+            if ui.button("Show in Explorer").clicked() {
+                action.reveal = Some(id);
+                ui.close();
+            }
+        });
+        if !open {
+            state.menu = None;
+            if let Some(id) = state.focus {
+                ui.memory_mut(|m| m.request_focus(id));
+            }
+        }
+    }
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        let mut shown = Vec::new();
+        for tile in &layout.tiles {
+            if shown.contains(&tile.category) {
+                continue;
+            }
+            shown.push(tile.category);
+            let (r, _) = ui.allocate_exact_size(Vec2::splat(8.0), egui::Sense::hover());
+            ui.painter().rect_filled(r, 2, tile.category.color(0));
+            crate::theme::caption(ui, tile.category.label());
+        }
+    });
     let note = if scale == 1.0 && layout.width > ui.available_width() {
         "Scroll sideways for more. Small entries are enlarged. Labels show actual sizes."
     } else {
         "Open a folder from the map. Small entries are enlarged. Labels show actual sizes."
     };
     crate::theme::caption(ui, note);
-    clicked
+    action
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn frame(
+        ctx: &egui::Context,
+        layout: &MapLayout,
+        state: &mut Interaction,
+        events: Vec<egui::Event>,
+    ) {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(700.0, 600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                show(ui, layout, state);
+            },
+        );
+        output.textures_delta.clear();
+    }
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+    #[test]
+    fn context_menu_opens_at_pointer_and_closes_on_escape_or_outside_click() {
+        let ctx = egui::Context::default();
+        let n = [node(0, 10)];
+        let layout = MapLayout::new(&n.iter().collect::<Vec<_>>());
+        let mut state = Interaction::default();
+        frame(&ctx, &layout, &mut state, vec![]);
+        let pos = egui::pos2(50.0, 50.0);
+        for pressed in [true, false] {
+            frame(
+                &ctx,
+                &layout,
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(state.menu, Some((0, pos)));
+        assert_eq!(state.selected, Some(0));
+        frame(
+            &ctx,
+            &layout,
+            &mut state,
+            vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+        );
+        assert!(state.menu.is_none());
+        for k in [
+            key(egui::Key::F10, egui::Modifiers::SHIFT),
+            key(egui::Key::Menu, egui::Modifiers::NONE),
+        ] {
+            frame(&ctx, &layout, &mut state, vec![k]);
+            assert_eq!(state.menu.map(|m| m.0), Some(0));
+            frame(
+                &ctx,
+                &layout,
+                &mut state,
+                vec![key(egui::Key::Escape, egui::Modifiers::NONE)],
+            );
+            assert!(state.menu.is_none());
+        }
+        state.menu = Some((0, pos));
+        frame(&ctx, &layout, &mut state, vec![]);
+        let outside = egui::pos2(650.0, 500.0);
+        for pressed in [true, false] {
+            frame(
+                &ctx,
+                &layout,
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(outside),
+                    egui::Event::PointerButton {
+                        pos: outside,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(state.menu.is_none());
+    }
     fn node(id: usize, bytes: u64) -> Node {
         Node {
             id,

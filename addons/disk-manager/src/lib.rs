@@ -1,4 +1,6 @@
 //! Native Disk Manager workspace, adapted from the standalone Stratum scan engine.
+mod category;
+mod explorer;
 mod folder_picker;
 mod map;
 mod optimization;
@@ -88,6 +90,7 @@ pub struct DiskManager {
     export_job: Option<mpsc::Receiver<Result<String, String>>>,
     last_generation: u64,
     listing_cache: Option<(String, scanner::Listing)>,
+    map_state: map::Interaction,
     map_cache: Option<(u64, usize, Arc<map::MapLayout>)>,
     picker: Option<mpsc::Receiver<Result<Option<String>, String>>>,
     tutorial_snapshot: Option<(usize, bool, usize, usize)>,
@@ -113,6 +116,7 @@ impl Default for DiskManager {
             export_job: None,
             last_generation: 0,
             listing_cache: None,
+            map_state: Default::default(),
             map_cache: None,
             picker: None,
             tutorial_snapshot: None,
@@ -246,6 +250,7 @@ impl DiskManager {
         (s.progress.clone(), s.nodes.clone())
     }
     fn drill(&mut self, id: usize) {
+        self.map_state = Default::default();
         self.parent = id;
         self.offset = 0;
         self.search.clear();
@@ -264,7 +269,7 @@ impl DiskManager {
             self.map_cache = Some((
                 p.generation,
                 self.parent,
-                Arc::new(map::MapLayout::new(&children)),
+                Arc::new(map::MapLayout::with_tree(&children, nodes)),
             ));
         }
         self.map_cache.as_ref().unwrap().2.clone()
@@ -477,8 +482,8 @@ impl DiskManager {
                                 ui.ctx().copy_text(display_path(&n.path));
                                 ui.close();
                             }
-                            if ui.button("Reveal in Explorer").clicked() {
-                                reveal(&n.path);
+                            if ui.button("Show in Explorer").clicked() {
+                                self.message = Some(explorer::show(&n.path).unwrap_or_else(|e| e));
                                 ui.close();
                             }
                         });
@@ -614,7 +619,11 @@ impl DiskManager {
             theme::section(ui, "Space map");
             ui.add_space(theme::SPACE_M);
             let entries = self.map_entries(nodes, p);
-            if let Some(n) = map::show(ui, &entries).and_then(|id| nodes.get(id)) {
+            let action = map::show(ui, &entries, &mut self.map_state);
+            if let Some(n) = action.reveal.and_then(|id| nodes.get(id)) {
+                self.message = Some(explorer::show(&n.path).unwrap_or_else(|e| e));
+            }
+            if let Some(n) = action.open.and_then(|id| nodes.get(id)) {
                 if n.dir {
                     self.drill(n.id);
                 } else {
@@ -738,6 +747,7 @@ impl NativeAddon for DiskManager {
         let (p, nodes) = self.progress();
         if p.generation != self.last_generation {
             self.last_generation = p.generation;
+            self.map_state = Default::default();
             self.parent = 0;
             self.offset = 0;
         }
@@ -1065,31 +1075,6 @@ impl NativeAddon for DiskManager {
     }
 }
 
-fn reveal(path: &str) {
-    #[cfg(windows)]
-    {
-        use std::{
-            ffi::OsString, os::windows::ffi::OsStringExt, os::windows::process::CommandExt,
-            path::PathBuf,
-        };
-        use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
-
-        let mut buffer = [0; 260];
-        // SAFETY: the binding passes the slice length to the Windows API.
-        let len = unsafe { GetSystemWindowsDirectoryW(Some(&mut buffer)) } as usize;
-        if len == 0 || len >= buffer.len() {
-            return;
-        }
-        let windows = PathBuf::from(OsString::from_wide(&buffer[..len]));
-        let _ = std::process::Command::new(windows.join("explorer.exe"))
-            .raw_arg(format!("/select,\"{}\"", display_path(path)))
-            .spawn();
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-    }
-}
 fn drives() -> Vec<Drive> {
     #[cfg(windows)]
     {

@@ -1,9 +1,10 @@
 //! Aural's live audio controls inside the Toolboks workspace.
 mod routing;
 mod settings;
+mod timeline;
 use settings::{AudioPreferences, DeviceIdentity, Discovery};
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering::Relaxed},
     Arc, Mutex,
@@ -17,8 +18,7 @@ use toolboks_addon_sdk::{tutorial, Capability, NativeAddon, TutorialStep};
 use toolboks_shared::ui as look;
 
 pub const ID: &str = "toolboks.aural";
-const HISTORY: usize = 160;
-const INTERVAL: Duration = Duration::from_millis(50);
+
 const VB_CABLE: &str = "https://vb-audio.com/Cable/";
 const ROUTE_LABELS: [&str; 2] = ["Hear myself", "Send to other apps"];
 
@@ -323,7 +323,8 @@ pub struct Aural {
     volume: f32,
     monitor_level: Arc<AtomicU32>,
     levels: [f32; 2],
-    history: [VecDeque<f32>; 2],
+    timeline: timeline::Timeline,
+    meter_started: Instant,
     last_sample: Instant,
 }
 
@@ -357,7 +358,8 @@ impl Default for Aural {
             volume: 50.0,
             monitor_level: Arc::new(AtomicU32::new(0.5_f32.to_bits())),
             levels: [-60.0; 2],
-            history: std::array::from_fn(|_| VecDeque::with_capacity(HISTORY)),
+            timeline: timeline::Timeline::default(),
+            meter_started: Instant::now(),
             last_sample: Instant::now(),
         }
     }
@@ -473,6 +475,8 @@ impl Aural {
         }
         self.message = None;
         self.last_sample = Instant::now();
+        self.meter_started = self.last_sample;
+        self.timeline.reset(self.ui_active);
         Ok(())
     }
 
@@ -537,24 +541,23 @@ impl Aural {
     }
 
     fn sample(&mut self) {
+        if !self.ui_active {
+            return;
+        }
         let Some(input) = &self.input else {
             return;
         };
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_sample);
-        if elapsed < INTERVAL {
-            return;
-        }
         self.last_sample = now;
-        for (channel, level) in self.levels.iter_mut().enumerate() {
-            let peak = f32::from_bits(input.signal.peaks[channel].swap(0, Relaxed));
-            *level = db(peak).max(*level - elapsed.as_secs_f32() * 48.0);
-            let history = &mut self.history[channel];
-            if history.len() == HISTORY {
-                history.pop_front();
-            }
-            history.push_back(*level + 60.0);
+        let peaks = std::array::from_fn(|channel| {
+            db(f32::from_bits(input.signal.peaks[channel].swap(0, Relaxed)))
+        });
+        for (level, peak) in self.levels.iter_mut().zip(peaks) {
+            *level = peak.max(*level - elapsed.as_secs_f32() * 48.0);
         }
+        self.timeline
+            .observe(now.duration_since(self.meter_started), peaks);
     }
 }
 
@@ -648,6 +651,50 @@ fn refreshing_picker(
         .unwrap_or(false)
 }
 
+fn status_pill(ui: &mut egui::Ui, text: &str, live: bool) {
+    let color = if live { look::GREEN } else { look::MUTED };
+    egui::Frame::new()
+        .fill(look::SELECTED_BG)
+        .corner_radius(20)
+        .inner_margin(egui::Margin::symmetric(7, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 12.0), egui::Sense::hover());
+                ui.painter().circle_filled(r.center(), 3.0, color);
+                ui.label(RichText::new(text).size(11.0).color(color));
+            });
+        });
+}
+fn named_switch(ui: &mut egui::Ui, value: &mut bool, name: &str) -> bool {
+    let response = look::toggle_switch(ui, value);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Switch, ui.is_enabled(), *value, name)
+    });
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.expand(2.0),
+            look::CONTROL_RADIUS,
+            egui::Stroke::new(1.5, look::ACCENT),
+            egui::StrokeKind::Outside,
+        );
+    }
+    response.changed()
+}
+fn info(ui: &mut egui::Ui, name: &str, text: &str) {
+    let response = ui.small_button("i").on_hover_text(text);
+    if response.has_focus() || response.clicked() {
+        response.show_tooltip_text(text);
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::Role::Button,
+            ui.is_enabled(),
+            format!("About {name}: {text}"),
+        )
+    });
+}
+
 impl Aural {
     fn microphone_picker(&mut self, ui: &mut egui::Ui) -> bool {
         let label = self
@@ -679,87 +726,84 @@ impl Aural {
         tutorial::region(ui, "aural-input", |ui| {
             look::card(ui, ui.available_width(), 0.0, |ui| {
                 section(ui, "Microphone");
-                muted(
-                    ui,
-                    if self.input.is_some() {
-                        "Input live"
-                    } else if self.mic_fault.is_some() {
-                        "Input off, problem with the microphone"
-                    } else {
-                        "Input off"
-                    },
-                );
-                if let Some(fault) = &self.mic_fault {
-                    fault_ui(ui, "aural-mic-fault", fault);
-                }
-                ui.add_space(look::SPACE_M);
                 if ui
                     .add_enabled_ui(interactive, |ui| self.microphone_picker(ui))
                     .inner
                 {
                     self.change_microphone();
                 }
-                if ui
-                    .add_enabled(interactive, egui::Button::new("Refresh microphones"))
-                    .clicked()
-                {
-                    self.refresh_microphones();
-                }
-                if let Some(error) = self.microphone_refresh_error.as_deref() {
-                    muted(ui, error);
-                }
-                ui.add_space(look::SPACE_M);
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     let live = self.input.is_some();
-                    let label = if live {
-                        "Disable microphone"
-                    } else {
-                        "Enable microphone"
-                    };
-                    let mut button = egui::Button::new(label);
-                    if !live {
-                        button =
-                            egui::Button::new(RichText::new(label).color(look::WINDOW_BG).strong())
-                                .fill(look::ACCENT);
+                    status_pill(ui, if live { "Live" } else { "Off" }, live);
+                    if let Some(input) = &self.input {
+                        muted(
+                            ui,
+                            format!(
+                                "{} kHz, {} channels",
+                                input.config.sample_rate.0 / 1000,
+                                input.config.channels
+                            ),
+                        );
                     }
                     if ui
-                        .add_enabled(
-                            interactive && (live || self.selected_input.is_some()),
-                            button,
-                        )
+                        .add_enabled(interactive, egui::Button::new("Refresh"))
+                        .on_hover_text("Refresh microphones")
                         .clicked()
                     {
-                        if live {
+                        self.refresh_microphones();
+                    }
+                    let mut enabled = live;
+                    if ui
+                        .add_enabled_ui(
+                            interactive && (live || self.selected_input.is_some()),
+                            |ui| named_switch(ui, &mut enabled, "Microphone"),
+                        )
+                        .inner
+                    {
+                        if enabled {
+                            if let Err(error) = self.enable_input() {
+                                self.mic_fault = Some(error);
+                            }
+                        } else {
                             self.disable_input();
-                        } else if let Err(e) = self.enable_input() {
-                            self.mic_fault = Some(e);
                         }
                     }
                 });
-                if let Some(input) = &self.input {
-                    muted(
-                        ui,
-                        format!(
-                            "{} Hz · {} channel(s)",
-                            input.config.sample_rate.0, input.config.channels
-                        ),
-                    );
-                } else if self.inputs.is_empty() {
-                    muted(
-                        ui,
-                        "Connect a microphone, then open the list or refresh microphones.",
-                    );
+                if let Some(fault) = &self.mic_fault {
+                    fault_ui(ui, "aural-mic-fault", fault);
                 }
-                ui.add_space(look::SPACE_M);
-                section(ui, "Input gain");
+                if let Some(error) = &self.microphone_refresh_error {
+                    muted(ui, error);
+                }
+                if self.inputs.is_empty() {
+                    muted(ui, "Connect a microphone, then refresh.");
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    section(ui, "Input gain");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{:+.1} dB", self.gain_db)).strong());
+                    });
+                });
                 ui.add_enabled_ui(interactive, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.add(
-                            egui::Slider::new(&mut self.gain_db, -30.0..=24.0)
-                                .suffix(" dB")
-                                .fixed_decimals(1),
-                        );
-                        if ui.button("Reset gain").clicked() {
+                    ui.spacing_mut().slider_width = ui.available_width() - 8.0;
+                    ui.add(
+                        egui::Slider::new(&mut self.gain_db, -30.0..=24.0)
+                            .show_value(false)
+                            .fixed_decimals(1),
+                    )
+                    .widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::Role::Slider, ui.is_enabled(), "Input gain")
+                    });
+                    ui.horizontal(|ui| {
+                        muted(ui, "Lower it if the bars reach red.");
+                        if ui
+                            .button("Reset")
+                            .on_hover_text("Reset input gain")
+                            .clicked()
+                        {
                             self.gain_db = 0.0;
                         }
                     });
@@ -770,64 +814,46 @@ impl Aural {
                         .gain
                         .store(gain(self.gain_db).to_bits(), Relaxed);
                 }
-                muted(ui, "Gain applies to both routes.");
             });
         });
     }
 
     fn settings_ui(&mut self, ui: &mut egui::Ui, interactive: bool) {
+        self.settings_card(ui, interactive, 0.0);
+    }
+
+    fn settings_card(&mut self, ui: &mut egui::Ui, interactive: bool, height: f32) {
         tutorial::region(ui, "aural-settings", |ui| {
-            look::card(ui, ui.available_width(), 0.0, |ui| {
-                section(ui, "Settings");
+            look::card(ui, ui.available_width(), height, |ui| {
+                section(ui, "Remember my setup");
                 let enabled = interactive && self.preferences_allowed;
-                ui.add_space(look::SPACE_M);
                 ui.add_enabled_ui(enabled, |ui| {
-                    audio_setting_switch(
-                        ui,
-                        &mut self.preferences.auto_enable,
-                        "Enable microphone on startup",
-                    );
+                    audio_setting_switch(ui, &mut self.preferences.auto_enable, "Turn on when Toolboks starts");
+                    info(ui, "startup", "Starts live audio when Toolboks opens. A saved per-microphone on/off state takes priority when remembering settings is enabled.");
+                    audio_setting_switch(ui, &mut self.preferences.remember_devices, "Remember gain and routes per microphone");
+                    info(ui, "remembering", "Save microphone on/off, gain, listening volume and routing. Restore them when switching microphones or reopening Toolboks.");
                 });
-                muted(
-                    ui,
-                    "Starts live audio when Toolboks opens. A saved per-microphone on/off state takes priority when remembering settings is enabled.",
-                );
-                ui.add_space(look::SPACE_M);
-                ui.add_enabled_ui(enabled, |ui| {
-                    audio_setting_switch(
-                        ui,
-                        &mut self.preferences.remember_devices,
-                        "Remember settings for each microphone",
-                    );
-                });
-                muted(
-                    ui,
-                    "Save microphone on/off, gain, listening volume and routing. Restore them when switching microphones or reopening Toolboks.",
-                );
-                if self.preferences.remember_devices {
-                    if let Some(device) = self.selected_input.and_then(|i| self.inputs.get(i)) {
-                        muted(ui, format!("Saving settings for {}.", device.name));
-                    } else {
-                        muted(ui, "Choose a microphone to save its settings.");
-                    }
-                }
-                ui.add_space(look::SPACE_L);
-                section(ui, "Default microphone");
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                muted(ui, "Default microphone");
                 if let Some(default) = &self.preferences.default_input {
-                    ui.label(egui::RichText::new(&default.name).strong());
-                    muted(
+                    ui.add(egui::Label::new(RichText::new(&default.name).strong()).wrap());
+                    let available = self.default_input_available();
+                    status_pill(
                         ui,
-                        if self.default_input_available() {
-                            "Available. Toolboks switches back when it reconnects."
+                        if available {
+                            "Connected"
                         } else {
-                            "Waiting for this microphone. Toolboks will switch to it when it connects."
+                            "Disconnected"
                         },
+                        available,
                     );
+                    if !available {
+                        muted(ui, "Waiting for this microphone. Toolboks will switch to it when it connects.");
+                    }
                 } else {
-                    muted(
-                        ui,
-                        "No default set. Choose a microphone above, then save it here.",
-                    );
+                    muted(ui, "No default set.");
                 }
                 ui.add_enabled_ui(enabled, |ui| {
                     ui.horizontal_wrapped(|ui| {
@@ -842,10 +868,8 @@ impl Aural {
                                     == 1
                             });
                         if ui
-                            .add_enabled(
-                                uniquely_named,
-                                egui::Button::new("Use selected microphone"),
-                            )
+                            .add_enabled(uniquely_named, egui::Button::new("Use selected"))
+                            .on_hover_text("Use selected microphone as default")
                             .clicked()
                         {
                             self.set_default_input();
@@ -853,8 +877,9 @@ impl Aural {
                         if ui
                             .add_enabled(
                                 self.preferences.default_input.is_some(),
-                                egui::Button::new("Clear default"),
+                                egui::Button::new("Clear"),
                             )
+                            .on_hover_text("Clear default microphone")
                             .clicked()
                         {
                             self.clear_default_input();
@@ -862,7 +887,10 @@ impl Aural {
                     });
                 });
                 if !self.preferences_allowed {
-                    muted(ui, "Review the Audio Gainer update to allow these settings to be saved on this PC.");
+                    muted(
+                        ui,
+                        "Review the Audio Gainer update to save settings on this PC.",
+                    );
                     if ui
                         .add_enabled(
                             !tutorial::active(ui.ctx()),
@@ -872,205 +900,166 @@ impl Aural {
                     {
                         self.request_settings_update();
                     }
-                } else {
-                    muted(ui, "Changes are saved automatically on this PC.");
                 }
             });
         });
     }
 
-    fn levels_ui(&mut self, ui: &mut egui::Ui, interactive: bool) {
+    fn levels_ui(&mut self, ui: &mut egui::Ui, height: f32) {
         tutorial::region(ui, "aural-levels", |ui| {
-            let history = self.history.each_mut().map(|line| &*line.make_contiguous());
-            let lines = [
-                look::Line {
-                    values: history[0],
-                    color: look::DATA_NETWORK,
-                    fill: false,
-                    label: "Left",
-                    fmt: |v| format!("{:.1} dBFS", v - 60.0),
-                },
-                look::Line {
-                    values: history[1],
-                    color: look::MUTED,
-                    fill: false,
-                    label: "Right",
-                    fmt: |v| format!("{:.1} dBFS", v - 60.0),
-                },
-            ];
-            let stats = if self.input.is_some() {
-                self.levels
-                    .iter()
-                    .zip(["Left", "Right"])
-                    .map(|(level, channel)| (format!("{level:.1} dBFS"), channel))
-                    .collect::<Vec<_>>()
-            } else {
-                vec![("Input off".into(), "")]
-            };
-            look::graph_card(
-                ui,
-                ui.available_width(),
-                185.0,
-                &look::GraphCard {
-                    title: "Input levels",
-                    detail: "Recent peaks",
-                    lines: &lines,
-                    capacity: HISTORY,
-                    max: 60.0,
-                    step_secs: INTERVAL.as_secs_f32(),
-                    stats: &stats,
-                    note: self
-                        .input
-                        .is_none()
-                        .then_some("Enable the microphone to see live levels."),
-                },
-            );
-            if let Some(input) = &self.input {
-                ui.add_space(look::SPACE_XS);
-                for (channel, level) in ["Left", "Right"].into_iter().zip(self.levels) {
-                    ui.horizontal(|ui| {
-                        ui.add_sized([38.0, 18.0], egui::Label::new(channel));
-                        ui.add(
-                            egui::ProgressBar::new((level + 60.0) / 60.0)
-                                .desired_width((ui.available_width() - 86.0).max(50.0))
-                                .fill(if channel == "Left" {
-                                    look::DATA_NETWORK
-                                } else {
-                                    look::MUTED
-                                }),
-                        );
-                        ui.add_sized([78.0, 18.0], egui::Label::new(format!("{level:.1} dBFS")));
-                    });
-                }
+            look::card(ui, ui.available_width(), height, |ui| {
+                section(ui, "Input levels");
                 ui.horizontal_wrapped(|ui| {
-                    if input.signal.clipped.load(Relaxed) {
-                        ui.label(RichText::new("Clipping detected").color(look::AMBER));
-                        if ui
-                            .add_enabled(interactive, egui::Button::new("Clear warning"))
-                            .clicked()
-                        {
-                            input.signal.clipped.store(false, Relaxed);
-                        }
-                        muted(
-                            ui,
-                            "Lower the input gain or your microphone's hardware gain.",
-                        );
-                    } else {
-                        muted(ui, "No clipping detected");
+                    for level in [
+                        timeline::Level::Good,
+                        timeline::Level::Close,
+                        timeline::Level::Clipping,
+                    ] {
+                        ui.label(RichText::new(level.label()).size(11.0).color(level.color()));
                     }
                 });
-            }
+                let elapsed = self.meter_started.elapsed();
+                let graph_height = (height - 174.0).max(160.0);
+                self.timeline.draw(ui, graph_height, elapsed);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    for (name, level) in ["Left", "Right"].into_iter().zip(self.levels) {
+                        ui.vertical(|ui| {
+                            muted(ui, name);
+                            ui.add_sized(
+                                [(ui.available_width() * 0.5 - 4.0).max(70.0), 28.0],
+                                egui::Label::new(
+                                    RichText::new(format!("{level:.1} dB")).size(22.0).strong(),
+                                ),
+                            );
+                        });
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(self.timeline.event_text(elapsed, false))
+                            .size(11.0)
+                            .color(look::MUTED),
+                    );
+                    ui.label(
+                        RichText::new(self.timeline.event_text(elapsed, true))
+                            .size(11.0)
+                            .color(look::MUTED),
+                    );
+                });
+            });
         });
     }
 
-    fn route_ui(&mut self, ui: &mut egui::Ui, index: usize, interactive: bool) {
+    fn route_ui(&mut self, ui: &mut egui::Ui, index: usize, interactive: bool, height: f32) {
         tutorial::region(ui, ["aural-monitor", "aural-cable"][index], |ui| {
-            look::card(ui, ui.available_width(), 0.0, |ui| {
+            look::card(ui, ui.available_width(), height, |ui| {
                 section(ui, ROUTE_LABELS[index]);
                 let cable_present = self.outputs.iter().any(|d| virtual_cable(&d.name));
                 let selected_is_cable = self.selected_outputs[index]
                     .and_then(|i| self.outputs.get(i))
                     .map(|d| virtual_cable(&d.name));
-                if index == 0 {
-                    muted(ui, "Use headphones to avoid feedback.");
+                if index == 1 {
+                    ui.label(
+                        RichText::new(if cable_present {
+                            "Virtual cable found"
+                        } else {
+                            "Virtual cable not found"
+                        })
+                        .color(if cable_present {
+                            look::GREEN
+                        } else {
+                            look::MUTED
+                        }),
+                    );
                 } else {
+                    muted(ui, "Use headphones to avoid feedback.");
+                }
+                let changed = ui
+                    .add_enabled_ui(interactive, |ui| {
+                        picker(
+                            ui,
+                            ("aural-output", index),
+                            &self.outputs,
+                            &mut self.selected_outputs[index],
+                            if index == 0 {
+                                "Choose headphones"
+                            } else {
+                                "Choose a virtual cable"
+                            },
+                            |d| index == 1 || !virtual_cable(&d.name),
+                        )
+                    })
+                    .inner;
+                if changed {
+                    let live = self.routes[index].is_some();
+                    self.stop_route(index);
+                    self.route_errors[index] = if live {
+                        self.enable_route(index).err()
+                    } else {
+                        None
+                    };
+                }
+                if index == 0 {
+                    ui.add_enabled_ui(interactive, |ui| {
+                        ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(80.0);
+                        ui.add(
+                            egui::Slider::new(&mut self.volume, 0.0..=100.0)
+                                .suffix("%")
+                                .fixed_decimals(0),
+                        )
+                        .widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::Role::Slider,
+                                ui.is_enabled(),
+                                "Listening volume",
+                            )
+                        });
+                    });
+                    self.monitor_level
+                        .store((self.volume / 100.0).to_bits(), Relaxed);
+                }
+                ui.horizontal(|ui| {
+                    let live = self.routes[index].is_some();
+                    let mut on = live;
+                    if ui
+                        .add_enabled_ui(
+                            interactive && self.selected_outputs[index].is_some(),
+                            |ui| named_switch(ui, &mut on, ROUTE_LABELS[index]),
+                        )
+                        .inner
+                    {
+                        self.route_errors[index] = None;
+                        if on {
+                            self.route_errors[index] = self.enable_route(index).err();
+                        } else {
+                            self.route_stopped(index);
+                        }
+                    }
+                    let live = self.routes[index].is_some();
+                    status_pill(ui, if live { "Live" } else { "Off" }, live);
+                });
+                if index == 1 {
                     let state = CableState::of(
                         cable_present,
                         selected_is_cable,
                         self.input.is_some(),
                         self.routes[index].is_some(),
                     );
-                    ui.label(RichText::new(format!("Status: {}", state.headline())).strong());
-                    muted(ui, state.hint());
+                    muted(ui, state.headline());
                     if state == CableState::Missing {
                         ui.add_enabled_ui(interactive, |ui| {
                             ui.visuals_mut().hyperlink_color = look::DATA_MEMORY;
-                            ui.hyperlink_to("VB-CABLE download and installation", VB_CABLE);
+                            ui.hyperlink_to("Get VB-CABLE", VB_CABLE);
                         });
                     }
-                    muted(ui, CABLE_EXPLAINED);
-                }
-                ui.add_space(look::SPACE_M);
-                ui.horizontal_wrapped(|ui| {
-                    let changed = ui
-                        .add_enabled_ui(interactive, |ui| {
-                            picker(
-                                ui,
-                                ("aural-output", index),
-                                &self.outputs,
-                                &mut self.selected_outputs[index],
-                                if index == 0 {
-                                    "Choose headphones"
-                                } else {
-                                    "Choose a virtual cable"
-                                },
-                                |d| index == 1 || !virtual_cable(&d.name),
-                            )
-                        })
-                        .inner;
-                    if changed {
-                        let live = self.routes[index].is_some();
-                        self.stop_route(index);
-                        self.route_errors[index] = if live {
-                            self.enable_route(index).err()
-                        } else {
-                            None
-                        };
-                    }
-                    let live = self.routes[index].is_some();
-                    let label = if live { "Stop route" } else { "Start route" };
-                    if ui
-                        .add_enabled(
-                            interactive && self.selected_outputs[index].is_some(),
-                            egui::Button::new(label),
-                        )
-                        .clicked()
-                    {
-                        self.route_errors[index] = None;
-                        if live {
-                            self.route_stopped(index);
-                        } else {
-                            self.route_errors[index] = self.enable_route(index).err();
-                        }
-                    }
-                    ui.label(
-                        RichText::new(if live { "Route live" } else { "Route off" })
-                            .color(if live { look::GREEN } else { look::MUTED }),
-                    );
-                });
-                let live = self.routes[index].is_some();
-                if !live && self.input.is_none() {
-                    muted(ui, "Starting this route also turns on the microphone.");
-                } else if live {
-                    muted(ui, "Stopping this route leaves the microphone on.");
-                }
-                if index == 0 {
-                    ui.add_enabled_ui(interactive, |ui| {
-                        ui.add(
-                            egui::Slider::new(&mut self.volume, 0.0..=100.0)
-                                .suffix("%")
-                                .fixed_decimals(0)
-                                .text("Listening volume"),
-                        );
-                    });
-                    self.monitor_level
-                        .store((self.volume / 100.0).to_bits(), Relaxed);
+                    ui.label(CABLE_EXPLAINED).on_hover_text(state.hint());
                 }
                 if let Some(fault) = &self.route_errors[index] {
                     fault_ui(ui, ("aural-route-fault", index), fault);
                 }
             });
         });
-    }
-
-    fn detail_ui(&mut self, ui: &mut egui::Ui, interactive: bool) {
-        self.levels_ui(ui, interactive);
-        ui.add_space(look::SPACE_M);
-        muted(ui, "Disabling the microphone stops both routes.");
-        for index in 0..2 {
-            ui.add_space(look::SPACE_M);
-            self.route_ui(ui, index, interactive);
-        }
     }
 }
 
@@ -1110,52 +1099,52 @@ impl NativeAddon for Aural {
         if interactive && !self.loaded {
             self.refresh();
         }
-        if self.input.is_some() {
-            ui.request_repaint_after(INTERVAL);
-        }
-        egui::ScrollArea::vertical()
-            .id_salt("aural-workspace")
-            .show(ui, |ui| {
-                ui.label(RichText::new("Live audio").size(look::TEXT_TITLE).strong());
-                muted(
-                    ui,
-                    "Check your microphone level and choose where the sound goes.",
-                );
-                if let Some(message) = self.message.as_deref() {
-                    if look::banner(ui, message) {
-                        self.message = None;
-                    }
-                }
-                ui.add_space(look::SPACE_L);
-                let width = ui.available_width();
-                if width >= 680.0 {
-                    ui.horizontal_top(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_width(270.0);
-                            self.input_ui(ui, interactive);
-                            ui.add_space(look::SPACE_M);
-                            self.settings_ui(ui, interactive);
-                        });
-                        ui.vertical(|ui| {
-                            ui.set_width(ui.available_width());
-                            self.detail_ui(ui, interactive);
-                        });
+        egui::ScrollArea::vertical().id_salt("aural-workspace")
+            .animated(!tutorial_active).auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(RichText::new("Live audio").size(look::TEXT_TITLE).strong());
+            muted(ui, "Check your microphone level and choose where the sound goes. Switching a route on also turns on the microphone.");
+            if let Some(message) = self.message.as_deref() { if look::banner(ui, message) { self.message = None; } }
+            ui.add_space(look::SPACE_M);
+            let width = ui.available_width();
+            let height = ui.available_height().max(520.0);
+            if width >= 860.0 {
+                ui.spacing_mut().item_spacing.x = look::GAP;
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(300.0, height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.set_width(300.0);
+                        self.input_ui(ui, interactive);
+                        ui.add_space(look::GAP);
+                        self.settings_card(ui, interactive, ui.available_height().max(0.0));
                     });
-                } else {
-                    self.input_ui(ui, interactive);
-                    ui.add_space(look::SPACE_M);
-                    self.settings_ui(ui, interactive);
-                    ui.add_space(look::SPACE_M);
-                    self.detail_ui(ui, interactive);
-                }
-            });
+                    ui.allocate_ui_with_layout(egui::vec2(width - 640.0 - 2.0 * look::GAP, height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.set_width(width - 640.0 - 2.0 * look::GAP);
+                        self.levels_ui(ui, height);
+                    });
+                    ui.allocate_ui_with_layout(egui::vec2(340.0, height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        ui.set_width(340.0);
+                        self.route_ui(ui, 0, interactive, (height - look::GAP) * 0.48);
+                        ui.add_space(look::GAP);
+                        self.route_ui(ui, 1, interactive, ui.available_height().max(0.0));
+                    });
+                });
+            } else {
+                self.levels_ui(ui, 400.0);
+                ui.add_space(look::GAP); self.input_ui(ui, interactive);
+                ui.add_space(look::GAP);
+                self.settings_ui(ui, interactive);
+                for index in 0..2 { ui.add_space(look::GAP); self.route_ui(ui, index, interactive, 0.0); }
+            }
+        });
+        // A switch can start audio during this frame; scheduling here also handles that case.
+        if self.ui_active && self.input.is_some() && !tutorial_active {
+            ui.request_repaint_after(timeline::FRAME);
+        }
         if tutorial_active {
             false
         } else {
             self.finish_ui_preferences(prefs)
         }
     }
-
     fn load_preferences(&mut self, prefs: &BTreeMap<String, serde_json::Value>) {
         if self.preferences_loaded {
             return;
@@ -1184,7 +1173,7 @@ impl NativeAddon for Aural {
         if let Some(input) = &self.input {
             input.signal.metering.store(false, Relaxed);
         }
-        self.history = std::array::from_fn(|_| VecDeque::new());
+        self.timeline.reset(false);
         self.levels = [-60.0; 2];
     }
 
@@ -1197,6 +1186,8 @@ impl NativeAddon for Aural {
             input.signal.metering.store(true, Relaxed);
         }
         self.last_sample = Instant::now();
+        self.meter_started = self.last_sample;
+        self.timeline.reset(self.input.is_some());
     }
 
     fn has_background_work(&self) -> bool {
@@ -1230,7 +1221,7 @@ impl NativeAddon for Aural {
         }
         self.input = None;
         self.levels = [-60.0; 2];
-        self.history.iter_mut().for_each(VecDeque::clear);
+        self.timeline.reset(false);
     }
 
     fn tutorial_location(&self) -> String {
@@ -1241,7 +1232,7 @@ impl NativeAddon for Aural {
         [
             ("aural-input", "Choose your microphone", "Choose a physical input, then enable it. Input gain changes the level sent to both routes."),
             ("aural-settings", "Remember your setup", "Startup activation is optional. Save gain and routing separately for each microphone, and choose a default whose name stays saved while disconnected. Toolboks switches back when it reconnects."),
-            ("aural-levels", "Check your levels", "Watch the left and right peaks. If clipping is reported, lower your gain, then clear the warning to check again."),
+            ("aural-levels", "Check your levels", "Watch the last 10 seconds of input levels. Lower your gain when levels are close to clipping or clipping. Left and right readouts show the current levels."),
             ("aural-monitor", "Hear yourself", "Choose headphones and start the route. Listening volume affects only your headphones."),
             ("aural-cable", "Send audio to another app", "Install VB-CABLE separately. Choose CABLE Input here and CABLE Output as the microphone in your other app."),
         ].into_iter().map(|(id, title, text)| TutorialStep::new("0", id, title, text)).collect()
@@ -1303,7 +1294,7 @@ mod tests {
         let texts = settings_frame(&ctx, &mut addon, 290.0, true, Vec::new());
         let startup = texts
             .iter()
-            .find(|(text, _)| text == "Enable microphone on startup")
+            .find(|(text, _)| text == "Turn on when Toolboks starts")
             .unwrap()
             .1
             .center();
@@ -1320,7 +1311,7 @@ mod tests {
         let texts = settings_frame(&ctx, &mut addon, 290.0, true, Vec::new());
         let remember = texts
             .iter()
-            .find(|(text, _)| text == "Remember settings for each microphone")
+            .find(|(text, _)| text == "Remember gain and routes per microphone")
             .unwrap()
             .1
             .center();
@@ -1676,7 +1667,8 @@ mod tests {
                     );
                     output.textures_delta.clear();
                 }
-                let anchor = tutorial::anchor(&ctx).expect("walkthrough anchor");
+                let anchor = tutorial::anchor(&ctx)
+                    .unwrap_or_else(|| panic!("missing anchor for {} at {width}", step.title));
                 assert!(
                     anchor.right() <= width + 1.0,
                     "{} overflows at {width}",
@@ -1687,6 +1679,54 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn page_text_and_cards_fit_three_columns_and_stacked_layouts() {
+        fn texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((
+                    t.galley.text().into(),
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                )),
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        texts(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for width in [420.0, 824.0, 860.0, 1000.0, 1106.0] {
+            let ctx = egui::Context::default();
+            let mut addon = Aural::default();
+            let mut prefs = BTreeMap::new();
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 720.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        addon.ui(ui, &mut prefs);
+                    },
+                );
+                output.textures_delta.clear();
+                let mut painted = Vec::new();
+                for shape in output.shapes {
+                    texts(&shape.shape, &mut painted);
+                }
+                for (text, rect) in painted {
+                    assert!(
+                        rect.right() <= width + 1.0 && rect.left() >= -1.0,
+                        "{text} overflows at {width}: {rect:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn device_text_is_kept_apart_and_never_doubles_punctuation() {
         let fault = Fault::new(MICROPHONE_LOST, "The device is no longer available.. ");

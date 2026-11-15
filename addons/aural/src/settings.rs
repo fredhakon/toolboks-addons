@@ -375,7 +375,7 @@ impl Aural {
             && self.selected_input.is_some()
         {
             if let Err(error) = self.enable_input() {
-                self.message = Some(error);
+                self.mic_fault = Some(error);
             }
         }
         if self.input.is_some() {

@@ -1363,6 +1363,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "system-profiles"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "serde",
+ "serde_json",
+ "toolboks-addon-proto",
+ "toolboks-addon-sdk",
+ "toolboks-debloat-engine",
+ "toolboks-shared",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"

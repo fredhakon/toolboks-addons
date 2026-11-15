@@ -29,6 +29,8 @@ enum AdminKind {
     ServiceUndo,
     TaskSet,
     TaskUndo,
+    StartupSet,
+    StartupUndo,
 }
 
 /// State of the Apps page. Package calls are slow, so they run on worker threads and report
@@ -191,6 +193,10 @@ pub struct Debloater {
     service_rest: Vec<services::UndoStep>,
     task_batch: Vec<tasks::UndoStep>,
     task_rest: Vec<tasks::UndoStep>,
+    startup_batch: Vec<startup::UndoStep>,
+    startup_rest: Vec<startup::UndoStep>,
+    /// The title of the startup item a pending set request is about, and what was asked.
+    pending_startup: Option<(String, bool)>,
 }
 
 impl Debloater {
@@ -222,6 +228,9 @@ impl Debloater {
             service_rest: Vec::new(),
             task_batch: Vec::new(),
             task_rest: Vec::new(),
+            startup_batch: Vec::new(),
+            startup_rest: Vec::new(),
+            pending_startup: None,
         }
     }
 }

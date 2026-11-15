@@ -14,6 +14,7 @@ use toolboks_debloat_engine::{
     plan::{self, Applied, Outcome, Run, UndoOp},
     restore::{self, RestoreStatus, WinRestore},
     services::{self, ServiceDef, StartType, WinServices},
+    startup::{self, Class, Entry, Source, WinStartup},
     tasks::{self, TaskDef, WinTasks},
     ChangeError,
 };
@@ -190,6 +191,8 @@ pub fn prepare_admin(request: &AdminRequest) -> Result<Box<dyn AdminChange>, Str
         Some("service_undo") => prepare_service_undo(&value),
         Some("task_set") => prepare_task_set(&value),
         Some("task_undo") => prepare_task_undo(&value),
+        Some("startup_set") => prepare_startup_set(&value),
+        Some("startup_undo") => prepare_startup_undo(&value),
         _ => Err("The administrator request was not understood.".into()),
     }
 }
@@ -854,6 +857,229 @@ impl AdminChange for TaskUndo {
     }
 }
 
+// ---- startup entries -----------------------------------------------------------------------
+
+fn source_name(source: Source) -> &'static str {
+    match source {
+        Source::UserRun => "user_run",
+        Source::MachineRun => "machine_run",
+        Source::MachineRun32 => "machine_run32",
+        Source::UserFolder => "user_folder",
+        Source::CommonFolder => "common_folder",
+    }
+}
+
+fn source_from(name: &str) -> Option<Source> {
+    Source::ALL
+        .into_iter()
+        .find(|source| source_name(*source) == name)
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok())
+        .collect()
+}
+
+/// An entry name as it may appear in a request: non-empty, short, no control characters.
+fn startup_name(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .filter(|name| !name.is_empty() && name.len() <= 260 && !name.chars().any(char::is_control))
+}
+
+pub fn startup_step_json(step: &startup::UndoStep) -> Value {
+    json!({
+        "source": source_name(step.source),
+        "name": step.name,
+        "previous": step.previous.as_deref().map(hex),
+    })
+}
+
+/// A startup undo step back from JSON. The approval value is exactly 12 bytes or absent.
+pub fn startup_step_from(value: &Value) -> Result<startup::UndoStep, String> {
+    let source = value["source"]
+        .as_str()
+        .and_then(source_from)
+        .ok_or("An undo step names an unknown startup location.")?;
+    let name = startup_name(&value["name"]).ok_or("An undo step has an invalid entry name.")?;
+    let previous = match &value["previous"] {
+        Value::Null => None,
+        Value::String(text) => Some(
+            unhex(text)
+                .filter(|bytes| bytes.len() == 12)
+                .ok_or("An undo step has an invalid startup value.")?,
+        ),
+        _ => return Err("An undo step has an invalid startup value.".into()),
+    };
+    Ok(startup::UndoStep {
+        source,
+        name: name.to_owned(),
+        previous,
+    })
+}
+
+pub fn startup_set_request(entry: &Entry, enable: bool) -> String {
+    json!({
+        "kind": "startup_set",
+        "source": source_name(entry.source),
+        "name": entry.name,
+        "enable": enable,
+    })
+    .to_string()
+}
+
+pub fn startup_undo_request(steps: &[startup::UndoStep]) -> String {
+    json!({
+        "kind": "startup_undo",
+        "steps": steps.iter().map(startup_step_json).collect::<Vec<_>>(),
+    })
+    .to_string()
+}
+
+/// The entries as they really are right now. A request is checked against this list, so it can
+/// only name an entry that exists, never write an arbitrary startup value.
+fn current_entries() -> Result<Vec<Entry>, String> {
+    startup::entries(&WinStartup, &startup::publisher_of_command)
+}
+
+struct StartupSet {
+    entry: Entry,
+    enable: bool,
+    description: String,
+}
+
+struct StartupUndo {
+    steps: Vec<startup::UndoStep>,
+    description: String,
+}
+
+fn startup_set_description(entry: &Entry, enable: bool) -> String {
+    let care = match entry.class {
+        Class::Careful => {
+            "\n  This may be hardware software, a VPN or something unknown. Switching it off can stop that from working."
+        }
+        _ => "",
+    };
+    limited(format!(
+        "Switch this startup item {}?\n\n\u{2022} {} ({})\n  Publisher: {}\n  Runs: {}{care}\n\nThe entry stays where it is; only whether it starts with Windows changes.\nYou can undo this in Toolboks until you close it.",
+        if enable { "on" } else { "off" },
+        entry.name,
+        entry.source.label(),
+        entry.publisher.as_deref().unwrap_or("unknown"),
+        entry.command,
+    ))
+}
+
+fn startup_undo_description(steps: &[startup::UndoStep]) -> String {
+    let mut text = String::from("Put these startup items back?\n");
+    for step in steps {
+        text.push_str(&format!(
+            "\n\u{2022} {} ({})\n  Its start-up setting goes back to what it was.\n",
+            step.name,
+            step.source.label()
+        ));
+    }
+    limited(text)
+}
+
+fn prepare_startup_set(value: &Value) -> Result<Box<dyn AdminChange>, String> {
+    let source = value["source"]
+        .as_str()
+        .and_then(source_from)
+        .ok_or("The request names an unknown startup location.")?;
+    let name = startup_name(&value["name"]).ok_or("The request has an invalid entry name.")?;
+    let enable = value["enable"]
+        .as_bool()
+        .ok_or("The request does not say whether to switch the item on or off.")?;
+    let entry = current_entries()?
+        .into_iter()
+        .find(|entry| entry.source == source && entry.name == name)
+        .ok_or("That startup item is no longer there.")?;
+    if entry.class == Class::Never {
+        return Err(format!(
+            "{} is a security or system component and cannot be changed here.",
+            entry.name
+        ));
+    }
+    Ok(Box::new(StartupSet {
+        description: startup_set_description(&entry, enable),
+        entry,
+        enable,
+    }))
+}
+
+fn prepare_startup_undo(value: &Value) -> Result<Box<dyn AdminChange>, String> {
+    let steps = steps_list(value)?
+        .iter()
+        .map(startup_step_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let entries = current_entries()?;
+    if let Some(step) = steps.iter().find(|step| {
+        !entries
+            .iter()
+            .any(|entry| entry.source == step.source && entry.name == step.name)
+    }) {
+        return Err(format!("{} is no longer a startup item.", step.name));
+    }
+    Ok(Box::new(StartupUndo {
+        description: startup_undo_description(&steps),
+        steps,
+    }))
+}
+
+/// Windows FILETIME now: 100 ns steps since 1601.
+fn filetime_now() -> u64 {
+    const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
+    let since_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    UNIX_EPOCH_AS_FILETIME + (since_unix.as_nanos() / 100) as u64
+}
+
+impl AdminChange for StartupSet {
+    fn capability(&self) -> &str {
+        "system_tuning"
+    }
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+    fn apply(self: Box<Self>) -> Result<String, String> {
+        let result =
+            startup::set_enabled(&mut WinStartup, &self.entry, self.enable, filetime_now());
+        Ok(change_json(&result, None, startup_step_json).to_string())
+    }
+}
+
+impl AdminChange for StartupUndo {
+    fn capability(&self) -> &str {
+        "system_tuning"
+    }
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+    fn apply(self: Box<Self>) -> Result<String, String> {
+        let (done, kept) = undo_batch(
+            self.steps,
+            |step| (step.source, step.name.clone()),
+            |step| startup::undo(&mut WinStartup, step),
+        );
+        Ok(json!({
+            "done": done,
+            "kept": kept.iter().map(startup_step_json).collect::<Vec<_>>(),
+        })
+        .to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1126,5 +1352,68 @@ mod tests {
         let undo = prepare_admin(&request(&service_undo_request(&[step]))).unwrap();
         assert!(undo.description().contains("Manual"));
         assert!(prepare_admin(&request(r#"{"kind":"task_undo","steps":[]}"#)).is_err());
+    }
+
+    #[test]
+    fn startup_steps_round_trip_and_bad_ones_are_refused() {
+        for previous in [None, Some(vec![2, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8])] {
+            let step = startup::UndoStep {
+                source: Source::MachineRun,
+                name: "Some App".into(),
+                previous,
+            };
+            assert_eq!(startup_step_from(&startup_step_json(&step)).unwrap(), step);
+        }
+        let good = json!({ "source": "machine_run", "name": "x", "previous": null });
+        assert!(startup_step_from(&good).is_ok());
+        for bad in [
+            json!({ "source": "sideways", "name": "x", "previous": null }),
+            json!({ "source": "machine_run", "name": "", "previous": null }),
+            json!({ "source": "machine_run", "name": "a\nb", "previous": null }),
+            json!({ "source": "machine_run", "name": "x", "previous": "00ff" }),
+            json!({ "source": "machine_run", "name": "x", "previous": 5 }),
+            json!({ "source": "machine_run", "name": "x", "previous": "zz0000000000000000000000" }),
+        ] {
+            assert!(startup_step_from(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_startup_preview_comes_from_the_real_entry() {
+        let entry = Entry {
+            source: Source::MachineRun,
+            name: "Updater".into(),
+            command: "C:\\Apps\\updater.exe --silent".into(),
+            enabled: true,
+            publisher: Some("Example Corp".into()),
+            class: Class::Careful,
+        };
+        let text = startup_set_description(&entry, false);
+        assert!(text.contains("off") && text.contains("Updater"));
+        assert!(text.contains("Example Corp") && text.contains("updater.exe --silent"));
+        assert!(text.contains("All users") && text.contains("VPN"));
+        assert!(startup_set_description(&entry, true).contains("on?"));
+    }
+
+    #[test]
+    fn startup_requests_for_things_that_are_not_there_are_refused() {
+        assert!(prepare_admin(&request(
+            r#"{"kind":"startup_set","source":"machine_run","name":"No Such Entry Exists 12345","enable":false}"#
+        ))
+        .is_err());
+        assert!(prepare_admin(&request(
+            r#"{"kind":"startup_set","source":"nowhere","name":"x","enable":false}"#
+        ))
+        .is_err());
+        assert!(prepare_admin(&request(
+            r#"{"kind":"startup_set","source":"machine_run","name":"x"}"#
+        ))
+        .is_err());
+        let step = startup::UndoStep {
+            source: Source::MachineRun,
+            name: "No Such Entry Exists 12345".into(),
+            previous: None,
+        };
+        assert!(prepare_admin(&request(&startup_undo_request(&[step]))).is_err());
     }
 }

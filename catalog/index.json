@@ -1,1 +1,249 @@
-{"format_version":1,"entries":[]}
+{
+  "format_version": 1,
+  "entries": [
+    {
+      "id": "toolboks.disk-manager",
+      "title": "Disk Manager",
+      "short_description": "Find the weight. Keep what matters. Map your storage and uncover the files taking the most space.",
+      "long_description": "Stratum's disk analysis, built for your Toolboks workspace. Scan any drive or folder, explore an interactive space map, find the largest files, filter by size and age, inspect file types, and export your findings. Analyze fragmentation, inspect Windows optimization history, defragment hard drives, or TRIM SSDs with administrator access. Optimization only runs when requested. Scans are read-only, run in the background, and can be cancelled. Links and junctions are skipped; access errors are reported transparently. Sizes are logical file lengths and may differ from allocated disk usage. Drive-changing optimization is unavailable pending host issue #132 and a rebuild against its protocol and elevated helper.",
+      "publisher": "Toolboks",
+      "byline": "by stratum",
+      "category": "Storage",
+      "icon": "storage",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "filesystem_read",
+        "local_preferences",
+        "user_exports",
+        "drive_optimize"
+      ],
+      "pages": [
+        "Overview",
+        "Largest files",
+        "File types",
+        "Scan details",
+        "Optimization"
+      ],
+      "background": true,
+      "kind": "native",
+      "version": "0.2.0",
+      "min_toolboks_version": "0.12.5",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/disk-manager-v0.2.0/disk-manager.exe",
+      "size": 3646976,
+      "sha256": "05b4ba7d3a22bf6bdcf9a7d9e5bc6da95f75a3874d19c172e30790efcc5881fe",
+      "release_notes": "Release disk-manager-v0.2.0.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.event-watch",
+      "title": "Event Watch",
+      "short_description": "Understand Windows events and crashes.",
+      "long_description": "Event Watch reads the Windows event logs and explains what is going on, with a closer look at crashes and restarts. It reads crash dump headers to name the stop code. It never clears your logs and changes nothing on your PC.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "grid",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "filesystem_read",
+        "local_preferences"
+      ],
+      "pages": [
+        "Live",
+        "Crashes",
+        "Summary"
+      ],
+      "background": false,
+      "kind": "native",
+      "version": "0.1.0",
+      "min_toolboks_version": "0.12.5",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/event-watch-v0.1.0/event-watch.exe",
+      "size": 3400704,
+      "sha256": "5cc03c8acd83e48d1e1c236e3fa1de6f3c475a6098e90a70117b512c6ead709e",
+      "release_notes": "Release event-watch-v0.1.0.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.memory-cleaner",
+      "title": "Memory Cleaner",
+      "short_description": "Keep an eye on memory and clean up what idle apps are holding.",
+      "long_description": "Memory Cleaner shows how your memory is used, which apps hold the most, and how close Windows is to running short. It can trim the memory that idle apps are not using, by hand or automatically when memory is under real pressure, and it keeps a short history. Trimming moves memory into the cache and never closes an app. One advanced action, clearing the low-priority cache, changes how Windows manages memory for the whole PC: it asks for administrator rights in a separate window and only runs when you confirm there. Nothing is stored between runs.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "leaf",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "host_metrics",
+        "system_tuning"
+      ],
+      "pages": [
+        "Home",
+        "Advanced"
+      ],
+      "background": true,
+      "kind": "native",
+      "version": "0.1.0",
+      "min_toolboks_version": "0.12.5",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/memory-cleaner-v0.1.0/memory-cleaner.exe",
+      "size": 3566592,
+      "sha256": "dc17705bffdfce80eaac3e36fb0c20a4682b67d9b4cbcd42c7fa90d109e0dad3",
+      "release_notes": "Release memory-cleaner-v0.1.0.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.resource-monitor",
+      "title": "Resource Monitor",
+      "short_description": "Watch your processor, graphics, memory, disk and network.",
+      "long_description": "Resource Monitor draws live graphs of what your PC is doing and keeps a short history while it is open. It also lists running apps, lets you change a process's priority or end it, and shows network connections. It reads system and process information; it changes something only when you use one of those process actions.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "activity",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "host_metrics"
+      ],
+      "pages": [
+        "Overview",
+        "Details",
+        "Processes",
+        "Connections"
+      ],
+      "background": false,
+      "kind": "native",
+      "version": "0.1.0",
+      "min_toolboks_version": "0.12.5",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/resource-monitor-v0.1.0/resource-monitor.exe",
+      "size": 3857920,
+      "sha256": "f6bcc3e12441c4c8da10944a506d8096f3855c0b2c33d4c905cf11e220600256",
+      "release_notes": "Release resource-monitor-v0.1.0.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.aural",
+      "title": "Audio Gainer",
+      "short_description": "Check your microphone level, hear yourself, and route your mic to other apps.",
+      "long_description": "Adjust microphone gain, watch live left and right levels, and monitor through headphones. Sending audio to another app uses a separately installed driver such as VB-Audio Virtual Cable. Aural includes setup instructions and a link to the official installer page.",
+      "publisher": "Toolboks",
+      "byline": "by aural",
+      "category": "Audio",
+      "icon": "activity",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "live_audio",
+        "local_preferences"
+      ],
+      "pages": [],
+      "background": true,
+      "kind": "native",
+      "version": "0.2.0",
+      "min_toolboks_version": "0.12.5",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/aural-v0.2.0/aural.exe",
+      "size": 3438592,
+      "sha256": "34e2c74153a04c8152c9a3316227f33c6b469cff03deaae3c57dc5f401e1e4ec",
+      "release_notes": "Release aural-v0.2.0.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.macro-manager",
+      "title": "Macro Manager",
+      "short_description": "Record, edit and repeat keyboard and mouse actions.",
+      "long_description": "Record keystrokes, mouse movements, clicks and scrolling when you choose. Edit steps and movement paths, set timings, and replay with an optional repeat delay and duration. Configurable shortcuts control recording and playback; Escape stops active work. Macros and settings stay on this PC. Playback sends real input to the active desktop.",
+      "publisher": "Toolboks",
+      "category": "Automation",
+      "icon": "macro",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "input_automation",
+        "local_preferences"
+      ],
+      "pages": [
+        "Editor",
+        "Mouse editor"
+      ],
+      "background": true,
+      "kind": "native",
+      "version": "0.1.0",
+      "min_toolboks_version": "0.12.5",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/macro-manager-v0.1.0/macro-manager.exe",
+      "size": 3375104,
+      "sha256": "a519edf27f87ebb57905f5070f3a8e9d802ebcc31e8f7b488d3683b9d33e36cb",
+      "release_notes": "Release macro-manager-v0.1.0.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.debloater",
+      "title": "Debloater",
+      "short_description": "Tune Windows privacy, apps, startup and background tasks.",
+      "long_description": "Debloater explains optional Windows changes in plain language, so you can turn off what you do not need. Nothing is changed until you choose it, and supported changes can be undone during the session. It changes your own account's settings: privacy and advertising switches, startup entries and installed apps. Changes that need administrator rights are listed but not available yet.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "wrench",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "system_tuning"
+      ],
+      "pages": [
+        "Privacy and ads",
+        "Apps",
+        "Startup",
+        "Tasks",
+        "Services"
+      ],
+      "background": false,
+      "kind": "native",
+      "version": "0.1.0",
+      "min_toolboks_version": "0.12.5",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/debloater-v0.1.0/debloater.exe",
+      "size": 3544064,
+      "sha256": "22956dc853bbab3b7b794b0df4e368367f5baaed534e1d4d64c6cc77c84b7197",
+      "release_notes": "Release debloater-v0.1.0.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.system-profiles",
+      "title": "System Profiles",
+      "short_description": "Review and apply a Windows gaming profile with a restore point, registry backup, and activity log.",
+      "long_description": "Choose the Gaming profile changes to apply, follow guided Windows and NVIDIA settings, and restore the settings Toolboks applied.",
+      "publisher": "Toolboks",
+      "category": "System",
+      "icon": "activity",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "system_tuning"
+      ],
+      "pages": [],
+      "background": false,
+      "kind": "native",
+      "version": "0.1.0",
+      "min_toolboks_version": "0.12.0",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/system-profiles-v0.1.0/system-profiles.exe",
+      "size": 3339776,
+      "sha256": "e0bab362d3e533b66212de9795e631232f259ca22048711dacd066f2830e25df",
+      "release_notes": "Release system-profiles-v0.1.0.",
+      "verified": true,
+      "channel": "stable"
+    }
+  ]
+}

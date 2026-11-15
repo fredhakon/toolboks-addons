@@ -22,7 +22,113 @@ const INTERVAL: Duration = Duration::from_millis(50);
 const VB_CABLE: &str = "https://vb-audio.com/Cable/";
 const ROUTE_LABELS: [&str; 2] = ["Hear myself", "Send to other apps"];
 
+/// What the streams report: the raw device text. The screen shows a short sentence and keeps
+/// this text behind "Technical details".
 type AudioError = Arc<Mutex<Option<String>>>;
+
+const MICROPHONE_LOST: &str = "Microphone disconnected. Reconnect it, then enable it again.";
+const OUTPUT_LOST: &str = "Output disconnected. Reconnect it, then start this route again.";
+
+/// A problem shown beside the control it belongs to: one short sentence that says what to do,
+/// and the technical text kept apart for whoever needs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fault {
+    short: String,
+    detail: Option<String>,
+}
+
+impl Fault {
+    fn new(short: &str, raw: &str) -> Self {
+        let detail = plain_detail(raw);
+        Self {
+            short: short.into(),
+            detail: (!detail.is_empty()).then_some(detail),
+        }
+    }
+}
+
+impl From<&str> for Fault {
+    fn from(short: &str) -> Self {
+        Self {
+            short: short.into(),
+            detail: None,
+        }
+    }
+}
+
+impl From<String> for Fault {
+    fn from(short: String) -> Self {
+        Self {
+            short,
+            detail: None,
+        }
+    }
+}
+
+/// Device text without trailing punctuation, so it never ends in "..".
+fn plain_detail(raw: &str) -> String {
+    raw.trim()
+        .trim_end_matches(|c: char| c.is_whitespace() || ".:;,".contains(c))
+        .to_owned()
+}
+
+/// Where the "send to other apps" route stands. Choosing a device is not proof that sound
+/// arrives, so "ready" says only that it can be started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CableState {
+    /// No virtual cable among the output devices.
+    Missing,
+    /// A cable exists, but no destination is chosen yet.
+    NoDestination,
+    /// The chosen destination is an ordinary output, not a virtual cable.
+    NotACable,
+    /// A cable is chosen and the route is off.
+    Ready,
+    /// A cable is chosen, the route is off, and the microphone is off too.
+    ReadyInputOff,
+    /// The route is running.
+    Running,
+}
+
+impl CableState {
+    /// `cable_present` comes from the devices that exist, never from what is selected.
+    fn of(
+        cable_present: bool,
+        selected_is_cable: Option<bool>,
+        input_on: bool,
+        running: bool,
+    ) -> Self {
+        match selected_is_cable {
+            _ if !cable_present && selected_is_cable != Some(true) => Self::Missing,
+            None => Self::NoDestination,
+            Some(false) => Self::NotACable,
+            Some(true) if running => Self::Running,
+            Some(true) if input_on => Self::Ready,
+            Some(true) => Self::ReadyInputOff,
+        }
+    }
+    /// A short status in words, so it does not depend on colour.
+    fn headline(self) -> &'static str {
+        match self {
+            Self::Missing => "Virtual cable not found",
+            Self::NoDestination => "Virtual cable found, destination not chosen",
+            Self::NotACable => "Destination is not a virtual cable",
+            Self::Ready => "Ready to start",
+            Self::ReadyInputOff => "Ready to start, microphone is off",
+            Self::Running => "Running",
+        }
+    }
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Missing => "Install VB-Audio Virtual Cable, then refresh. Without it there is nothing to send the sound to.",
+            Self::NoDestination => "Choose CABLE Input below.",
+            Self::NotACable => "Other apps cannot use this as a microphone. Choose CABLE Input instead.",
+            Self::Ready => "Start the route to send your microphone to the cable.",
+            Self::ReadyInputOff => "Nothing is sent until you start the route.",
+            Self::Running => "Sending your microphone to the cable. Choose CABLE Output as the microphone in the other app. Choosing a device does not prove sound arrives, so check the level there.",
+        }
+    }
+}
 
 #[derive(Default)]
 struct Signal {
@@ -99,10 +205,7 @@ impl Input {
                 device.build_input_stream(
                     &config,
                     move |data: &[$t], _| process(data, channels, &samples),
-                    move |e| {
-                        *error.lock().unwrap() =
-                            Some(format!("Microphone disconnected: {e}. Enable it again."))
-                    },
+                    move |e| *error.lock().unwrap() = Some(e.to_string()),
                     None,
                 )
             }};
@@ -212,7 +315,8 @@ pub struct Aural {
     selected_outputs: [Option<usize>; 2],
     input: Option<Input>,
     routes: [Option<Output>; 2],
-    route_errors: [Option<String>; 2],
+    route_errors: [Option<Fault>; 2],
+    mic_fault: Option<Fault>,
     message: Option<String>,
     microphone_refresh_error: Option<String>,
     gain_db: f32,
@@ -246,6 +350,7 @@ impl Default for Aural {
             input: None,
             routes: [None, None],
             route_errors: [None, None],
+            mic_fault: None,
             message: None,
             microphone_refresh_error: None,
             gain_db: 0.0,
@@ -301,6 +406,7 @@ impl Aural {
         self.cancel();
         self.loaded = true;
         self.message = None;
+        self.mic_fault = None;
         self.microphone_refresh_error = None;
         self.route_errors = [None, None];
         let host = cpal::default_host();
@@ -345,7 +451,7 @@ impl Aural {
         self.restore_profile();
     }
 
-    fn enable_input(&mut self) -> Result<(), String> {
+    fn enable_input(&mut self) -> Result<(), Fault> {
         if !self.allowed {
             return Err("Live audio access is unavailable.".into());
         }
@@ -353,8 +459,13 @@ impl Aural {
             .selected_input
             .and_then(|i| self.inputs.get(i))
             .ok_or("Choose a microphone first.")?;
-        self.input = Some(Input::open(&device.device, self.gain_db)
-            .map_err(|e| format!("Could not open the microphone: {e}. Check the device and Windows microphone access."))?);
+        self.input = Some(Input::open(&device.device, self.gain_db).map_err(|e| {
+            Fault::new(
+                "Could not open the microphone. Check the device and Windows microphone access.",
+                &e,
+            )
+        })?);
+        self.mic_fault = None;
         self.want_input = true;
         self.manual_disabled = false;
         if let Some(input) = &self.input {
@@ -372,7 +483,7 @@ impl Aural {
         self.routes[index] = None;
     }
 
-    fn enable_route(&mut self, index: usize) -> Result<(), String> {
+    fn enable_route(&mut self, index: usize) -> Result<(), Fault> {
         let output = self.selected_outputs[index]
             .and_then(|i| self.outputs.get(i))
             .ok_or("Choose an audio output first.")?;
@@ -410,8 +521,9 @@ impl Aural {
                     if started_input {
                         self.cancel();
                     }
-                    return Err(format!(
-                        "Could not open the output: {e}. Choose another device or refresh."
+                    return Err(Fault::new(
+                        "Could not open this output. Choose another device or refresh the list.",
+                        &e,
                     ));
                 }
             };
@@ -453,6 +565,20 @@ fn muted(ui: &mut egui::Ui, message: impl Into<String>) {
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).size(look::TEXT_SECTION).strong());
 }
+
+/// A problem beside the control it belongs to. The sentence says what to do; the device's own
+/// wording is one click away.
+fn fault_ui(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, fault: &Fault) {
+    ui.label(RichText::new(&fault.short).color(look::AMBER).strong());
+    if let Some(detail) = &fault.detail {
+        egui::CollapsingHeader::new("Technical details")
+            .id_salt(id)
+            .show(ui, |ui| muted(ui, detail.as_str()));
+    }
+}
+
+/// Plain words for the two cable ends, shown wherever the cable is explained.
+const CABLE_EXPLAINED: &str = "CABLE Input is where Toolboks sends your voice. CABLE Output is what the other app listens to, so pick it as that app's microphone.";
 
 fn picker(
     ui: &mut egui::Ui,
@@ -557,10 +683,15 @@ impl Aural {
                     ui,
                     if self.input.is_some() {
                         "Input live"
+                    } else if self.mic_fault.is_some() {
+                        "Input off, problem with the microphone"
                     } else {
                         "Input off"
                     },
                 );
+                if let Some(fault) = &self.mic_fault {
+                    fault_ui(ui, "aural-mic-fault", fault);
+                }
                 ui.add_space(look::SPACE_M);
                 if ui
                     .add_enabled_ui(interactive, |ui| self.microphone_picker(ui))
@@ -601,7 +732,7 @@ impl Aural {
                         if live {
                             self.disable_input();
                         } else if let Err(e) = self.enable_input() {
-                            self.message = Some(e);
+                            self.mic_fault = Some(e);
                         }
                     }
                 });
@@ -836,32 +967,28 @@ impl Aural {
         tutorial::region(ui, ["aural-monitor", "aural-cable"][index], |ui| {
             look::card(ui, ui.available_width(), 0.0, |ui| {
                 section(ui, ROUTE_LABELS[index]);
+                let cable_present = self.outputs.iter().any(|d| virtual_cable(&d.name));
+                let selected_is_cable = self.selected_outputs[index]
+                    .and_then(|i| self.outputs.get(i))
+                    .map(|d| virtual_cable(&d.name));
                 if index == 0 {
                     muted(ui, "Use headphones to avoid feedback.");
                 } else {
-                    let has_vb_cable = self.outputs.iter().any(|device| {
-                        let name = device.name.to_ascii_lowercase();
-                        name.contains("vb-audio") && name.contains("cable")
-                    });
-                    muted(
-                        ui,
-                        if has_vb_cable {
-                            "VB-Audio Virtual Cable is available for routing to other apps."
-                        } else {
-                            "Install VB-Audio Virtual Cable to route audio to another app."
-                        },
+                    let state = CableState::of(
+                        cable_present,
+                        selected_is_cable,
+                        self.input.is_some(),
+                        self.routes[index].is_some(),
                     );
-                    ui.add_enabled_ui(interactive, |ui| {
-                        ui.visuals_mut().hyperlink_color = look::DATA_MEMORY;
-                        ui.hyperlink_to("VB-CABLE download and installation", VB_CABLE);
-                    });
-                    muted(ui, "Select CABLE Input here, then choose CABLE Output as the microphone in the other app.");
-                    if self.selected_outputs[index].is_none() {
-                        muted(
-                            ui,
-                            "No virtual cable detected. After installing it, refresh devices.",
-                        );
+                    ui.label(RichText::new(format!("Status: {}", state.headline())).strong());
+                    muted(ui, state.hint());
+                    if state == CableState::Missing {
+                        ui.add_enabled_ui(interactive, |ui| {
+                            ui.visuals_mut().hyperlink_color = look::DATA_MEMORY;
+                            ui.hyperlink_to("VB-CABLE download and installation", VB_CABLE);
+                        });
                     }
+                    muted(ui, CABLE_EXPLAINED);
                 }
                 ui.add_space(look::SPACE_M);
                 ui.horizontal_wrapped(|ui| {
@@ -907,13 +1034,16 @@ impl Aural {
                         }
                     }
                     ui.label(
-                        RichText::new(if live { "Live" } else { "Off" }).color(if live {
-                            look::GREEN
-                        } else {
-                            look::MUTED
-                        }),
+                        RichText::new(if live { "Route live" } else { "Route off" })
+                            .color(if live { look::GREEN } else { look::MUTED }),
                     );
                 });
+                let live = self.routes[index].is_some();
+                if !live && self.input.is_none() {
+                    muted(ui, "Starting this route also turns on the microphone.");
+                } else if live {
+                    muted(ui, "Stopping this route leaves the microphone on.");
+                }
                 if index == 0 {
                     ui.add_enabled_ui(interactive, |ui| {
                         ui.add(
@@ -926,8 +1056,8 @@ impl Aural {
                     self.monitor_level
                         .store((self.volume / 100.0).to_bits(), Relaxed);
                 }
-                if let Some(error) = &self.route_errors[index] {
-                    muted(ui, error);
+                if let Some(fault) = &self.route_errors[index] {
+                    fault_ui(ui, ("aural-route-fault", index), fault);
                 }
             });
         });
@@ -936,7 +1066,7 @@ impl Aural {
     fn detail_ui(&mut self, ui: &mut egui::Ui, interactive: bool) {
         self.levels_ui(ui, interactive);
         ui.add_space(look::SPACE_M);
-        muted(ui, "Starting a route turns on the selected microphone. Disable the microphone to stop both routes.");
+        muted(ui, "Disabling the microphone stops both routes.");
         for index in 0..2 {
             ui.add_space(look::SPACE_M);
             self.route_ui(ui, index, interactive);
@@ -1079,17 +1209,17 @@ impl NativeAddon for Aural {
             .input
             .as_ref()
             .and_then(|input| input.signal.error.lock().unwrap().take());
-        if let Some(error) = error {
+        if let Some(raw) = error {
             self.cancel();
-            self.message = Some(error);
+            self.mic_fault = Some(Fault::new(MICROPHONE_LOST, &raw));
         }
         for index in 0..2 {
             let error = self.routes[index]
                 .as_ref()
                 .and_then(|route| route.error.lock().unwrap().take());
-            if error.is_some() {
+            if let Some(raw) = error {
                 self.stop_route(index);
-                self.route_errors[index] = error;
+                self.route_errors[index] = Some(Fault::new(OUTPUT_LOST, &raw));
             }
         }
     }
@@ -1477,7 +1607,7 @@ mod tests {
         assert!(addon.microphone_refresh_error.is_none());
         assert_eq!(addon.message.as_deref(), Some("Existing audio error"));
         assert_eq!(
-            addon.route_errors[0].as_deref(),
+            addon.route_errors[0].as_ref().map(|f| f.short.as_str()),
             Some("Existing route error")
         );
         assert_eq!(addon.selected_outputs, [Some(2), Some(4)]);
@@ -1556,5 +1686,77 @@ mod tests {
                 assert!(addon.routes.iter().all(Option::is_none));
             }
         }
+    }
+    #[test]
+    fn device_text_is_kept_apart_and_never_doubles_punctuation() {
+        let fault = Fault::new(MICROPHONE_LOST, "The device is no longer available.. ");
+        assert_eq!(
+            fault.short,
+            "Microphone disconnected. Reconnect it, then enable it again."
+        );
+        assert_eq!(
+            fault.detail.as_deref(),
+            Some("The device is no longer available")
+        );
+        assert!(!fault.short.contains(".."));
+        assert_eq!(Fault::new(OUTPUT_LOST, "  ").detail, None);
+    }
+
+    #[test]
+    fn cable_is_found_from_the_devices_not_from_the_choice() {
+        // Ordinary speakers chosen, no cable installed: still missing.
+        assert_eq!(
+            CableState::of(false, Some(false), true, false),
+            CableState::Missing
+        );
+        // Cable installed, nothing chosen.
+        assert_eq!(
+            CableState::of(true, None, true, false),
+            CableState::NoDestination
+        );
+        // Cable installed, ordinary speakers chosen.
+        assert_eq!(
+            CableState::of(true, Some(false), true, false),
+            CableState::NotACable
+        );
+        // Cable chosen, microphone on or off, and running.
+        assert_eq!(
+            CableState::of(true, Some(true), true, false),
+            CableState::Ready
+        );
+        assert_eq!(
+            CableState::of(true, Some(true), false, false),
+            CableState::ReadyInputOff
+        );
+        assert_eq!(
+            CableState::of(true, Some(true), true, true),
+            CableState::Running
+        );
+        // Nothing chosen and no cable.
+        assert_eq!(
+            CableState::of(false, None, false, false),
+            CableState::Missing
+        );
+    }
+
+    #[test]
+    fn every_state_has_its_own_words() {
+        let all = [
+            CableState::Missing,
+            CableState::NoDestination,
+            CableState::NotACable,
+            CableState::Ready,
+            CableState::ReadyInputOff,
+            CableState::Running,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.headline(), b.headline());
+            }
+            assert!(!a.hint().is_empty());
+        }
+        assert!(CableState::ReadyInputOff
+            .headline()
+            .contains("microphone is off"));
     }
 }

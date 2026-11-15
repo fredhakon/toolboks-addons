@@ -144,9 +144,7 @@ pub fn open(
                 &config,
                 move |data: &mut [$t], _| render(data, channels, &bridge, &level),
                 move |e| {
-                    *error.lock().unwrap() = Some(format!(
-                        "Output disconnected: {e}. Enable this route again."
-                    ));
+                    *error.lock().unwrap() = Some(e.to_string());
                 },
                 None,
             )

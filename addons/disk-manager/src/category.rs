@@ -165,6 +165,7 @@ mod tests {
             bytes,
             files: 0,
             modified: 0,
+            dir_stamp: 0,
         };
         let nodes = [
             n(0, None, "root", true, 10),

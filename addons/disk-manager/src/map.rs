@@ -410,6 +410,7 @@ mod tests {
             bytes,
             files: 1,
             modified: 0,
+            dir_stamp: 0,
         }
     }
     #[test]

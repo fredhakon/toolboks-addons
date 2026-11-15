@@ -4,6 +4,7 @@ mod explorer;
 mod folder_picker;
 mod map;
 mod optimization;
+mod saved_scan;
 mod scanner;
 mod theme;
 mod tutorial;
@@ -50,6 +51,7 @@ struct Settings {
     min_bytes: u64,
     older_days: u64,
     sort: String,
+    remember: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -63,6 +65,7 @@ impl Default for Settings {
             min_bytes: 0,
             older_days: 0,
             sort: "size".into(),
+            remember: true,
         }
     }
 }
@@ -71,6 +74,12 @@ struct Drive {
     path: String,
     total: u64,
     free: u64,
+}
+#[derive(Clone, Copy)]
+enum DeleteScope {
+    All,
+    Drive,
+    Disable,
 }
 pub struct DiskManager {
     settings: Settings,
@@ -95,6 +104,12 @@ pub struct DiskManager {
     picker: Option<mpsc::Receiver<Result<Option<String>, String>>>,
     tutorial_snapshot: Option<(usize, bool, usize, usize)>,
     optimization: optimization::Panel,
+    cache: Option<saved_scan::Worker>,
+    cache_started: bool,
+    reload_cache: bool,
+    saved_generation: u64,
+    restore: Option<(String, Option<String>)>,
+    delete_confirm: Option<DeleteScope>,
 }
 impl Default for DiskManager {
     fn default() -> Self {
@@ -121,6 +136,12 @@ impl Default for DiskManager {
             picker: None,
             tutorial_snapshot: None,
             optimization: Default::default(),
+            cache: None,
+            cache_started: false,
+            reload_cache: false,
+            saved_generation: 0,
+            restore: None,
+            delete_confirm: None,
         }
     }
 }
@@ -152,6 +173,26 @@ fn display_path(path: &str) -> String {
         format!(r"\\{p}")
     } else {
         path.strip_prefix(r"\\?\").unwrap_or(path).into()
+    }
+}
+fn path_key(path: &str) -> String {
+    display_path(path.trim())
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+fn age(time: u64) -> String {
+    let seconds = scanner::now().saturating_sub(time);
+    if time == 0 {
+        "not recorded".into()
+    } else if seconds < 60 {
+        "just now".into()
+    } else if seconds < 3600 {
+        format!("{} min ago", seconds / 60)
+    } else if seconds < 86400 {
+        format!("{} h ago", seconds / 3600)
+    } else {
+        format!("{} days ago", seconds / 86400)
     }
 }
 fn elapsed(s: f64) -> String {
@@ -197,8 +238,27 @@ impl DiskManager {
             }
         }
     }
-    fn start(&mut self) {
-        if self.shared.lock().unwrap().progress.running {
+    fn exclusions(&self) -> Vec<String> {
+        scanner::exclusions(
+            &self
+                .settings
+                .exclude
+                .split(';')
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+        )
+    }
+    fn quick_available(&self, p: &Progress, nodes: &[Node]) -> bool {
+        !nodes.is_empty()
+            && !p.cancelled
+            && p.full_scanned_at > 0
+            && path_key(&p.root) == path_key(&self.settings.path)
+            && p.exclusions == self.exclusions()
+    }
+    fn start(&mut self, quick: bool) {
+        if self.shared.lock().unwrap().progress.running
+            || self.cache.as_ref().is_some_and(|w| w.loading)
+        {
             return;
         }
         let root = match std::fs::canonicalize(self.settings.path.trim()) {
@@ -210,6 +270,25 @@ impl DiskManager {
                 return;
             }
         };
+        let (previous, old) = self.progress();
+        let quick = quick
+            && self.quick_available(&previous, &old)
+            && saved_scan::volume_id(&root).as_deref() == Some(previous.volume.as_str());
+        if path_key(&previous.root) == path_key(&root.to_string_lossy()) && !old.is_empty() {
+            self.restore = Some((
+                old.get(self.parent)
+                    .map_or_else(|| previous.root.clone(), |n| n.path.clone()),
+                self.map_state
+                    .selected
+                    .and_then(|i| old.get(i))
+                    .map(|n| n.path.clone()),
+            ));
+        } else {
+            self.parent = 0;
+            self.offset = 0;
+            self.search.clear();
+            self.restore = None;
+        }
         let mut state = self.shared.lock().unwrap();
         let generation = state.progress.generation + 1;
         state.progress = Progress {
@@ -220,29 +299,172 @@ impl DiskManager {
         };
         state.nodes = Arc::new(vec![]);
         drop(state);
-        self.parent = 0;
-        self.offset = 0;
-        self.search.clear();
+        self.last_generation = generation;
+        self.map_cache = None;
+        self.listing_cache = None;
         self.cancel.store(false, Ordering::Relaxed);
         let shared = self.shared.clone();
         let cancel = self.cancel.clone();
-        let excludes = self
-            .settings
-            .exclude
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
+        let excludes = self.exclusions();
         match std::thread::Builder::new()
             .name("disk-scan".into())
-            .spawn(move || scanner::scan(root, excludes, shared, cancel))
-        {
+            .spawn(move || {
+                if quick {
+                    scanner::rescan(old, previous, shared, cancel);
+                } else {
+                    drop(old);
+                    scanner::scan(root, excludes, shared, cancel);
+                }
+            }) {
             Ok(_) => self.message = None,
             Err(error) => {
                 self.shared.lock().unwrap().progress.running = false;
                 self.message = Some(format!("Could not start the disk scan: {error}"));
             }
+        }
+    }
+    fn cache_tick(&mut self, active: bool) {
+        if self.tutorial_snapshot.is_some() {
+            return;
+        }
+        if !self.cache_started {
+            if !active {
+                return;
+            }
+            self.cache_started = true;
+            let mut worker = saved_scan::Worker::new();
+            if self.settings.remember {
+                worker.send(saved_scan::Command::Load(self.exclusions()));
+            } else {
+                worker.send(saved_scan::Command::Delete(None));
+            }
+            self.cache = Some(worker);
+        }
+        if active && self.reload_cache && !self.cache.as_ref().unwrap().loading {
+            self.reload_cache = false;
+            if self.settings.remember {
+                let exclusions = self.exclusions();
+                self.cache
+                    .as_mut()
+                    .unwrap()
+                    .send(saved_scan::Command::Load(exclusions));
+            }
+        }
+        let events: Vec<_> = self.cache.as_ref().unwrap().receiver.try_iter().collect();
+        for event in events {
+            let worker = self.cache.as_mut().unwrap();
+            worker.pending = worker.pending.saturating_sub(1);
+            match event {
+                saved_scan::Event::Loaded(result)=>{
+                    worker.loading=false;
+                    match *result {
+                        Ok(Some((p,nodes))) if active && self.settings.remember && p.exclusions==self.exclusions() && self.progress().0.generation==0 => {
+                            self.settings.path=display_path(&p.root);
+                            self.saved_generation=p.generation;
+                            let mut state=self.shared.lock().unwrap();state.progress=p;state.nodes=nodes;
+                        }
+                        Err(e)=>self.message=Some(e),
+                        _=>{}
+                    }
+                }
+                saved_scan::Event::Saved(result)=>match result {
+                    Ok(bytes) if bytes>256*1024*1024=>self.message=Some(format!("The saved scan uses {} on this PC. Use exclusions or a smaller root to reduce it. The limit is 384 MiB per root.",size(bytes))),
+                    Err(e)=>self.message=Some(e),
+                    _=>{}
+                },
+                saved_scan::Event::Deleted(result)=>self.message=Some(result.map(|_|"Saved scans deleted from this PC.".into()).unwrap_or_else(|e|format!("Could not delete saved scans: {e}. Try again."))),
+            }
+        }
+        let (p, nodes) = self.progress();
+        if !p.running && !nodes.is_empty() {
+            if let Some((parent, selected)) = self.restore.take() {
+                self.parent = nodes
+                    .iter()
+                    .find(|n| path_key(&n.path) == path_key(&parent))
+                    .map_or(0, |n| n.id);
+                self.map_state = Default::default();
+                self.map_state.selected = selected.and_then(|path| {
+                    nodes
+                        .iter()
+                        .find(|n| path_key(&n.path) == path_key(&path))
+                        .map(|n| n.id)
+                });
+            }
+            if self.settings.remember && !p.cancelled && p.generation != self.saved_generation {
+                self.saved_generation = p.generation;
+                self.cache
+                    .as_mut()
+                    .unwrap()
+                    .send(saved_scan::Command::Save(Box::new(p), nodes));
+            }
+        }
+    }
+    fn privacy(&mut self, ui: &mut egui::Ui, p: &Progress) {
+        ui.add_space(theme::SPACE_M);
+        ui.horizontal_wrapped(|ui| {
+            let toggle = toolboks_shared::ui::toggle_switch(ui, &mut self.settings.remember);
+            ui.label("Remember my last scan");
+            if toggle.changed() {
+                if !self.settings.remember {
+                    self.settings.remember = true;
+                    self.delete_confirm = Some(DeleteScope::Disable);
+                } else {
+                    self.saved_generation = 0;
+                }
+            }
+            if ui.add(theme::outlined("Delete saved scans")).clicked() {
+                self.delete_confirm = Some(DeleteScope::All);
+            }
+            if ui
+                .add_enabled(
+                    !p.volume.is_empty(),
+                    theme::outlined("Delete this drive's scans"),
+                )
+                .clicked()
+            {
+                self.delete_confirm = Some(DeleteScope::Drive);
+            }
+        });
+        theme::caption(ui,"Saved file names stay on this PC only and are never sent anywhere. One scan per root, up to 384 MiB. Turning remembering off deletes saved scans.");
+        if self.cache.as_ref().is_some_and(|w| w.loading) {
+            weak(ui, "Loading your last scan...");
+        } else if self.cache.as_ref().is_some_and(|w| w.pending > 0) {
+            theme::caption(ui, "Updating saved scans...");
+        }
+        if let Some(scope) = self.delete_confirm {
+            ui.horizontal_wrapped(|ui| {
+                weak(
+                    ui,
+                    match scope {
+                        DeleteScope::Drive => {
+                            "Delete saved scans for this drive? Your files stay unchanged."
+                        }
+                        _ => "Delete all saved scans? Your files stay unchanged.",
+                    },
+                );
+                if ui.button("Delete scans").clicked() {
+                    self.delete_saved(scope, p);
+                    self.delete_confirm = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.delete_confirm = None;
+                }
+            });
+        }
+    }
+    fn delete_saved(&mut self, scope: DeleteScope, p: &Progress) {
+        if matches!(scope, DeleteScope::Disable) {
+            self.settings.remember = false;
+        }
+        self.saved_generation = p.generation;
+        if let Some(worker) = &mut self.cache {
+            worker.send(saved_scan::Command::Delete(
+                if matches!(scope, DeleteScope::Drive) {
+                    Some(p.volume.clone())
+                } else {
+                    None
+                },
+            ));
         }
     }
     fn progress(&self) -> (Progress, Arc<Vec<Node>>) {
@@ -319,7 +541,7 @@ impl DiskManager {
             ui.horizontal_wrapped(|ui| {
                 theme::stat(ui, size(p.bytes), "analyzed, logical file sizes");
                 theme::stat(ui, p.files.to_string(), "files found");
-                theme::stat(ui, p.folders.to_string(), "folders read");
+                theme::stat(ui, p.folders.to_string(), if p.changes.is_some() { "folders checked" } else { "folders read" });
                 theme::stat(ui, elapsed(p.elapsed), "scan time");
                 weak(
                     ui,
@@ -332,6 +554,13 @@ impl DiskManager {
                     },
                 );
             });
+            if p.scanned_at>0 {
+                weak(ui,format!("Scanned {}. Last full scan {}.",age(p.scanned_at),age(p.full_scanned_at)));
+            }
+            if let Some(c)=&p.changes {
+                weak(ui,format!("Found {} new, {} removed, {} changed in {}. Read {} folders; reused {} folder lists.",c.new,c.removed,c.changed,elapsed(p.elapsed),c.folders_read,c.folders_reused));
+                weak(ui,"Sizes of unchanged folders were not rechecked. Files edited in place can change size without changing their folder time. Use Full rescan to refresh every size.");
+            }
         });
     }
     fn list(&mut self, ui: &mut egui::Ui, nodes: &[Node], p: &Progress, compact: bool) {
@@ -654,6 +883,9 @@ impl NativeAddon for DiskManager {
         self.optimization.save_preferences(prefs) || changed
     }
     fn suspend(&mut self) {
+        if self.cache_started {
+            self.cache_tick(false);
+        }
         // Keep export/analysis workers, but cancel the scan and drop its large results.
         // The old worker owns the old state until it observes cancellation.
         self.cancel.store(true, Ordering::Relaxed);
@@ -662,14 +894,23 @@ impl NativeAddon for DiskManager {
         self.listing_cache = None;
         self.map_cache = None;
         self.last_generation = 0;
+        self.saved_generation = 0;
+        self.reload_cache = true;
+        self.restore = None;
         self.parent = 0;
         self.offset = 0;
     }
     fn has_background_work(&self) -> bool {
-        self.export_job.is_some() || self.picker.is_some() || self.optimization.busy()
+        self.export_job.is_some()
+            || self.picker.is_some()
+            || self.optimization.busy()
+            || self.cache.as_ref().is_some_and(|w| w.pending > 0)
     }
     fn tick_background(&mut self) {
         self.poll_workers();
+        if self.cache_started {
+            self.cache_tick(false);
+        }
     }
     fn set_capabilities(&mut self, capabilities: &[toolboks_addon_sdk::Capability]) {
         self.optimization.capabilities(capabilities);
@@ -744,6 +985,8 @@ impl NativeAddon for DiskManager {
             self.loaded = true;
         }
         self.poll_workers();
+        self.cache_tick(true);
+        self.tick(ui.ctx());
         let (p, nodes) = self.progress();
         if p.generation != self.last_generation {
             self.last_generation = p.generation;
@@ -895,26 +1138,38 @@ impl NativeAddon for DiskManager {
                         self.cancel.store(true, Ordering::Relaxed);
                     }
                 } else {
+                    let quick = self.quick_available(&p, &nodes);
+                    let label = if quick {
+                        "Rescan (quick)"
+                    } else if nodes.is_empty() {
+                        "Scan"
+                    } else {
+                        "Full rescan"
+                    };
                     let analyze = ui
-                        .add_enabled_ui(self.picker.is_none() && self.export_kind.is_none(), |ui| {
-                            if self.export_kind.is_some() {
-                                ui.add(theme::outlined("Analyze space"))
-                            } else {
-                                button(ui, "Analyze space")
-                            }
-                        })
+                        .add_enabled_ui(
+                            self.picker.is_none()
+                                && self.export_kind.is_none()
+                                && !self.cache.as_ref().is_some_and(|w| w.loading),
+                            |ui| button(ui, label),
+                        )
                         .inner;
                     guide::mark(ui, "disk-analyze", analyze.rect);
-                    if analyze.clicked()
-                        || (enter && self.picker.is_none() && self.export_kind.is_none())
-                    {
-                        self.start();
+                    if analyze.clicked() || (enter && analyze.enabled()) {
+                        self.start(quick);
+                    }
+                    if quick && ui.add(theme::outlined("Full rescan")).clicked() {
+                        self.start(false);
                     }
                 }
                 if ui.add(theme::outlined("Options")).clicked() {
                     self.options = !self.options;
                 }
             });
+            self.privacy(ui, &p);
+            if !nodes.is_empty() && p.exclusions != self.exclusions() {
+                weak(ui, "Exclusions changed. A full rescan is required.");
+            }
             if self.options {
                 ui.add_space(theme::SPACE_M);
                 let options = card().show(ui, |ui| {
@@ -947,7 +1202,7 @@ impl NativeAddon for DiskManager {
                         weak(
                             ui,
                             if self.page == 0 {
-                                "Choose a drive or folder, then select Analyze space."
+                                "Choose a drive or folder, then select Scan."
                             } else {
                                 "Start a scan from Overview to see results here."
                             },
@@ -1053,6 +1308,7 @@ impl NativeAddon for DiskManager {
                     "Logical sizes. Links and junctions are left out. Read-only analysis.",
                 );
             });
+        self.tick(ui.ctx());
         let value = serde_json::to_value(&self.settings).unwrap();
         if prefs.get("settings") != Some(&value) {
             prefs.insert("settings".into(), value);
@@ -1066,6 +1322,7 @@ impl NativeAddon for DiskManager {
             || self.export_job.is_some()
             || self.picker.is_some()
             || self.optimization.busy()
+            || self.cache.as_ref().is_some_and(|w| w.pending > 0)
         {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
@@ -1147,7 +1404,7 @@ mod tests {
         let prefs = BTreeMap::from([(
             "settings".into(),
             serde_json::json!({
-                "path":"C:\\saved", "exclude":"target", "min_bytes":1234, "older_days":9, "sort":"name"
+                "path":"C:\\saved", "exclude":"target", "min_bytes":1234, "older_days":9, "sort":"name", "remember":true
             }),
         )]);
         addon.load_preferences(&prefs);
@@ -1168,6 +1425,275 @@ mod tests {
         let mut saved = BTreeMap::new();
         assert!(addon.save_preferences(&mut saved));
         assert_eq!(saved["settings"], prefs["settings"]);
+    }
+    #[test]
+    fn pending_cache_work_requests_a_frame_from_inside_ui() {
+        let root = scanner::tests::temp("cache-repaint");
+        let mut worker = saved_scan::Worker::at(root.clone());
+        worker.pending = 1;
+        worker.loading = true;
+        let mut addon = DiskManager::default();
+        addon.loaded = true;
+        addon.cache_started = true;
+        addon.cache = Some(worker);
+        let ctx = egui::Context::default();
+        let mut prefs = BTreeMap::new();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            addon.ui(ui, &mut prefs);
+        });
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                <= Duration::from_millis(200)
+        );
+        output.textures_delta.clear();
+    }
+    #[test]
+    fn scan_button_starts_from_pointer_input() {
+        let root = scanner::tests::temp("scan-button");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), b"data").unwrap();
+        let mut addon = DiskManager::default();
+        addon.loaded = true;
+        addon.cache_started = true;
+        addon.cache = Some(saved_scan::Worker::at(root.join("cache")));
+        addon.settings.path = root.to_string_lossy().into_owned();
+        addon.settings.remember = false;
+        let ctx = egui::Context::default();
+        let mut prefs = BTreeMap::new();
+        let frame = |addon: &mut DiskManager,
+                     prefs: &mut BTreeMap<String, serde_json::Value>,
+                     events: Vec<egui::Event>| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    guide::prepare(ui.ctx(), Some("disk-analyze"), false);
+                    addon.ui(ui, prefs);
+                },
+            );
+            out.textures_delta.clear();
+        };
+        for _ in 0..3 {
+            frame(&mut addon, &mut prefs, vec![]);
+        }
+        let pos = guide::anchor(&ctx).unwrap().center();
+        for pressed in [true, false] {
+            frame(
+                &mut addon,
+                &mut prefs,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(
+            addon.progress().0.generation > 0,
+            "button did not start; message={:?}",
+            addon.message
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while addon.progress().0.running {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(addon.progress().0.files, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn remembering_off_deletes_on_disk_and_exclusions_disable_quick_rescan() {
+        let root = scanner::tests::temp("privacy");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file"), b"data").unwrap();
+        let shared = Arc::new(Mutex::new(State::default()));
+        scanner::scan(
+            root.clone(),
+            vec![],
+            shared.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (p, nodes) = {
+            let state = shared.lock().unwrap();
+            (state.progress.clone(), state.nodes.clone())
+        };
+        let dir = root.join("cache");
+        saved_scan::save(&dir, &p, &nodes).unwrap();
+        let mut addon = DiskManager::default();
+        addon.cache = Some(saved_scan::Worker::at(dir.clone()));
+        addon.cache_started = true;
+        addon.shared = shared;
+        addon.settings.path = root.to_string_lossy().into_owned();
+        assert!(addon.quick_available(&p, &nodes));
+        addon.settings.exclude = "skip".into();
+        assert!(!addon.quick_available(&p, &nodes));
+        addon.delete_saved(DeleteScope::Disable, &p);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while addon.cache.as_ref().unwrap().pending > 0 {
+            assert!(std::time::Instant::now() < deadline);
+            addon.cache_tick(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!addon.settings.remember);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn rescan_restores_parent_selection_and_pagination_by_path() {
+        let root = scanner::tests::temp("selection");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/selected"), b"data").unwrap();
+        let shared = Arc::new(Mutex::new(State::default()));
+        scanner::scan(
+            root.clone(),
+            vec![],
+            shared.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (p, nodes) = {
+            let state = shared.lock().unwrap();
+            (state.progress.clone(), state.nodes.clone())
+        };
+        let parent = nodes
+            .iter()
+            .find(|n| n.name == "nested")
+            .unwrap()
+            .path
+            .clone();
+        let selected = nodes
+            .iter()
+            .find(|n| n.name == "selected")
+            .unwrap()
+            .path
+            .clone();
+        std::fs::write(root.join("nested/new"), b"new").unwrap();
+        scanner::rescan(nodes, p, shared.clone(), Arc::new(AtomicBool::new(false)));
+        let mut addon = DiskManager::default();
+        addon.shared = shared;
+        addon.cache = Some(saved_scan::Worker::at(root.join("cache")));
+        addon.cache_started = true;
+        addon.restore = Some((parent.clone(), Some(selected.clone())));
+        addon.offset = 100;
+        addon.settings.remember = false;
+        addon.cache_tick(false);
+        let (_, nodes) = addon.progress();
+        assert_eq!(nodes[addon.parent].path, parent);
+        assert_eq!(nodes[addon.map_state.selected.unwrap()].path, selected);
+        assert_eq!(addon.offset, 100);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[ignore = "700,000-node streaming/load responsiveness measurement"]
+    fn large_saved_scan_loads_while_frames_continue() {
+        use std::time::Instant;
+        let root = scanner::tests::temp("large-snapshot");
+        std::fs::create_dir_all(&root).unwrap();
+        let canonical = std::fs::canonicalize(&root).unwrap();
+        let root_path = canonical.to_string_lossy().into_owned();
+        let mut nodes = Vec::with_capacity(700101);
+        nodes.push(Node {
+            id: 0,
+            parent: None,
+            name: "Synthetic 700k fixture".into(),
+            path: root_path.clone(),
+            dir: true,
+            bytes: 700000,
+            files: 700000,
+            modified: 0,
+            dir_stamp: 1,
+        });
+        for folder in 0..100 {
+            let name = format!("folder-{folder}");
+            nodes.push(Node {
+                id: nodes.len(),
+                parent: Some(0),
+                path: canonical.join(&name).to_string_lossy().into_owned(),
+                name,
+                dir: true,
+                bytes: 7000,
+                files: 7000,
+                modified: 0,
+                dir_stamp: 1,
+            });
+        }
+        for file in 0..700000 {
+            let parent = 1 + file / 7000;
+            let name = format!("file-{file}.bin");
+            nodes.push(Node {
+                id: nodes.len(),
+                parent: Some(parent),
+                path: PathBuf::from(&nodes[parent].path)
+                    .join(&name)
+                    .to_string_lossy()
+                    .into_owned(),
+                name,
+                dir: false,
+                bytes: 1,
+                files: 1,
+                modified: 0,
+                dir_stamp: 0,
+            });
+        }
+        let p = Progress {
+            root: root_path,
+            volume: saved_scan::volume_id(&canonical).unwrap(),
+            generation: 1,
+            scanned_at: scanner::now(),
+            full_scanned_at: scanner::now(),
+            files: 700000,
+            folders: 101,
+            bytes: 700000,
+            ..Default::default()
+        };
+        let dir = root.join("cache");
+        let bytes = saved_scan::save(&dir, &p, &nodes).unwrap();
+        drop(nodes);
+        let mut worker = saved_scan::Worker::at(dir);
+        worker.send(saved_scan::Command::Load(vec![]));
+        let mut addon = DiskManager::default();
+        addon.cache = Some(worker);
+        addon.cache_started = true;
+        addon.loaded = true;
+        let ctx = egui::Context::default();
+        let mut prefs = BTreeMap::new();
+        let started = Instant::now();
+        let mut frames = 0;
+        let mut max_frame = Duration::ZERO;
+        while addon.progress().0.generation == 0 {
+            assert!(started.elapsed() < Duration::from_secs(45));
+            let begin = Instant::now();
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    addon.ui(ui, &mut prefs);
+                },
+            );
+            out.textures_delta.clear();
+            max_frame = max_frame.max(begin.elapsed());
+            frames += 1;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(frames > 2, "loading should yield frames");
+        assert_eq!(addon.progress().1.len(), 700101);
+        println!("LARGE_SNAPSHOT nodes=700101 files=700000 bytes={} load={:.3}s frames={} longest_frame={:.3}s",bytes,started.elapsed().as_secs_f64(),frames,max_frame.as_secs_f64());
+        drop(addon);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn csv_protects_formulas_and_quotes() {

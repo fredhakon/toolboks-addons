@@ -118,13 +118,14 @@ fn should_create(switch: bool, elevated: bool, already_created: bool) -> bool {
     switch && elevated && !already_created
 }
 
-/// Short description handed to System Restore.
-fn restore_description(text: &str) -> String {
-    format!("toolboks: {text}")
-}
-
 impl Debloater {
     /// The "Create a restore point first" switch with its notes.
+    /// Machine-wide changes (tasks, services) go through the administrator helper, which asks for
+    /// rights itself; the add-on does not need to be elevated to offer them.
+    fn machine_ok(&self) -> bool {
+        true
+    }
+
     /// `helper` is true where the administrator helper can make the restore point for the page.
     fn restore_switch(&mut self, ui: &mut egui::Ui, busy: bool, helper: bool) {
         let usable = self.env.elevated || helper;
@@ -163,6 +164,16 @@ impl Debloater {
             return;
         }
         self.admin_pending = None;
+        if matches!(
+            kind,
+            AdminKind::ServiceSet
+                | AdminKind::ServiceUndo
+                | AdminKind::TaskSet
+                | AdminKind::TaskUndo
+        ) {
+            self.finish_job(kind, outcome);
+            return;
+        }
         match outcome {
             AdminOutcome::Cancelled => {
                 self.message = Some("Cancelled. Nothing was changed.".to_string());
@@ -174,8 +185,86 @@ impl Debloater {
                 match kind {
                     AdminKind::RegistryApply => self.registry_applied(&value),
                     AdminKind::RegistryUndo => self.registry_undone(&value),
+                    // Handled above, before this match.
+                    _ => {}
                 }
             }
+        }
+        self.refresh();
+    }
+
+    /// Turns the helper's answer for a service or task request into the same job the page used to
+    /// get from its worker thread, so the existing message and undo handling runs unchanged.
+    fn finish_job(&mut self, kind: AdminKind, outcome: AdminOutcome) {
+        let completed = match &outcome {
+            AdminOutcome::Completed { json } => {
+                serde_json::from_str::<serde_json::Value>(json).ok()
+            }
+            _ => None,
+        };
+        let stopped = match outcome {
+            AdminOutcome::Cancelled => "Cancelled. Nothing was changed.".to_string(),
+            AdminOutcome::Failed { reason } => reason,
+            AdminOutcome::Completed { .. } => {
+                "The administrator helper returned an unreadable answer.".to_string()
+            }
+        };
+        match kind {
+            AdminKind::ServiceSet => {
+                let title = std::mem::take(&mut self.pending_title);
+                let (result, point) = match &completed {
+                    Some(value) => admin::change_from_json(value, admin::service_step_from),
+                    None => (Err(stopped.into()), None),
+                };
+                if let Some(tx) = self.service_tx.take() {
+                    let _ = tx.send(ServiceJob::Set(title, result, point));
+                }
+            }
+            AdminKind::TaskSet => {
+                let title = std::mem::take(&mut self.pending_title);
+                let (result, point) = match &completed {
+                    Some(value) => admin::change_from_json(value, admin::task_step_from),
+                    None => (Err(stopped.into()), None),
+                };
+                if let Some(tx) = self.task_tx.take() {
+                    let _ = tx.send(TaskJob::Set(title, result, point));
+                }
+            }
+            AdminKind::ServiceUndo => {
+                let batch = std::mem::take(&mut self.service_batch);
+                let mut remaining = std::mem::take(&mut self.service_rest);
+                let (done, kept) = match &completed {
+                    Some(value) => admin::undo_batch_from_json(value, admin::service_step_from),
+                    None => (0, batch),
+                };
+                let failed = kept.len();
+                remaining.extend(kept.into_iter().rev());
+                if let Some(tx) = self.service_tx.take() {
+                    let _ = tx.send(ServiceJob::Undo {
+                        remaining,
+                        done,
+                        failed,
+                    });
+                }
+            }
+            AdminKind::TaskUndo => {
+                let batch = std::mem::take(&mut self.task_batch);
+                let mut remaining = std::mem::take(&mut self.task_rest);
+                let (done, kept) = match &completed {
+                    Some(value) => admin::undo_batch_from_json(value, admin::task_step_from),
+                    None => (0, batch),
+                };
+                let failed = kept.len();
+                remaining.extend(kept.into_iter().rev());
+                if let Some(tx) = self.task_tx.take() {
+                    let _ = tx.send(TaskJob::Undo {
+                        remaining,
+                        done,
+                        failed,
+                    });
+                }
+            }
+            AdminKind::RegistryApply | AdminKind::RegistryUndo => {}
         }
         self.refresh();
     }
@@ -1418,59 +1507,50 @@ impl Debloater {
         });
     }
 
-    fn tasks_set(&mut self, ctx: &egui::Context, def: TaskDef, enable: bool) {
+    fn tasks_set(&mut self, _ctx: &egui::Context, def: TaskDef, enable: bool) {
         self.tasks.pending = None;
-        if self.tasks.working.is_some() {
+        if self.tasks.working.is_some() || self.admin_pending.is_some() {
             return;
         }
-        let make_point = should_create(self.restore.on, self.env.elevated, self.restore.tasks_done);
+        let make_point = should_create(self.restore.on, true, self.restore.tasks_done);
         self.restore.status = None;
-        let elevated = self.env.elevated;
         let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let point = make_point.then(|| {
-                restore::create(
-                    &mut restore::WinRestore,
-                    &restore_description(&format!("switch task {}", def.title)),
-                    elevated,
-                )
-            });
-            let result = match &point {
-                Some(status) if restore::is_blocking(status) => {
-                    Err(restore::status_text(status).into())
-                }
-                _ => tasks::set_enabled(&mut tasks::WinTasks, &def, enable),
-            };
-            let _ = tx.send(TaskJob::Set(def.title.to_string(), result, point));
-            ctx.request_repaint();
-        });
         self.tasks.working = Some(rx);
+        self.task_tx = Some(tx);
+        self.pending_title = def.title.to_string();
+        self.send_admin(
+            AdminKind::TaskSet,
+            admin::task_set_request(def.id, enable, make_point),
+        );
     }
 
-    fn tasks_undo(&mut self, ctx: &egui::Context, all: bool) {
+    fn tasks_undo(&mut self, _ctx: &egui::Context, all: bool) {
         self.tasks.pending = None;
-        if self.tasks.working.is_some() {
+        if self.tasks.working.is_some() || self.admin_pending.is_some() {
             return;
         }
         let mut steps = std::mem::take(&mut self.tasks.steps);
+        let mut batch = Vec::new();
+        run_undo(
+            &mut steps,
+            all,
+            |step| step.path,
+            |s: &tasks::UndoStep| {
+                batch.push(s.clone());
+                Ok(())
+            },
+        );
+        if batch.is_empty() {
+            self.tasks.steps = steps;
+            return;
+        }
+        let request = admin::task_undo_request(&batch);
+        self.task_batch = batch;
+        self.task_rest = steps;
         let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let (done, failed) = run_undo(
-                &mut steps,
-                all,
-                |step| step.path,
-                |s| tasks::undo(&mut tasks::WinTasks, s),
-            );
-            let _ = tx.send(TaskJob::Undo {
-                remaining: steps,
-                done,
-                failed,
-            });
-            ctx.request_repaint();
-        });
         self.tasks.working = Some(rx);
+        self.task_tx = Some(tx);
+        self.send_admin(AdminKind::TaskUndo, request);
     }
 
     fn tasks_busy(&self) -> bool {
@@ -1552,12 +1632,9 @@ impl Debloater {
     ) -> Option<(TaskDef, bool)> {
         let focused = self.tasks.focus == Some(def.id);
         let switchable = task_switchable(state);
-        let usable = switchable && self.env.elevated && !self.tasks_busy();
+        let usable = switchable && !self.tasks_busy();
 
-        let needs_admin = switchable && !self.env.elevated;
-        let state_chip = if needs_admin {
-            Chip::new("Needs admin", AMBER)
-        } else {
+        let state_chip = {
             let color = if *state == TaskState::Disabled {
                 GREEN
             } else {
@@ -1626,16 +1703,17 @@ impl Debloater {
             }
         }
 
-        if !self.env.elevated {
-            style::divider(ui);
-            ui.label("Changing a task needs administrator rights.");
-            style::note(ui, ADMIN_UNAVAILABLE);
-        }
+        style::divider(ui);
+        ui.label("Changing a task needs administrator rights.");
+        style::note(
+            ui,
+            "A separate administrator window shows exactly what will change. Confirm or cancel there.",
+        );
 
         style::divider(ui);
         let busy = self.tasks_busy();
-        self.restore_switch(ui, busy, false);
-        if self.restore.on && self.env.elevated && self.restore.tasks_done {
+        self.restore_switch(ui, busy, true);
+        if self.restore.on && self.machine_ok() && self.restore.tasks_done {
             style::note(ui, "A restore point was already made this session.");
         }
 
@@ -1827,63 +1905,55 @@ impl Debloater {
         });
     }
 
-    fn services_set_off(&mut self, ctx: &egui::Context, def: ServiceDef) {
+    fn services_set_off(&mut self, _ctx: &egui::Context, def: ServiceDef) {
         self.services.pending = None;
-        if self.services.working.is_some() {
+        if self.services.working.is_some() || self.admin_pending.is_some() {
             return;
         }
-        let make_point = should_create(
-            self.restore.on,
-            self.env.elevated,
-            self.restore.services_done,
-        );
+        let make_point = should_create(self.restore.on, true, self.restore.services_done);
         self.restore.status = None;
-        let elevated = self.env.elevated;
         let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let point = make_point.then(|| {
-                restore::create(
-                    &mut restore::WinRestore,
-                    &restore_description(&format!("switch off service {}", def.title)),
-                    elevated,
-                )
-            });
-            let result = match &point {
-                Some(status) if restore::is_blocking(status) => {
-                    Err(restore::status_text(status).into())
-                }
-                _ => services::set_off(&mut services::WinServices, &def),
-            };
-            let _ = tx.send(ServiceJob::Set(def.title.to_string(), result, point));
-            ctx.request_repaint();
-        });
         self.services.working = Some(rx);
+        self.service_tx = Some(tx);
+        self.pending_title = def.title.to_string();
+        self.send_admin(
+            AdminKind::ServiceSet,
+            admin::service_set_request(def.id, make_point),
+        );
     }
 
-    /// Undo everything (`all`), the newest step, or the newest step of one service (`only`).
-    fn services_undo(&mut self, ctx: &egui::Context, all: bool, only: Option<&'static str>) {
+    /// Undo everything (`all`), the newest step, or the newest step of one service (`only`). The
+    /// steps are chosen here and undone by the helper, which asks for confirmation first.
+    fn services_undo(&mut self, _ctx: &egui::Context, all: bool, only: Option<&'static str>) {
         self.services.pending = None;
-        if self.services.working.is_some() {
+        if self.services.working.is_some() || self.admin_pending.is_some() {
             return;
         }
         let mut steps = std::mem::take(&mut self.services.steps);
+        let mut batch = Vec::new();
+        let mut pick = |s: &services::UndoStep| {
+            batch.push(s.clone());
+            Ok(())
+        };
+        match only {
+            Some(id) => {
+                undo_for_id(&mut steps, id, &mut pick);
+            }
+            None => {
+                run_undo(&mut steps, all, |step| step.name, &mut pick);
+            }
+        }
+        if batch.is_empty() {
+            self.services.steps = steps;
+            return;
+        }
+        let request = admin::service_undo_request(&batch);
+        self.service_batch = batch;
+        self.service_rest = steps;
         let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let undo_one = |s: &services::UndoStep| services::undo(&mut services::WinServices, s);
-            let (done, failed) = match only {
-                Some(id) => undo_for_id(&mut steps, id, undo_one),
-                None => run_undo(&mut steps, all, |step| step.name, undo_one),
-            };
-            let _ = tx.send(ServiceJob::Undo {
-                remaining: steps,
-                done,
-                failed,
-            });
-            ctx.request_repaint();
-        });
         self.services.working = Some(rx);
+        self.service_tx = Some(tx);
+        self.send_admin(AdminKind::ServiceUndo, request);
     }
 
     fn services_busy(&self) -> bool {
@@ -1969,7 +2039,7 @@ impl Debloater {
         let on = service_on(def, state);
         let has_step = self.services.steps.iter().any(|s| s.id == def.id);
         let can_revert = on || has_step;
-        let usable = switchable && self.env.elevated && !self.services_busy() && can_revert;
+        let usable = switchable && !self.services_busy() && can_revert;
 
         let chips = [
             Chip::new(service_state_text(state), MUTED),
@@ -1983,8 +2053,6 @@ impl Debloater {
         let text_color = if switchable { ui::TEXT } else { MUTED };
         let tip = if !switchable {
             None
-        } else if !self.env.elevated {
-            Some("Needs admin")
         } else if !can_revert {
             Some(SERVICES_CHANGED_TIP)
         } else {
@@ -2049,16 +2117,17 @@ impl Debloater {
             }
         }
 
-        if !self.env.elevated {
-            style::divider(ui);
-            ui.label("Needs admin: changing a service needs administrator rights.");
-            style::note(ui, ADMIN_UNAVAILABLE);
-        }
+        style::divider(ui);
+        ui.label("Changing a service needs administrator rights.");
+        style::note(
+            ui,
+            "A separate administrator window shows exactly what will change. Confirm or cancel there.",
+        );
 
         style::divider(ui);
         let busy = self.services_busy();
-        self.restore_switch(ui, busy, false);
-        if self.restore.on && self.env.elevated && self.restore.services_done {
+        self.restore_switch(ui, busy, true);
+        if self.restore.on && self.machine_ok() && self.restore.services_done {
             style::note(ui, "A restore point was already made this session.");
         }
 
@@ -2112,11 +2181,6 @@ mod tests {
         assert!(!should_create(false, true, false));
         assert!(!should_create(true, false, false));
         assert!(!should_create(true, true, true));
-    }
-
-    #[test]
-    fn restore_description_has_prefix() {
-        assert_eq!(restore_description("x"), "toolboks: x");
     }
 
     #[test]

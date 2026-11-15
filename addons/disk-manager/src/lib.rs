@@ -23,6 +23,14 @@ use toolboks_addon_sdk::NativeAddon;
 pub const PROVIDER: &str = "stratum.disk-manager";
 pub const PACKAGE: &str = include_str!("../disk-manager.tbaddon");
 pub const ID: &str = "toolboks.disk-manager";
+
+/// Validates and previews one administrator action for the separate elevated helper. It changes
+/// nothing; the helper's own confirmation window decides.
+pub fn prepare_admin(
+    request: &toolboks_addon_sdk::AdminRequest,
+) -> Result<Box<dyn toolboks_addon_sdk::admin::AdminChange>, String> {
+    optimization::prepare_admin(request)
+}
 pub const PAGES: [&str; 5] = [
     "Overview",
     "Largest files",
@@ -656,6 +664,15 @@ impl NativeAddon for DiskManager {
     }
     fn set_capabilities(&mut self, capabilities: &[toolboks_addon_sdk::Capability]) {
         self.optimization.capabilities(capabilities);
+    }
+    fn prepare_admin(
+        &mut self,
+        request: &toolboks_addon_sdk::AdminRequest,
+    ) -> Result<Box<dyn toolboks_addon_sdk::admin::AdminChange>, String> {
+        optimization::prepare_admin(request)
+    }
+    fn admin_result(&mut self, id: u64, outcome: toolboks_addon_sdk::AdminOutcome) {
+        self.optimization.admin_result(id, outcome);
     }
     fn take_host_request(&mut self) -> Option<toolboks_addon_sdk::HostRequest> {
         self.optimization.request()

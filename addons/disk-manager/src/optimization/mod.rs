@@ -1,5 +1,6 @@
 mod backend;
 use super::*;
+pub(super) use backend::prepare_admin;
 use backend::{Action, Analysis, Media, Metadata, Shared, Volume};
 use toolboks_addon_sdk::{Capability, HostRequest};
 
@@ -10,6 +11,8 @@ pub(super) struct Panel {
     allowed: bool,
     request: Option<HostRequest>,
     tour_selection: Option<String>,
+    pending: Option<u64>,
+    next_id: u64,
 }
 impl Default for Panel {
     fn default() -> Self {
@@ -20,6 +23,8 @@ impl Default for Panel {
             allowed: false,
             request: None,
             tour_selection: None,
+            pending: None,
+            next_id: 0,
         }
     }
 }
@@ -38,9 +43,52 @@ impl Panel {
     pub fn request(&mut self) -> Option<HostRequest> {
         self.request.take()
     }
+    fn start(&mut self, letter: &str, device_id: &str, action: Action) {
+        if self.busy() {
+            return;
+        }
+        self.next_id = self.next_id.wrapping_add(1);
+        self.pending = Some(self.next_id);
+        self.service.lock().unwrap().message =
+            Some("Waiting for administrator confirmation or the Windows report...".into());
+        self.request = Some(HostRequest::AdminOperation(
+            toolboks_addon_sdk::AdminRequest {
+                id: self.next_id,
+                operation: "drive_optimize".into(),
+                json: serde_json::to_string(&backend::DriveRequest {
+                    letter: letter.into(),
+                    device_id: device_id.into(),
+                    action,
+                })
+                .expect("drive request"),
+            },
+        ));
+    }
+    pub fn admin_result(&mut self, id: u64, outcome: toolboks_addon_sdk::AdminOutcome) {
+        if self.pending != Some(id) {
+            return;
+        }
+        self.pending = None;
+        let mut state = self.service.lock().unwrap();
+        match outcome {
+            toolboks_addon_sdk::AdminOutcome::Cancelled => state.message = Some("Cancelled. No drive change was made.".into()),
+            toolboks_addon_sdk::AdminOutcome::Failed { reason } => state.message = Some(reason),
+            toolboks_addon_sdk::AdminOutcome::Completed { json } => match serde_json::from_str::<backend::DriveResult>(&json) {
+                Ok(result) => {
+                    state.metadata = Some(result.metadata);
+                    state.reports.remove(&result.device_id);
+                    if let Some(report) = result.report { state.reports.insert(report.device_id.clone(), report); }
+                    state.message = Some(result.message);
+                    state.last_output = result.output;
+                }
+                Err(_) => state.message = Some("The administrator helper returned an unreadable drive report. Refresh drive information.".into()),
+            }
+        }
+    }
+
     pub fn busy(&self) -> bool {
         let s = self.service.lock().unwrap();
-        s.job.is_some() || s.refreshing
+        self.pending.is_some() || s.job.is_some() || s.refreshing
     }
     pub fn ui(
         &mut self,
@@ -74,13 +122,13 @@ impl Panel {
         } else {
             self.service.lock().unwrap().clone()
         };
-        if state.refreshing || state.job.is_some() {
+        if self.pending.is_some() || state.refreshing || state.job.is_some() {
             ui.request_repaint_after(Duration::from_millis(250));
         }
         theme::title(ui, "Drive optimization");
         weak(
             ui,
-            "Check drive fragmentation and Windows maintenance history. Drive optimization is currently unavailable.",
+            "Check how fragmented a drive is, then defragment a hard drive or run TRIM on an SSD. Nothing starts until you confirm.",
         );
         if tutorial {
             weak(ui, "Tutorial sample. No disk operation runs.");
@@ -183,19 +231,17 @@ impl Panel {
                             weak(ui, "Less than 15% free space. Windows may only partially defragment this drive.");
                         }
                         ui.add_space(theme::SPACE_M);
-                        let enabled = self.allowed && m.elevated && v.supported() && !self.busy() && !tutorial;
+                        let enabled = self.allowed && v.supported() && !self.busy() && !tutorial;
                         ui.horizontal_wrapped(|ui| {
-                            if !m.elevated && self.allowed {
-                                if ui.add_enabled_ui(!self.busy() && !tutorial, |ui| theme::primary(ui, "Restart with administrator access")).inner.clicked() {
-                                    self.request = Some(HostRequest::RestartElevated { page: "4".into() });
-                                }
-                            } else if ui.add_enabled_ui(enabled, |ui| theme::primary(ui, "Analyze fragmentation")).inner.clicked() {
-                                backend::start(&self.service, &v.letter, &v.device_id, Action::Analyze);
+                            if ui.add_enabled_ui(enabled, |ui| theme::primary(ui, "Analyze fragmentation")).inner.clicked() {
+                                self.start(&v.letter, &v.device_id, Action::Analyze);
                             }
-                            ui.add_enabled(false, theme::outlined(v.action().label()));
+                            if ui.add_enabled(enabled, theme::outlined(v.action().label())).clicked() {
+                                self.start(&v.letter, &v.device_id, v.action());
+                            }
                         });
-                        weak(ui, "Drive optimization is unavailable until the administrator confirmation update is ready.");
-
+                        weak(ui, "A separate administrator window will show exactly what will happen. Confirm or cancel there.");
+                        weak(ui, "Windows runs maintenance in the background. It may continue after Toolboks closes.");
                     });
                 });
             } else {
@@ -226,6 +272,7 @@ impl Panel {
             ui.set_width(ui.available_width());theme::section(ui,"Activity and Windows report");
             if let Some(job)=&state.job{ui.label(format!("{} · {} · {}s",job.action.label(),job.letter,job.started.elapsed().as_secs()));if let Some(p)=job.phase_percent{ui.add(egui::ProgressBar::new(p/100.0).text(format!("Windows-reported percentage · {p:.0}%")));weak(ui,"Windows may report several phases; this is not an overall completion estimate.");}
 if !job.output.is_empty(){egui::ScrollArea::vertical().id_salt("optimize-output").max_height(180.0).show(ui,|ui|{ui.label(RichText::new(&job.output).monospace().size(12.0));});}}
+            else if self.pending.is_some(){weak(ui,"An administrator action is pending. Use its separate window to confirm or cancel.");}
             else{weak(ui,"No Toolboks optimization is running.");}
             if let Some(message)=&state.message{ui.label(message);}
             if !state.last_output.is_empty(){egui::CollapsingHeader::new("Last Windows report").show(ui,|ui|{ui.label(RichText::new(&state.last_output).monospace().size(12.0));});}

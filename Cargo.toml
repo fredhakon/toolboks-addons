@@ -3,10 +3,10 @@ members = ["addons/*", "tools/repo"]
 resolver = "2"
 
 [workspace.dependencies]
-toolboks-addon-sdk = { git = "https://github.com/Gusseti/toolboks", rev = "86c749cbd3a27de920329b512ea8a3f33baca74b", features = ["runtime"] }
-toolboks-addon-proto = { git = "https://github.com/Gusseti/toolboks", rev = "86c749cbd3a27de920329b512ea8a3f33baca74b" }
-toolboks-shared = { git = "https://github.com/Gusseti/toolboks", rev = "86c749cbd3a27de920329b512ea8a3f33baca74b", features = ["ui"] }
-toolboks-catalog = { git = "https://github.com/Gusseti/toolboks", rev = "86c749cbd3a27de920329b512ea8a3f33baca74b" }
+toolboks-addon-sdk = { git = "https://github.com/Gusseti/toolboks", rev = "5a1fee118f98b7e6e677836ec64003e5c3589497", features = ["runtime"] }
+toolboks-addon-proto = { git = "https://github.com/Gusseti/toolboks", rev = "5a1fee118f98b7e6e677836ec64003e5c3589497" }
+toolboks-shared = { git = "https://github.com/Gusseti/toolboks", rev = "5a1fee118f98b7e6e677836ec64003e5c3589497", features = ["ui"] }
+toolboks-catalog = { git = "https://github.com/Gusseti/toolboks", rev = "5a1fee118f98b7e6e677836ec64003e5c3589497" }
 egui = { version = "0.37", default-features = false }
 serde_json = "1"
 

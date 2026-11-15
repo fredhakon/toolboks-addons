@@ -693,7 +693,7 @@ dependencies = [
 [[package]]
 name = "toolboks-addon-proto"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=86c749cbd3a27de920329b512ea8a3f33baca74b#86c749cbd3a27de920329b512ea8a3f33baca74b"
+source = "git+https://github.com/Gusseti/toolboks?rev=5a1fee118f98b7e6e677836ec64003e5c3589497#5a1fee118f98b7e6e677836ec64003e5c3589497"
 dependencies = [
  "egui",
  "postcard",
@@ -703,18 +703,19 @@ dependencies = [
 [[package]]
 name = "toolboks-addon-sdk"
 version = "0.4.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=86c749cbd3a27de920329b512ea8a3f33baca74b#86c749cbd3a27de920329b512ea8a3f33baca74b"
+source = "git+https://github.com/Gusseti/toolboks?rev=5a1fee118f98b7e6e677836ec64003e5c3589497#5a1fee118f98b7e6e677836ec64003e5c3589497"
 dependencies = [
  "egui",
  "serde",
  "serde_json",
  "toolboks-addon-proto",
+ "windows",
 ]
 
 [[package]]
 name = "toolboks-catalog"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=86c749cbd3a27de920329b512ea8a3f33baca74b#86c749cbd3a27de920329b512ea8a3f33baca74b"
+source = "git+https://github.com/Gusseti/toolboks?rev=5a1fee118f98b7e6e677836ec64003e5c3589497#5a1fee118f98b7e6e677836ec64003e5c3589497"
 dependencies = [
  "serde",
  "serde_json",
@@ -725,7 +726,7 @@ dependencies = [
 [[package]]
 name = "toolboks-shared"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=86c749cbd3a27de920329b512ea8a3f33baca74b#86c749cbd3a27de920329b512ea8a3f33baca74b"
+source = "git+https://github.com/Gusseti/toolboks?rev=5a1fee118f98b7e6e677836ec64003e5c3589497#5a1fee118f98b7e6e677836ec64003e5c3589497"
 dependencies = [
  "egui",
  "toolboks-addon-sdk",

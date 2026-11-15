@@ -66,7 +66,10 @@ fn protocol_test_host_draws_pings_and_quits() {
         )
         .unwrap();
         assert_eq!(hello.addon_id, "toolboks.disk-manager");
-        assert_eq!(hello.protocol_version, 2);
+        assert_eq!(
+            hello.protocol_version,
+            toolboks_addon_proto::PROTOCOL_VERSION
+        );
         let preferences = serde_json::json!({
             "settings": {"path":"C:\\saved", "exclude":"target", "min_bytes":1234, "older_days":9, "sort":"name"},
             "optimize_selected_drive":"Z:",

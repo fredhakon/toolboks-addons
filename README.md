@@ -18,8 +18,8 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `86c749cbd3a27de920329b512ea8a3f33baca74b` (host staging,
-protocol 2, minimum host 0.12.5). They are not on host main yet. Upgrade all four git
+Host dependencies pin commit `5a1fee118f98b7e6e677836ec64003e5c3589497` (host staging,
+protocol 3, minimum host 0.12.5). They are not on host main yet. Upgrade all four git
 dependencies together, regenerate `Cargo.lock`, review compatibility and rerun checks.
 
 ## Build and test
@@ -95,25 +95,18 @@ fragmentation analysis can finish while hidden. Suspending cancels scans and rel
 results. It keeps an idle background process under the existing host lifecycle; it does not
 poll without work. Closing the host ends it. No protocol/supervisor changes are made here.
 
-The current host dependency pin remains on **protocol 2**. **After host #132 merges to staging,
-repin all host dependencies together and rebuild Disk Manager for protocol 3 before release.**
-Re-run workspace/release protocol checks and the named-pipe/elevation/cancelled-UAC checks.
-The current protocol 2 pin includes the plain catalog from host PR #134. Catalog generation
-retains `by stratum`, page names and background behavior. The obsolete signature is removed
-and the unreleased catalog reset to an empty plain list, as requested by the owner.
+Drive optimization uses the host's administrator helper (protocol 3). The drawing process
+never runs elevated. A click on Analyze, Defrag, TRIM or Optimize sends one request; a separate
+elevated helper process prepares the exact change, shows its own native Confirm / Cancel window
+and applies it only after Confirm. Input from the host window cannot confirm. See the host's
+`docs/ADDON-AUTHOR-GUIDE.md`. The real-window dialog and a real UAC and drive test are still to
+be run before the first release.
 
-Elevation touchpoints for that repin:
+Where the add-on touches it:
 
-- `src/optimization/mod.rs`: `HostRequest::RestartElevated { page: "4" }`, guarded by
-  `drive_optimize`; the page returns through normal SDK navigation.
-- `src/optimization/backend.rs`: metadata detects elevation; fragmentation analysis uses
-  Win32_Volume.DefragAnalysis through `analyze.ps1`. Analysis needs administrator rights.
-- Defragment (`/D`), TRIM (`/L`), and Windows-selected optimization (`/O`) are disabled in
-  the UI and rejected before worker creation in the backend pending #132's separate elevated
-  helper and its own confirmation window. This PR does not implement that window. Re-enable
-  actions only after integrating and testing that helper; UAC/restart is not action consent.
-- Folder scanning, file ranking/map/type totals, exports and drive inventory/history queries
-  do not request elevation. Tests never run drive-changing operations.
+- `src/main.rs`: `run_addon_with_admin`, so the same exe also starts as the helper.
+- `src/optimization/mod.rs`: sends `HostRequest::AdminOperation`, receives `admin_result`.
+- `src/optimization/backend.rs`: `prepare_admin` validates and previews; the helper applies after Confirm.
 
 Run `cargo run --locked -p addon-repo -- measure disk-manager` for a release build, executable
 bytes, three spawn-to-first-frame stdio timings, and suspended working set/private commit

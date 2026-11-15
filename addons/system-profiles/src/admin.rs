@@ -93,7 +93,7 @@ fn limited(mut text: String) -> String {
 
 fn apply_description(selected: &[&'static str], enable_protection: bool) -> String {
     let mut text = String::from(
-        "Apply the Gaming profile?\n\nBefore anything changes, Windows must confirm a new restore point, and the current values are saved to a registry backup.",
+        "Apply the Gaming profile?\n\nBefore anything changes, Windows must confirm a new restore point, and the current values are saved to a registry backup. Neither guarantees a complete recovery, so review the changes first.",
     );
     if enable_protection {
         text.push_str("\n\nSystem Protection will be turned on for the Windows drive.");

@@ -78,7 +78,7 @@ jobs:
         run: |
           if ($env:RELEASE_TAG -cnotmatch '\A[a-z][a-z0-9]*(?:-[a-z0-9]+)*-v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\z') { throw 'Invalid tag' }
           # Existing releases are never overwritten. Retry catalog alone after a PR failure.
-          gh release create $env:RELEASE_TAG --verify-tag --target $env:RELEASE_SHA --title $env:RELEASE_TAG --notes 'Native add-on. Catalog availability follows owner review and offline signing.' dist/*
+          gh release create $env:RELEASE_TAG --verify-tag --target $env:RELEASE_SHA --title $env:RELEASE_TAG --notes 'Native add-on. Catalog availability follows owner review of the plain list.' dist/*
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   catalog:
     needs: [build, publish]
@@ -117,7 +117,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
           Copy-Item release-source/catalog/index.json catalog/index.json
-          Remove-Item catalog/index.json.sig -ErrorAction SilentlyContinue
       - name: Open unsigned catalog PR
         shell: pwsh
         env:
@@ -141,6 +140,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Cannot configure bot authentication' }
           git push origin $branch
           if ($LASTEXITCODE -ne 0) { throw 'Cannot push catalog branch (an existing branch is never overwritten)' }
-          'Unsigned catalog update. Review the URL, checksum, size and host compatibility. Mark verified only after review. Refresh sequence/expiry against latest main, sign offline with the host catalog-sign tool, verify, then merge. Never put private keys in CI.' | Set-Content pr-body.md -Encoding utf8
+          'Catalog update. Review the URL, checksum, size, capabilities, pages, background behavior and host compatibility. Preserve all other releases from latest main. Mark verified only after review, then merge the plain unsigned list.' | Set-Content pr-body.md -Encoding utf8
           gh pr create --base main --head $branch --title "Catalog: $env:ADDON $env:VERSION" --body-file pr-body.md
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

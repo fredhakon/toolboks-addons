@@ -1,36 +1,22 @@
 # Catalog
 
-`index.json` is the host's format 1 (`toolboks-catalog::Index`). It starts empty:
-there is no downloadable Hello entry until an executable has actually been released.
-The initial unsigned index is a development source, not a trusted published catalog.
+`index.json` is a plain unsigned list in host format 1 (`toolboks_catalog::Index`):
 
-Release automation adds one entry per version, retaining older entries. It copies the
-released manifest's host compatibility and the pinned protocol version, and hashes the
-actual executable. New entries have `verified: false`; only owner review can change that.
-The bot increments `sequence`, sets a 14-day validity window and removes stale signatures.
-
-Before merging any catalog PR, rebase onto current main, preserve all other releases,
-and make `sequence` higher than every published index. Refresh `generated_at` and
-`expires_at` (Unix seconds, at most 90 days apart). Review compatibility, release URL,
-size and SHA-256. The placeholder does not warrant a verified badge by default.
-
-Signing follows the **offline-only owner decision in host #84**. No CI signing secret
-is used. On the owner's machine, build `tools/catalog-sign` from the pinned host commit:
-
-```powershell
-cargo build --release --locked -p catalog-sign
-# Use that binary on the add-ons checkout; the private-key path is outside this repo.
-catalog-sign sign catalog/index.json E:\catalog-main\catalog-private.key
-catalog-sign verify catalog/index.json <main-public-hex> <recovery-public-hex>
+```json
+{"format_version":1,"entries":[]}
 ```
 
-Commit `catalog/index.json` and `catalog/index.json.sig` together after signing. Keep
-`rotations.json` beside the index when rotating keys. The recovery key signs rotation
-statements only. Never generate keys in CI or put private keys in this repository or
-Actions secrets. `.gitattributes` preserves signed bytes exactly across platforms.
+This follows the owner's 2026-11-15 decision, implemented in host PR #134. There are
+no signatures, keys, rotation statements, sequence numbers, or validity dates.
+Executable downloads are checked against the size and SHA-256 declared by each entry.
 
-The host still needs owner-configured public keys and a catalog delivery URL. Publishing
-or hosting a signed index is an owner step; this workflow publishes executable releases
-and opens catalog PRs, but does not deploy an unsigned index. Renew the catalog before
-expiry even when there are no add-on releases. See the pinned host's
-`docs/catalog-signing.md` for the full signing and recovery runbook.
+The list stays empty until an executable has actually been released. Release automation
+copies the released manifest's compatibility, byline and capabilities plus optional
+`host-services.json` pages/background metadata, records the pinned protocol version, and
+hashes the actual executable. New entries have `verified: false`; owner review controls it.
+
+Before merging a catalog PR, rebase onto current main, preserve other add-ons and versions,
+and review the executable URL, version, compatibility, capabilities, page names, background
+behavior, size and SHA-256. The workflow opens the PR; owner review completes publication.
+No signing tool or signing secret is used. Tags/releases remain separate owner/orchestrator
+steps; do not publish a production add-on merely to test the pipeline.

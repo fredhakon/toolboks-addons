@@ -1,7 +1,7 @@
 # Toolboks add-ons
 
 First-party native add-ons live here and release independently. The host keeps the SDK,
-wire protocol, shared UI and catalog verifier. Real tool migration is host #88; Hello
+wire protocol, shared UI and catalog entry/download checks. Disk Manager is the first migrated tool (host #88); Hello
 is only a small pipeline fixture.
 
 ## Layout
@@ -18,8 +18,8 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `5f7c39b04dc367379be0eb9396cfb7362af2ffa3` (host staging,
-protocol 2, minimum host 0.12.5). They are not on host main yet. Upgrade all four git
+Host dependencies pin commit `5a1fee118f98b7e6e677836ec64003e5c3589497` (host staging,
+protocol 3, minimum host 0.12.5). They are not on host main yet. Upgrade all four git
 dependencies together, regenerate `Cargo.lock`, review compatibility and rerun checks.
 
 ## Build and test
@@ -55,18 +55,18 @@ host's `cargo run --example addon_host -- <absolute-hello.exe-path> toolboks.hel
 5. The catalog job uses the released manifest/protocol pin and executable to update
    main's catalog, then opens a PR. URLs derive from `github.repository`, allowing
    a future owner move without workflow changes.
-6. Review and sign the catalog offline before merging; see [catalog/README.md](catalog/README.md).
+6. Review the plain unsigned catalog before merging; see [catalog/README.md](catalog/README.md).
 
 Configure **`CATALOG_PR_TOKEN`** before releasing: a fine-grained bot token restricted
 to this repository with Contents and Pull requests write access. Only the final PR
 step receives it. Build/catalog jobs' `GITHUB_TOKEN` stays read-only. The separate token
-allows bot PRs to trigger CI. No signing key belongs in this secret. Protect main and
+allows bot PRs to trigger CI. No signing keys are used. Protect main and
 configure a tag ruleset for `*-v*` to restrict who can release.
 
 If catalog PR creation fails, executable publication is already complete. Fix configuration
 and re-run only the failed catalog job. Existing releases and branches are never overwritten.
 If a branch was pushed before a PR API failure, open its PR manually. Concurrent catalog
-PRs must be rebased/reconciled before signing; sequence/expiry become final at owner review.
+PRs must be rebased/reconciled before owner review; preserve every other released entry.
 
 ## Test a release without publishing
 
@@ -78,4 +78,38 @@ to update an unsigned catalog without calling GitHub. Run `actionlint` for workf
 For actual publication end to end, use a disposable repository with Actions and the bot
 token configured, merge this code to its main, then push its Hello tag. Check release
 assets, checksum, size summary and catalog PR. Do not push a production tag just to test CI.
-No real tools or private keys are included here.
+Disk Manager is included; no private keys are included here.
+
+## Disk Manager pilot (#88)
+
+`addons/disk-manager` builds `disk-manager.exe`, preserving ID `toolboks.disk-manager`,
+the five pages (Overview, Largest files, File types, Scan details, Optimization), and
+the existing `settings`, `optimize_selected_drive` and `fragmentation_reports` preferences.
+Use `--open "Disk Manager/Largest files"` after catalog installation as before. The host
+keeps `addon-data/toolboks.disk-manager/` and namespaced preferences; the old local activation
+package alone cannot install this executable. No data migration is required.
+
+`host-services.json` is optional per-add-on metadata copied by `catalog-update` into the
+catalog entry. Disk Manager declares its page names and `background: true`, so exports and
+fragmentation analysis can finish while hidden. Suspending cancels scans and releases their
+results. It keeps an idle background process under the existing host lifecycle; it does not
+poll without work. Closing the host ends it. No protocol/supervisor changes are made here.
+
+Drive optimization uses the host's administrator helper (protocol 3). The drawing process
+never runs elevated. A click on Analyze, Defrag, TRIM or Optimize sends one request; a separate
+elevated helper process prepares the exact change, shows its own native Confirm / Cancel window
+and applies it only after Confirm. Input from the host window cannot confirm. See the host's
+`docs/ADDON-AUTHOR-GUIDE.md`. The real-window dialog and a real UAC and drive test are still to
+be run before the first release.
+
+Where the add-on touches it:
+
+- `src/main.rs`: `run_addon_with_admin`, so the same exe also starts as the helper.
+- `src/optimization/mod.rs`: sends `HostRequest::AdminOperation`, receives `admin_result`.
+- `src/optimization/backend.rs`: `prepare_admin` validates and previews; the helper applies after Confirm.
+
+Run `cargo run --locked -p addon-repo -- measure disk-manager` for a release build, executable
+bytes, three spawn-to-first-frame stdio timings, and suspended working set/private commit
+after five seconds. The result is process-only and excludes the installer, named pipes and
+host drawing. No catalog writes or signatures occur. Full pilot evidence and remaining
+checks are in the paired host PR under `docs/reviews/88/`.

@@ -828,10 +828,14 @@ impl Aural {
                 section(ui, "Remember my setup");
                 let enabled = interactive && self.preferences_allowed;
                 ui.add_enabled_ui(enabled, |ui| {
-                    audio_setting_switch(ui, &mut self.preferences.auto_enable, "Turn on when Toolboks starts");
-                    info(ui, "startup", "Starts live audio when Toolboks opens. A saved per-microphone on/off state takes priority when remembering settings is enabled.");
-                    audio_setting_switch(ui, &mut self.preferences.remember_devices, "Remember gain and routes per microphone");
-                    info(ui, "remembering", "Save microphone on/off, gain, listening volume and routing. Restore them when switching microphones or reopening Toolboks.");
+                    ui.horizontal_wrapped(|ui| {
+                        audio_setting_switch(ui, &mut self.preferences.auto_enable, "Turn on when Toolboks starts");
+                        info(ui, "startup", "Starts live audio when Toolboks opens. A saved per-microphone on/off state takes priority when remembering settings is enabled.");
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        audio_setting_switch(ui, &mut self.preferences.remember_devices, "Remember per microphone");
+                        info(ui, "remembering", "Save microphone on/off, gain, listening volume and routing. Restore them when switching microphones or reopening Toolboks.");
+                    });
                 });
                 ui.add_space(4.0);
                 ui.separator();
@@ -910,12 +914,20 @@ impl Aural {
             look::card(ui, ui.available_width(), height, |ui| {
                 section(ui, "Input levels");
                 ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
                     for level in [
                         timeline::Level::Good,
                         timeline::Level::Close,
                         timeline::Level::Clipping,
                     ] {
-                        ui.label(RichText::new(level.label()).size(11.0).color(level.color()));
+                        // A dot and the word: the colour is never the only signal.
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            let (r, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 12.0), egui::Sense::hover());
+                            ui.painter().circle_filled(r.center(), 3.5, level.color());
+                            ui.label(RichText::new(level.label()).size(11.0).color(look::MUTED));
+                        });
                     }
                 });
                 let elapsed = self.meter_started.elapsed();
@@ -1107,7 +1119,7 @@ impl NativeAddon for Aural {
             ui.add_space(look::SPACE_M);
             let width = ui.available_width();
             let height = ui.available_height().max(520.0);
-            if width >= 860.0 {
+            if width >= 900.0 {
                 ui.spacing_mut().item_spacing.x = look::GAP;
                 ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(egui::vec2(300.0, height), egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -1311,7 +1323,7 @@ mod tests {
         let texts = settings_frame(&ctx, &mut addon, 290.0, true, Vec::new());
         let remember = texts
             .iter()
-            .find(|(text, _)| text == "Remember gain and routes per microphone")
+            .find(|(text, _)| text == "Remember per microphone")
             .unwrap()
             .1
             .center();
@@ -1695,7 +1707,7 @@ mod tests {
                 _ => {}
             }
         }
-        for width in [420.0, 824.0, 860.0, 1000.0, 1106.0] {
+        for width in [420.0, 824.0, 860.0, 899.0, 900.0, 1000.0, 1106.0] {
             let ctx = egui::Context::default();
             let mut addon = Aural::default();
             let mut prefs = BTreeMap::new();

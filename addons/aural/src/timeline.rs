@@ -6,7 +6,7 @@ use toolboks_shared::ui as look;
 
 pub const BARS: usize = 40;
 pub const SLICE: Duration = Duration::from_millis(250);
-pub const FRAME: Duration = Duration::from_nanos(16_666_667);
+pub const FRAME: Duration = Duration::from_nanos(33_333_333);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Level {

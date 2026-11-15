@@ -17,7 +17,23 @@ impl Drop for Guard {
     }
 }
 
+/// GitHub's Windows runners run elevated, and the add-on drawing runtime refuses to run elevated,
+/// so there is nothing to measure. A normal PC measures as usual.
+fn running_elevated() -> bool {
+    Command::new("whoami")
+        .arg("/groups")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains("S-1-16-12288"))
+        .unwrap_or(false)
+}
+
 pub(super) fn run(name: &str) {
+    if running_elevated() {
+        println!(
+            "Skipped: this process is elevated and the add-on runtime refuses to run elevated."
+        );
+        return;
+    }
     let manifest = super::package(name).manifest;
     let build = Command::new("cargo")
         .args([

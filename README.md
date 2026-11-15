@@ -191,3 +191,29 @@ The built-in provider and its legacy 0.1 package stay in the host until the fina
 "Restore your tools" step (host #94). Measure with
 `cargo run --locked -p addon-repo -- measure aural`.
 
+## Macro Manager (host #93)
+
+`addons/macro-manager` builds `macro-manager.exe`, keeping ID `toolboks.macro-manager`, the
+pages Editor and Mouse editor, the settings key `macro_manager_v1` and the built-in provider's
+behavior. The host's `src/native/macros.rs` and its engine moved over; 14 of its own unit tests
+moved with it (3 more need an interactive desktop and stay ignored). It needs no administrator
+rights.
+
+- **Capabilities:** `input_automation` (global key and mouse recording, hotkeys and playback with
+  real input) and `local_preferences`.
+- **Background.** `host-services.json` sets `background: true`: shortcuts, recording and playback
+  keep working while the window is hidden.
+- **What had to change because it is now a separate process.** The built-in provider knew where
+  its own Record button was on screen and which window was Toolboks. A separate process does
+  not. Two things changed, both small:
+  - Keys typed while a Toolboks window is in front are not recorded. The add-on now treats its
+    own process and the process that started it (the Toolboks window) as "the app".
+  - The click on "Stop recording" is no longer excluded by a screen rectangle. After recording
+    stops, trailing steps that sit over a Toolboks window (found with `WindowFromPoint`, outside
+    the hook) are dropped, so that click and the cursor travel to it are not in the macro.
+- Not yet checked in a real window: record and stop with a mouse and a keyboard, hotkeys while the
+  window is hidden, and that the stop click is really left out.
+
+The built-in provider stays in the host until the final removal and "Restore your tools" step
+(host #94). Measure with `cargo run --locked -p addon-repo -- measure macro-manager`.
+

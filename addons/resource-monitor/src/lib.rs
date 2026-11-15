@@ -14,6 +14,7 @@ mod power;
 mod processes;
 mod sampler;
 mod tutorial;
+mod vendor_gpu;
 
 use history::{History, Range};
 use sampler::{GpuSample, Info, Msg, Sample, Sampler};

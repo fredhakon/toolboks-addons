@@ -5,7 +5,7 @@ use egui::{self, Align, Layout, RichText, Vec2};
 use super::history::{History, Range};
 use super::overview::{
     cores_label, fmt_percent, fmt_rate, gpu_memory_label, nice_ceiling, DISK_FLOOR, NET_FLOOR,
-    NONE, SCROLL_GUTTER,
+    NONE, NOT_SHARED, SCROLL_GUTTER,
 };
 use super::Resources;
 use toolboks_shared::format::{clock, rate, size_plain, uptime};
@@ -200,6 +200,9 @@ impl Resources {
         }
         if let Some(c) = gpu.mem_clock_mhz {
             stats.push((format!("{c} MHz"), "Memory clock"));
+        }
+        for label in &gpu.not_shared {
+            stats.push((NOT_SHARED.to_string(), label));
         }
         section(ui, "GPU", name, &stats);
 

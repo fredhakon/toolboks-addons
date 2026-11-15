@@ -106,7 +106,8 @@ enum SortKey {
     Memory,
 }
 
-/// True for processes Windows needs and this app itself.
+/// True for processes Windows needs, this app itself, and game, launcher and anti-cheat
+/// processes. Protected processes are only ever opened with query access for the listing.
 pub(super) fn is_protected(pid: u32, name: &str, own_pid: u32) -> bool {
     pid == own_pid
         || pid == 0
@@ -114,6 +115,12 @@ pub(super) fn is_protected(pid: u32, name: &str, own_pid: u32) -> bool {
         || PROTECTED
             .iter()
             .any(|protected| name.eq_ignore_ascii_case(protected))
+        || protected_processes::protected_reason(name, None).is_some()
+}
+
+/// Why a protected process is left alone, for hovers and the inspector.
+pub(super) fn protected_note(name: &str) -> &'static str {
+    protected_processes::protected_reason(name, None).map_or(PROTECTED_NOTE, |p| p.describe())
 }
 
 /// Stable key of a row: lowercase name when grouped, process identity when not.
@@ -328,6 +335,7 @@ pub(super) fn result_line(
         Ok(()) => format!("{done} {name} (pid {pid})"),
         Err(ActionError::AccessDenied) => format!("{name} (pid {pid}): Access denied"),
         Err(ActionError::AlreadyLow) => format!("{name} (pid {pid}): Priority is already low"),
+        Err(ActionError::Protected) => format!("{name} (pid {pid}): {}", protected_note(name)),
         Err(ActionError::IdentityChanged) => {
             format!("{name} (pid {pid}): Windows could not verify the selected process")
         }
@@ -344,6 +352,8 @@ pub(super) fn result_line(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ActionError {
     AlreadyLow,
+    /// Windows, this app, or a game or anti-cheat process: never opened for write access.
+    Protected,
     AccessDenied,
     IdentityChanged,
     Failed,
@@ -399,6 +409,11 @@ fn action_handle(
     expected_name: &str,
     access: PROCESS_ACCESS_RIGHTS,
 ) -> Result<Handle, ActionError> {
+    // Refuse before a handle with write access exists; the check below repeats it on the
+    // verified image name.
+    if is_protected(identity.pid, expected_name, std::process::id()) {
+        return Err(ActionError::Protected);
+    }
     // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
     let handle = unsafe {
         OpenProcess(
@@ -1012,7 +1027,7 @@ impl Page {
                     let cell = |ui: &mut egui::Ui, text: String| {
                         let l = body_cell(ui, text, true, r.protected);
                         if r.protected {
-                            l.on_hover_text(PROTECTED_NOTE);
+                            l.on_hover_text(protected_note(&r.name));
                         }
                     };
                     row.col(|ui| {
@@ -1024,7 +1039,7 @@ impl Page {
                     row.col(|ui| {
                         let l = body_cell(ui, display_name(r), false, r.protected);
                         if r.protected {
-                            l.on_hover_text(PROTECTED_NOTE);
+                            l.on_hover_text(protected_note(&r.name));
                         }
                     });
                     if !grouped {
@@ -1131,7 +1146,9 @@ impl Page {
             let note = if chosen.iter().any(|p| p.identity.is_none() && !protected(p)) {
                 "Windows could not verify the selected processes."
             } else {
-                PROTECTED_NOTE
+                chosen
+                    .first()
+                    .map_or(PROTECTED_NOTE, |p| protected_note(&p.name))
             };
             ui.label(RichText::new(note).weak().small());
         } else if !skipped.is_empty() {
@@ -1412,6 +1429,37 @@ mod tests {
         );
         end_process(identity, &name).unwrap();
         assert_eq!(child.wait().unwrap().code(), Some(1));
+    }
+
+    #[test]
+    fn game_and_anti_cheat_processes_are_refused_before_opening() {
+        for name in ["steam.exe", "BEService.exe", "cs2.exe"] {
+            assert!(is_protected(500, name, 1), "{name}");
+        }
+        assert_eq!(
+            protected_note("vgc.exe"),
+            "Protected: anti-cheat process, Toolboks leaves it alone."
+        );
+        assert_eq!(protected_note("csrss.exe"), PROTECTED_NOTE);
+        // Pids are multiples of 4 on Windows, so no real process is touched here.
+        let fake = ProcessIdentity {
+            pid: u32::MAX - 1,
+            created: 1,
+        };
+        assert_eq!(end_process(fake, "cs2.exe"), Err(ActionError::Protected));
+        assert_eq!(
+            set_priority(
+                fake,
+                "EasyAntiCheat.exe",
+                BELOW_NORMAL_PRIORITY_CLASS.0,
+                true
+            ),
+            Err(ActionError::Protected)
+        );
+        assert_eq!(
+            result_line("Ended", "cs2.exe", 5, Err(ActionError::Protected)),
+            "cs2.exe (pid 5): Protected: game process, Toolboks leaves it alone."
+        );
     }
 
     #[test]

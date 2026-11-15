@@ -320,9 +320,12 @@ impl Memory {
                             .on_hover_text(hint.text());
                     });
                     row.col(|ui| {
-                        // System and shell processes are always protected, so they show as
-                        // ticked and locked.
-                        let locked = matches!(reason, Some(SkipReason::System | SkipReason::Own));
+                        // System, shell, game and anti-cheat processes are always protected, so
+                        // they show as ticked and locked.
+                        let locked = matches!(
+                            reason,
+                            Some(SkipReason::System | SkipReason::Own | SkipReason::Protected(_))
+                        );
                         let mut protected = reason.is_some();
                         let tick = ui
                             .add_enabled(!locked, egui::Checkbox::without_text(&mut protected))
@@ -432,7 +435,7 @@ impl Memory {
             first.get_or_insert(p);
             if !matches!(
                 skip_reason(p.pid, &p.name, own_pid, &self.exclusions),
-                Some(SkipReason::System | SkipReason::Own)
+                Some(SkipReason::System | SkipReason::Own | SkipReason::Protected(_))
             ) {
                 names.insert(p.name.to_lowercase());
             }

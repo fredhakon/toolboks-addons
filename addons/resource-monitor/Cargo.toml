@@ -8,6 +8,7 @@ description = "Resource Monitor - native Toolboks add-on with live CPU, memory, 
 [dependencies]
 egui = { version = "0.37", default-features = false }
 egui_extras = { version = "0.37", default-features = false }
+protected-processes.workspace = true
 serde_json.workspace = true
 sysinfo = { version = "0.40.0", features = ["gpu"] }
 toolboks-addon-sdk.workspace = true

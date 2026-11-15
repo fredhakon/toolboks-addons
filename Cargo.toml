@@ -1,5 +1,5 @@
 [workspace]
-members = ["addons/*", "tools/repo"]
+members = ["addons/*", "crates/*", "tools/repo"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -10,6 +10,7 @@ toolboks-catalog = { git = "https://github.com/Gusseti/toolboks", rev = "b99ea99
 toolboks-debloat-engine = { git = "https://github.com/Gusseti/toolboks", rev = "b99ea9982b505df3d454aa90f18731b895470f5d" }
 egui = { version = "0.37", default-features = false }
 serde_json = "1"
+protected-processes = { path = "crates/protected-processes" }
 
 [profile.release]
 opt-level = "s"

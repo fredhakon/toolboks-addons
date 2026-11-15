@@ -27,7 +27,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::trim::{skip_reason, Trimmed};
+use super::trim::{skip_reason, SkipReason, Trimmed};
 use toolboks_shared::win::Handle;
 
 /// Memory priority applied to idle background apps (MEMORY_PRIORITY_LOW).
@@ -71,23 +71,6 @@ const EXTRA_PROTECTED: &[&str] = &[
     "textinputhost.exe",
     "runtimebroker.exe",
     "taskhostw.exe",
-];
-
-/// Known game launchers and anti-cheat services. Matched against the app and its parent.
-const LAUNCHERS: &[&str] = &[
-    "steam.exe",
-    "steamwebhelper.exe",
-    "epicgameslauncher.exe",
-    "battle.net.exe",
-    "eadesktop.exe",
-    "origin.exe",
-    "upc.exe",
-    "ubisoftconnect.exe",
-    "galaxyclient.exe",
-    "riotclientservices.exe",
-    "easyanticheat.exe",
-    "beservice.exe",
-    "vgc.exe",
 ];
 
 /// Who a process is. A pid alone is not enough: pids get reused.
@@ -188,6 +171,7 @@ pub enum Skip {
     NotIdle,
     PlaysAudio,
     Fullscreen,
+    /// A game, game launcher or anti-cheat process, or a child of a launcher.
     Launcher,
     TooSmall,
     Cooldown,
@@ -239,7 +223,9 @@ pub fn check_eligibility(
     if c.identity.pid == policy.own_pid {
         return Err(Skip::Own);
     }
-    if skip_reason(c.identity.pid, &name, policy.own_pid, &HashSet::new()).is_some()
+    // Game and anti-cheat processes are checked below together with their parent.
+    if skip_reason(c.identity.pid, &name, policy.own_pid, &HashSet::new())
+        == Some(SkipReason::System)
         || EXTRA_PROTECTED.contains(&name.as_str())
     {
         return Err(Skip::System);
@@ -256,11 +242,7 @@ pub fn check_eligibility(
     if c.is_fullscreen {
         return Err(Skip::Fullscreen);
     }
-    let parent_is_launcher = c
-        .parent_name
-        .as_ref()
-        .is_some_and(|p| LAUNCHERS.contains(&p.to_lowercase().as_str()));
-    if LAUNCHERS.contains(&name.as_str()) || parent_is_launcher {
+    if protected_processes::protected_reason(&name, c.parent_name.as_deref()).is_some() {
         return Err(Skip::Launcher);
     }
     if c.plays_audio {
@@ -516,6 +498,10 @@ pub fn identity_of(pid: u32, name: &str) -> Option<Identity> {
 
 /// Opens the process and verifies start time and image name before returning the handle.
 fn open_verified(id: &Identity, access: PROCESS_ACCESS_RIGHTS) -> Result<Handle, ActionError> {
+    // Game and anti-cheat processes are refused before any handle with write access exists.
+    if protected_processes::protected_reason(&id.name, None).is_some() {
+        return Err(ActionError::AccessDenied);
+    }
     // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
     let handle = unsafe { OpenProcess(access | PROCESS_QUERY_LIMITED_INFORMATION, false, id.pid) }
         .map(Handle)
@@ -749,6 +735,13 @@ mod tests {
         let mut child = cand(8, "game.exe", 500);
         child.parent_name = Some("EpicGamesLauncher.exe".into());
         assert_eq!(check(&child, Kind::Trim), Err(Skip::Launcher));
+        for name in ["BEService.exe", "vgc.exe", "cs2.exe"] {
+            assert_eq!(
+                check(&cand(8, name, 500), Kind::LowerPriority),
+                Err(Skip::Launcher),
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -14,6 +14,7 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
 };
 
+use protected_processes::{protected_reason, Protected};
 use toolboks_shared::win::Handle;
 
 /// System and shell processes that are never trimmed. Compared case-insensitively.
@@ -44,6 +45,8 @@ pub enum SkipReason {
     Own,
     /// The user excluded it.
     Excluded,
+    /// A game, game launcher or anti-cheat process: never opened for write access.
+    Protected(Protected),
 }
 
 impl SkipReason {
@@ -52,6 +55,7 @@ impl SkipReason {
             SkipReason::System => "System and shell processes are never trimmed",
             SkipReason::Own => "This is toolboks itself",
             SkipReason::Excluded => "Excluded from trimming",
+            SkipReason::Protected(p) => p.describe(),
         }
     }
 }
@@ -69,6 +73,10 @@ pub fn skip_reason(
         Some(SkipReason::Own)
     } else if pid == 0 || pid == 4 || PROTECTED.contains(&lower.as_str()) {
         Some(SkipReason::System)
+    } else if let Some(p) = protected_reason(&lower, None) {
+        // shortcut: no parent name here, so children of launchers are only caught by the
+        // automatic path (`actions::check_eligibility`); pass the parent if rows ever carry it.
+        Some(SkipReason::Protected(p))
     } else if exclusions.contains(&lower) {
         Some(SkipReason::Excluded)
     } else {
@@ -176,6 +184,22 @@ mod tests {
             Some(SkipReason::Excluded)
         );
         assert_eq!(skip_reason(11, "firefox.exe", 999, &ex), None);
+    }
+
+    #[test]
+    fn game_and_anti_cheat_processes_are_protected_even_when_excluded() {
+        let ex: HashSet<String> = ["cs2.exe".to_string()].into();
+        assert_eq!(
+            skip_reason(20, "CS2.exe", 999, &ex),
+            Some(SkipReason::Protected(Protected::KnownGame))
+        );
+        let reason = skip_reason(21, "EasyAntiCheat.exe", 999, &none());
+        assert_eq!(reason, Some(SkipReason::Protected(Protected::AntiCheat)));
+        assert_eq!(
+            reason.unwrap().describe(),
+            "Protected: anti-cheat process, Toolboks leaves it alone."
+        );
+        assert_eq!(skip_reason(22, "chrome.exe", 999, &none()), None);
     }
 
     #[test]

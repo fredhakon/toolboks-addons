@@ -22,8 +22,8 @@ use windows::Win32::Networking::WinSock::{
 };
 
 use super::processes::{
-    confirm_text, end_process, is_protected, kv, result_line, sampled_identity, snapshot_start,
-    sort_arrow, visible, ActionError, ProcessIdentity, INSPECTOR_WIDTH, PROTECTED_NOTE, REFRESH,
+    confirm_text, end_process, is_protected, kv, protected_note, result_line, sampled_identity,
+    snapshot_start, sort_arrow, visible, ActionError, ProcessIdentity, INSPECTOR_WIDTH, REFRESH,
     ROW_HEIGHT,
 };
 use toolboks_shared::ui::{
@@ -936,7 +936,7 @@ impl Page {
         }
         if protected {
             ui.add_enabled(false, egui::Button::new("End process"));
-            ui.label(RichText::new(PROTECTED_NOTE).weak().small());
+            ui.label(RichText::new(protected_note(&c.name)).weak().small());
         } else if self.frozen.is_some() || c.identity.is_none() {
             ui.add_enabled(false, egui::Button::new("End process"));
             let note = if self.frozen.is_some() {

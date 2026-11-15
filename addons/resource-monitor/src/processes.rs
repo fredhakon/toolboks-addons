@@ -79,8 +79,9 @@ struct Proc {
     cpu: f32,
     /// Working set in bytes.
     mem: u64,
-    /// Bytes per second read plus written since the previous refresh.
-    disk: f64,
+    /// Bytes per second read plus written since the previous refresh; None until this process
+    /// has been seen in two refreshes in a row.
+    disk: Option<f64>,
     run_secs: u64,
     exe: Option<String>,
 }
@@ -96,7 +97,8 @@ struct Row {
     pids: Vec<u32>,
     cpu: f32,
     mem: u64,
-    disk: f64,
+    /// Sum of the known disk rates in the row; None while none of its processes has one.
+    disk: Option<f64>,
     run_secs: u64,
     exe: Option<String>,
     /// True when every process in the row is protected.
@@ -151,7 +153,10 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                 r.pids.push(p.pid);
                 r.cpu += p.cpu;
                 r.mem += p.mem;
-                r.disk += p.disk;
+                r.disk = match (r.disk, p.disk) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    (a, b) => a.or(b),
+                };
                 r.run_secs = r.run_secs.max(p.run_secs);
                 if r.exe.is_none() {
                     r.exe = p.exe.clone();
@@ -187,7 +192,7 @@ fn sort_rows(rows: &mut [Row], key: SortKey, descending: bool) {
             SortKey::Pid => a.pid.cmp(&b.pid),
             SortKey::Cpu => a.cpu.total_cmp(&b.cpu),
             SortKey::Memory => a.mem.cmp(&b.mem),
-            SortKey::Disk => a.disk.total_cmp(&b.disk),
+            SortKey::Disk => a.disk.unwrap_or(0.0).total_cmp(&b.disk.unwrap_or(0.0)),
         };
         let ord = if descending { ord.reverse() } else { ord };
         ord.then_with(|| a.lower_name.cmp(&b.lower_name))
@@ -260,11 +265,28 @@ fn cpu_text(cpu: f32, ready: bool) -> String {
     }
 }
 
-fn disk_text(disk: f64, ready: bool) -> String {
-    if ready {
-        rate(disk)
-    } else {
-        "...".to_string()
+fn disk_text(disk: Option<f64>) -> String {
+    disk.map_or_else(|| "...".to_string(), rate)
+}
+
+/// Which processes were present in the previous refresh. sysinfo reports a process's disk
+/// bytes as a delta against its previous reading, which is 0 for a process it sees for the
+/// first time, so that first "delta" is the whole lifetime I/O. A rate is only trusted for a
+/// process (pid plus start time) that was already there last time.
+#[derive(Default)]
+struct DiskBaseline {
+    seen: HashSet<ProcessIdentity>,
+}
+
+impl DiskBaseline {
+    fn rate(&self, id: Option<ProcessIdentity>, bytes: u64, secs: f64) -> Option<f64> {
+        let known = id.is_some_and(|id| self.seen.contains(&id));
+        (known && secs > 0.0).then(|| bytes as f64 / secs)
+    }
+
+    /// Remembers the processes of this refresh; ones that are gone are dropped.
+    fn commit(&mut self, ids: impl Iterator<Item = ProcessIdentity>) {
+        self.seen = ids.collect();
     }
 }
 
@@ -714,6 +736,7 @@ impl Worker {
                     .with_exe(UpdateKind::OnlyIfNotSet);
                 let mut last: Option<Instant> = None;
                 let mut ready = false;
+                let mut disk_baseline = DiskBaseline::default();
                 loop {
                     std::thread::sleep(Duration::from_millis(250));
                     if Arc::strong_count(&ping) == 1 {
@@ -724,6 +747,7 @@ impl Worker {
                         // The CPU baseline goes stale while hidden.
                         last = None;
                         ready = false;
+                        disk_baseline = DiskBaseline::default();
                         continue;
                     }
                     let wait = if ready { REFRESH } else { PRIME };
@@ -740,17 +764,16 @@ impl Worker {
                         .values()
                         .map(|p| {
                             let name = p.name().to_string_lossy().into_owned();
-                            // Disk bytes are counted since the previous refresh; the first one has
-                            // no baseline, so it reads as 0 (and shows "..." like CPU).
                             let u = p.disk_usage();
-                            let disk = if was_primed && secs > 0.0 {
-                                u.read_bytes.saturating_add(u.written_bytes) as f64 / secs
-                            } else {
-                                0.0
-                            };
+                            let identity = sampled_identity(p, sample_start);
+                            let disk = disk_baseline.rate(
+                                identity,
+                                u.read_bytes.saturating_add(u.written_bytes),
+                                secs,
+                            );
                             Proc {
                                 pid: p.pid().as_u32(),
-                                identity: sampled_identity(p, sample_start),
+                                identity,
                                 lower_name: name.to_lowercase(),
                                 name,
                                 cpu: (p.cpu_usage() / logical).clamp(0.0, 100.0),
@@ -760,7 +783,8 @@ impl Worker {
                                 exe: p.exe().map(|e| e.display().to_string()),
                             }
                         })
-                        .collect();
+                        .collect::<Vec<Proc>>();
+                    disk_baseline.commit(procs.iter().filter_map(|p| p.identity));
                     ready = was_primed;
                     if tx
                         .send(Snapshot {
@@ -1172,18 +1196,16 @@ impl Page {
                         shade_cell(ui, base, level);
                         cell(ui, text);
                     };
-                    let (cpu_level, disk_level) = if ready {
-                        (
-                            shade_level(f64::from(r.cpu), &CPU_SHADE),
-                            shade_level(r.disk, &DISK_SHADE),
-                        )
+                    let cpu_level = if ready {
+                        shade_level(f64::from(r.cpu), &CPU_SHADE)
                     } else {
-                        (0, 0)
+                        0
                     };
+                    let disk_level = r.disk.map_or(0, |d| shade_level(d, &DISK_SHADE));
                     let mem_level = shade_level(mem_share(r.mem, mem_total), &MEM_SHADE);
                     row.col(|ui| shaded(ui, DATA_CPU, cpu_level, cpu_text(r.cpu, ready)));
                     row.col(|ui| shaded(ui, DATA_MEMORY, mem_level, size_plain(r.mem)));
-                    row.col(|ui| shaded(ui, DATA_DISK, disk_level, disk_text(r.disk, ready)));
+                    row.col(|ui| shaded(ui, DATA_DISK, disk_level, disk_text(r.disk)));
                     let response = row.response();
                     row_rule(&rule, response.rect);
                     if response.clicked() && click.is_none() {
@@ -1419,7 +1441,7 @@ mod tests {
             lower_name: name.to_lowercase(),
             cpu,
             mem,
-            disk: 0.0,
+            disk: None,
             run_secs: pid as u64,
             exe: None,
         }
@@ -1452,7 +1474,7 @@ mod tests {
     }
 
     fn with_disk(mut p: Proc, disk: f64) -> Proc {
-        p.disk = disk;
+        p.disk = Some(disk);
         p
     }
 
@@ -1464,11 +1486,11 @@ mod tests {
             with_disk(p(20, "code.exe", 5.0, 50), 10.0),
         ];
         let grouped = build_rows(&procs, true, &none);
-        assert_eq!(grouped[0].disk, 2_000_000.0);
-        assert_eq!(grouped[1].disk, 10.0);
+        assert_eq!(grouped[0].disk, Some(2_000_000.0));
+        assert_eq!(grouped[1].disk, Some(10.0));
         let flat = build_rows(&procs, false, &none);
         assert_eq!(flat.len(), 3);
-        assert_eq!(flat[0].disk, 1_500_000.0);
+        assert_eq!(flat[0].disk, Some(1_500_000.0));
     }
 
     #[test]
@@ -1546,8 +1568,48 @@ mod tests {
 
     #[test]
     fn disk_cell_waits_for_the_baseline() {
-        assert_eq!(disk_text(2_000_000.0, false), "...");
-        assert_eq!(disk_text(0.0, true), "0 B/s");
+        assert_eq!(disk_text(None), "...");
+        assert_eq!(disk_text(Some(0.0)), "0 B/s");
+    }
+
+    #[test]
+    fn disk_rate_needs_a_previous_sighting() {
+        let id = |pid| {
+            Some(ProcessIdentity {
+                pid,
+                created: u64::from(pid),
+            })
+        };
+        let mut base = DiskBaseline::default();
+        // First refresh: nothing was seen before, so no rate.
+        assert_eq!(base.rate(id(1), 4_000_000, 2.0), None);
+        base.commit([1].into_iter().filter_map(id));
+        // Second refresh: pid 1 gets a rate; pid 2 started in between and reports lifetime
+        // I/O as its first delta, so it still has none.
+        assert_eq!(base.rate(id(1), 4_000_000, 2.0), Some(2_000_000.0));
+        assert_eq!(base.rate(id(2), 900_000_000, 2.0), None);
+        assert_eq!(base.rate(None, 10, 2.0), None);
+        assert_eq!(base.rate(id(1), 10, 0.0), None);
+        base.commit([1, 2].into_iter().filter_map(id));
+        assert_eq!(base.rate(id(2), 100, 2.0), Some(50.0));
+        // A process that disappeared is dropped; a reused pid with a new start time is new.
+        base.commit([2].into_iter().filter_map(id));
+        assert_eq!(base.rate(id(1), 100, 2.0), None);
+        let reused = Some(ProcessIdentity {
+            pid: 2,
+            created: 99,
+        });
+        assert_eq!(base.rate(reused, 100, 2.0), None);
+    }
+
+    #[test]
+    fn group_disk_ignores_processes_without_a_rate() {
+        let new_proc = p(12, "chrome.exe", 0.0, 10);
+        let procs = vec![with_disk(p(10, "chrome.exe", 1.0, 100), 500.0), new_proc];
+        let rows = build_rows(&procs, true, &none);
+        assert_eq!(rows[0].disk, Some(500.0));
+        let only_new = build_rows(&[p(12, "chrome.exe", 0.0, 10)], true, &none);
+        assert_eq!(only_new[0].disk, None);
     }
 
     #[test]

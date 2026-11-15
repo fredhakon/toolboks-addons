@@ -121,7 +121,6 @@ jobs:
         shell: pwsh
         env:
           # Fine-grained bot token: this repo only, Contents + Pull requests write.
-          # A separate credential also allows the resulting PR to trigger CI.
           GH_TOKEN: ${{ secrets.CATALOG_PR_TOKEN }}
           GH_REPO: ${{ github.repository }}
           ADDON: ${{ needs.build.outputs.addon }}

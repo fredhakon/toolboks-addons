@@ -41,8 +41,25 @@ impl Drop for Guard {
     }
 }
 
+/// GitHub's Windows runners run elevated. The add-on drawing runtime refuses to run elevated by
+/// design (administrator changes go through the separate helper), so there the exe exits at once
+/// and this test cannot start it. It still runs on every normal, unelevated PC.
+fn running_elevated() -> bool {
+    Command::new("whoami")
+        .arg("/groups")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains("S-1-16-12288"))
+        .unwrap_or(false)
+}
+
 #[test]
 fn protocol_test_host_draws_pings_and_quits() {
+    if running_elevated() {
+        eprintln!(
+            "skipped: this process is elevated and the add-on runtime refuses to run elevated"
+        );
+        return;
+    }
     // CI can exercise the exact release executable, rather than Cargo's test build.
     let exe = std::env::var("ADDON_TEST_EXE")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_disk-manager").into());

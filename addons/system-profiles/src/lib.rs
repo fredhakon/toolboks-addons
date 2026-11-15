@@ -1,4 +1,7 @@
+mod admin;
 mod engine;
+
+pub use admin::prepare_admin;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -6,27 +9,23 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
     os::windows::ffi::OsStrExt,
-    sync::mpsc::{self, Receiver, TryRecvError},
 };
 
 use egui::{self, RichText};
-use toolboks_addon_sdk::{tutorial, Capability, HostRequest, NativeAddon, TutorialStep};
+use toolboks_addon_sdk::{
+    tutorial, AdminOutcome, AdminRequest, Capability, HostRequest, NativeAddon, TutorialStep,
+};
 use windows::{core::PCWSTR, Win32::UI::Shell::ShellExecuteW};
 
 use engine::{Action, CHOICES};
-use toolboks_shared::{elevation, ui as theme};
+use toolboks_shared::ui as theme;
 
 pub const ID: &str = "toolboks.system-profiles";
 const PAGE: &str = "Gaming";
-/// Shown where the built-in provider offered to restart the whole app as administrator. This
-/// add-on never runs elevated; its own administrator helper is not built yet.
-const ADMIN_UNAVAILABLE: &str = "Applying or restoring a profile needs administrator rights, which this add-on cannot request yet. You can review the changes here.";
+/// Why a separate window appears when a profile is applied or restored.
+const ADMIN_NOTE: &str =
+    "A separate administrator window shows exactly what will change. Confirm or cancel there.";
 const LOG_LINES: usize = 120;
-
-enum Event {
-    Line(String),
-    Done(Result<(), String>),
-}
 
 #[derive(Default)]
 pub struct Gaming {
@@ -35,7 +34,9 @@ pub struct Gaming {
     selected: BTreeSet<&'static str>,
     enable_protection: bool,
     request: Option<HostRequest>,
-    receiver: Option<Receiver<Event>>,
+    /// The administrator request that has been sent and not answered yet.
+    pending: Option<u64>,
+    next_request: u64,
     log: VecDeque<String>,
     status: Option<Result<(), String>>,
     message: Option<String>,
@@ -180,63 +181,66 @@ impl Gaming {
         }
     }
 
-    fn start(&mut self, action: Action, ctx: &egui::Context) {
-        if !self.allowed || self.receiver.is_some() {
+    /// Sends one administrator request. The separate helper checks it, shows its own Confirm /
+    /// Cancel window and only then changes anything; nothing here can approve it.
+    fn start(&mut self, action: Action) {
+        if !self.allowed || self.pending.is_some() {
             return;
         }
         self.status = None;
         self.message = None;
         self.preview = None;
-        let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        let thread = std::thread::Builder::new()
-            .name("gaming-profile".into())
-            .spawn(move || {
-                let result = engine::run(action, |line| {
-                    let _ = tx.send(Event::Line(line));
-                    ctx.request_repaint();
-                });
-                let _ = tx.send(Event::Done(result));
-                ctx.request_repaint();
-            });
-        match thread {
-            Ok(_) => self.receiver = Some(rx),
-            Err(error) => self.status = Some(Err(format!("Could not start the profile: {error}"))),
-        }
+        self.next_request = self.next_request.wrapping_add(1);
+        self.pending = Some(self.next_request);
+        self.request = Some(HostRequest::AdminOperation(AdminRequest {
+            id: self.next_request,
+            operation: admin::OPERATION.into(),
+            json: admin::request_json(&action),
+        }));
     }
 
-    fn poll(&mut self) {
-        let Some(rx) = &self.receiver else { return };
-        loop {
-            match rx.try_recv() {
-                Ok(Event::Line(line)) => {
-                    if self.log.len() == LOG_LINES {
-                        self.log.pop_front();
+    fn push_line(&mut self, line: String) {
+        if self.log.len() == LOG_LINES {
+            self.log.pop_front();
+        }
+        self.log.push_back(line);
+    }
+
+    /// The helper answered. This only shows the outcome; it never authorizes anything.
+    fn finished(&mut self, id: u64, outcome: AdminOutcome) {
+        if self.pending != Some(id) {
+            return;
+        }
+        self.pending = None;
+        match outcome {
+            AdminOutcome::Cancelled => {
+                self.message = Some("Cancelled. Nothing was changed.".into());
+            }
+            AdminOutcome::Failed { reason } => self.status = Some(Err(reason)),
+            AdminOutcome::Completed { json } => {
+                let value: serde_json::Value =
+                    serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                for line in value["lines"].as_array().into_iter().flatten() {
+                    if let Some(line) = line.as_str() {
+                        self.push_line(line.to_owned());
                     }
-                    self.log.push_back(line);
                 }
-                Ok(Event::Done(result)) => {
-                    self.status = Some(result);
-                    self.receiver = None;
-                    break;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.status = Some(Err(
-                        "The profile was interrupted. Check the log and recovery data.".into(),
-                    ));
-                    self.receiver = None;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
+                self.status = Some(if value["ok"].as_bool() == Some(true) {
+                    Ok(())
+                } else {
+                    Err(value["error"]
+                        .as_str()
+                        .unwrap_or("The profile was interrupted. Check the log and recovery data.")
+                        .to_owned())
+                });
             }
         }
     }
 
     fn configuration(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
-        let busy = self.receiver.is_some();
+        let busy = self.pending.is_some();
         let recovery = engine::has_backup();
-        let elevated = elevation::is_elevated();
         heading(ui, "Profile changes");
         ui.label(RichText::new("Review the options you want to apply. Windows must confirm a new restore point before Toolboks changes the profile settings.").color(theme::MUTED));
         ui.add_enabled_ui(!busy && !recovery, |ui| {
@@ -289,9 +293,7 @@ impl Gaming {
         }
         ui.add_space(theme::SPACE_XS);
         ui.horizontal_wrapped(|ui| {
-            if !elevated {
-                ui.label(RichText::new(ADMIN_UNAVAILABLE).color(theme::MUTED));
-            } else if !recovery {
+            if !recovery {
                 let ready = !busy && (!self.selected.is_empty() || self.enable_protection);
                 if ui
                     .add_enabled(ready, primary("Apply Gaming profile"))
@@ -302,20 +304,17 @@ impl Gaming {
                         .filter(|choice| self.selected.contains(choice.id))
                         .map(|choice| choice.id)
                         .collect();
-                    self.start(
-                        Action::Apply {
-                            selected,
-                            enable_protection: self.enable_protection,
-                        },
-                        ui.ctx(),
-                    );
+                    self.start(Action::Apply {
+                        selected,
+                        enable_protection: self.enable_protection,
+                    });
                 }
             }
             if ui
-                .add_enabled(!busy && recovery && elevated, egui::Button::new("Restore"))
+                .add_enabled(!busy && recovery, egui::Button::new("Restore"))
                 .clicked()
             {
-                self.start(Action::Restore, ui.ctx());
+                self.start(Action::Restore);
             }
             if ui
                 .add_enabled(
@@ -327,6 +326,7 @@ impl Gaming {
                 self.message = open(engine::root().as_os_str()).err();
             }
         });
+        ui.label(RichText::new(ADMIN_NOTE).color(theme::MUTED));
         if recovery {
             ui.label(RichText::new("Restore uses the saved values for registry and power plan changes made by Toolboks. Guided changes are reversed in their original apps.").color(theme::MUTED));
         }
@@ -335,10 +335,10 @@ impl Gaming {
 
     fn activity(&self, ui: &mut egui::Ui) {
         heading(ui, "Activity log");
-        if self.receiver.is_some() {
+        if self.pending.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Working in Windows…");
+                ui.label("Waiting for the administrator window or Windows…");
             });
         }
         if let Some(status) = &self.status {
@@ -417,6 +417,17 @@ impl NativeAddon for Gaming {
         self.allowed = capabilities.contains(&Capability::SystemTuning);
     }
 
+    fn prepare_admin(
+        &mut self,
+        request: &AdminRequest,
+    ) -> Result<Box<dyn toolboks_addon_sdk::admin::AdminChange>, String> {
+        admin::prepare_admin(request)
+    }
+
+    fn admin_result(&mut self, id: u64, outcome: AdminOutcome) {
+        self.finished(id, outcome);
+    }
+
     fn take_host_request(&mut self) -> Option<HostRequest> {
         self.request.take()
     }
@@ -469,16 +480,8 @@ impl NativeAddon for Gaming {
         changed
     }
 
-    fn tick(&mut self, _ctx: &egui::Context) {
-        self.poll();
-    }
-
     fn has_background_work(&self) -> bool {
-        self.receiver.is_some()
-    }
-
-    fn tick_background(&mut self) {
-        self.poll();
+        self.pending.is_some()
     }
 
     fn tutorial_location(&self) -> String {

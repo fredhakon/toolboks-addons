@@ -250,11 +250,14 @@ its engine moved over with imports changed; the shared debloat engine is a pinne
 "Review registry edits" previews, the guided Windows and NVIDIA settings list, opening the
 backup folder and the guided tour.
 
-**What does not work yet.** Applying a profile, turning on System Protection and restoring need
-administrator rights (a restore point, registry changes and a power plan). The built-in provider
-restarted the whole app as administrator; protocol 3 add-ons never run elevated. The Apply and
-Restore buttons are therefore off, with a plain note, until the administrator helper operations
-exist (host issue #142). Real UAC validation is still required.
+**Administrator changes.** Applying a profile, turning on System Protection and restoring need
+administrator rights. They go through the protocol 3 helper: the Apply and Restore buttons send
+one request (`gaming_profile`, kind `apply` or `restore`, choices by id) and the drawing process
+never runs elevated. The helper checks the ids against the add-on's own list, builds the preview
+from that list and the current registry values (never from request text), shows its own Confirm /
+Cancel window, and only then runs the same engine as before (restore point, registry backup,
+changes, verification, activity log). Cancelling at the UAC prompt or in the window changes
+nothing. Real UAC validation is still required (host issue #142).
 
 The built-in provider stays in the host until the final removal and "Restore your tools" step
 (host #94). Measure with `cargo run --locked -p addon-repo -- measure system-profiles`.

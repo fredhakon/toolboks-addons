@@ -6,3 +6,4 @@
 
 Release blockers:
 - Defrag, TRIM, Windows-selected optimization and fragmentation analysis go through the host's administrator helper (protocol 3): a separate elevated process shows its own Confirm / Cancel window and applies the change only after Confirm. Host dependencies are pinned to host staging with protocol 3 and the unsigned catalog. Still pending before release: the dialog in a real window and a real UAC and drive test, and the GUI install test with screenshots.
+- Added Memory Cleaner as an independent `memory-cleaner.exe`, keeping its ID, Home and Advanced pages, trimming, automatic cleaning and guided tour. The cache purge now goes through the host administrator helper (separate window with Confirm / Cancel) instead of restarting the whole app as administrator. The built-in copy in the host stays until the final removal step.

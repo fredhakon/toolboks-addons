@@ -113,3 +113,26 @@ bytes, three spawn-to-first-frame stdio timings, and suspended working set/priva
 after five seconds. The result is process-only and excludes the installer, named pipes and
 host drawing. No catalog writes or signatures occur. Full pilot evidence and remaining
 checks are in the paired host PR under `docs/reviews/88/`.
+
+## Memory Cleaner (host #90)
+
+`addons/memory-cleaner` builds `memory-cleaner.exe`, keeping ID `toolboks.memory-cleaner`, the
+pages Home and Advanced and the built-in tool's behavior. The host's `src/tools/memory/` code
+moved over with imports changed to the shared crates, and 160 of its own unit tests moved with
+it. Nothing is stored between runs, as before.
+
+- **Administrator action.** The one action that needs administrator rights, "Clear low-priority
+  cache", no longer restarts the whole app as administrator. It uses the host's protocol 3
+  helper: a separate elevated process shows its own Confirm / Cancel window and only then runs
+  the purge (capability `system_tuning`). The drawing process is never elevated. Trimming idle
+  apps, process trims and automatic cleaning need no administrator rights.
+- **Background.** `host-services.json` sets `background: true` so a trim or optimize that is
+  running finishes while the window is hidden. Sampling and automatic checks run while the
+  window is shown, as in the built-in tool.
+- **Status bar.** The `RAM nn%` item is sent through the host's status services.
+- The guided tour has the same twelve steps.
+
+The built-in copy stays in the host until the final removal and "Restore your tools" step (host
+#94). The tray's memory percentage is measured by the host itself and does not depend on this
+add-on. Measure with `cargo run --locked -p addon-repo -- measure memory-cleaner`.
+

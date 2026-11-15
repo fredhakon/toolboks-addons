@@ -9,7 +9,7 @@ is only a small pipeline fixture.
 - `addons/<name>/`: one crate, one `<name>.tbaddon` SDK manifest, and `tests/protocol.rs`.
 - `catalog/index.json`: the host's format 1, initially empty and unsigned.
 - `tools/repo/`: manifest/index validation and release-to-catalog automation using host types.
-- `.github/workflows/`: Windows PR CI and isolated per-add-on releases.
+- `.github/workflows/`: the isolated per-add-on release workflow. There is no CI: checks run locally before merging.
 
 Folder, crate and executable names must agree. The manifest version matches Cargo's
 version; its ID must match `run_addon`. Every add-on supplies a `protocol` integration
@@ -37,7 +37,7 @@ $env:ADDON_TEST_EXE = (Resolve-Path target/release/hello.exe).Path
 cargo test --locked -p hello --test protocol
 ```
 
-PR CI runs these checks for all add-ons. For interactive inspection, use the pinned
+Run these checks locally for all add-ons before merging; nothing runs them for you. For interactive inspection, use the pinned
 host's `cargo run --example addon_host -- <absolute-hello.exe-path> toolboks.hello`.
 
 ## Release flow
@@ -59,8 +59,7 @@ host's `cargo run --example addon_host -- <absolute-hello.exe-path> toolboks.hel
 
 Configure **`CATALOG_PR_TOKEN`** before releasing: a fine-grained bot token restricted
 to this repository with Contents and Pull requests write access. Only the final PR
-step receives it. Build/catalog jobs' `GITHUB_TOKEN` stays read-only. The separate token
-allows bot PRs to trigger CI. No signing keys are used. Protect main and
+step receives it. Build/catalog jobs' `GITHUB_TOKEN` stays read-only. No signing keys are used. Protect main and
 configure a tag ruleset for `*-v*` to restrict who can release.
 
 If catalog PR creation fails, executable publication is already complete. Fix configuration

@@ -240,3 +240,22 @@ follow-up issue and nothing here pretends to do it. Real UAC validation is still
 The built-in tool stays in the host until the final removal and "Restore your tools" step (host
 #94). Measure with `cargo run --locked -p addon-repo -- measure debloater`.
 
+## System Profiles (host #92)
+
+`addons/system-profiles` builds `system-profiles.exe`, keeping ID `toolboks.system-profiles`, its
+single Gaming page and the built-in provider's behavior. The host's `src/native/profiles.rs` and
+its engine moved over with imports changed; the shared debloat engine is a pinned git dependency.
+
+**What works.** Reading the current value of every choice, the "Review current values" and
+"Review registry edits" previews, the guided Windows and NVIDIA settings list, opening the
+backup folder and the guided tour.
+
+**What does not work yet.** Applying a profile, turning on System Protection and restoring need
+administrator rights (a restore point, registry changes and a power plan). The built-in provider
+restarted the whole app as administrator; protocol 3 add-ons never run elevated. The Apply and
+Restore buttons are therefore off, with a plain note, until the administrator helper operations
+exist (host issue #142). Real UAC validation is still required.
+
+The built-in provider stays in the host until the final removal and "Restore your tools" step
+(host #94). Measure with `cargo run --locked -p addon-repo -- measure system-profiles`.
+

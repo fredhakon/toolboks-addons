@@ -244,6 +244,34 @@
       "release_notes": "Release system-profiles-v0.1.0.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.aural",
+      "title": "Audio Gainer",
+      "short_description": "Check your microphone level, hear yourself, and route your mic to other apps.",
+      "long_description": "Adjust microphone gain, watch live left and right levels, and monitor through headphones. Sending audio to another app uses a separately installed driver such as VB-Audio Virtual Cable. Aural includes setup instructions and a link to the official installer page.",
+      "publisher": "Toolboks",
+      "byline": "by aural",
+      "category": "Audio",
+      "icon": "mic",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "live_audio",
+        "local_preferences"
+      ],
+      "pages": [],
+      "background": true,
+      "kind": "native",
+      "version": "0.3.0",
+      "min_toolboks_version": "0.12.5",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/aural-v0.3.0/aural.exe",
+      "size": 3445248,
+      "sha256": "5d6d1495e3cfee1772b44c61ece63219282e5b4869148ac431939a2294b6331a",
+      "release_notes": "Release aural-v0.3.0.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

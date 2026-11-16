@@ -16,7 +16,7 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
 };
 
-use protected_processes::{protected_reason, Protected};
+use protected_processes::{protected_reason, Parent, Protected};
 use toolboks_shared::win::Handle;
 
 /// System and shell processes that are never trimmed. Compared case-insensitively.
@@ -63,11 +63,12 @@ impl SkipReason {
 }
 
 /// Why this process must not be trimmed, or `None` if it may be.
-/// `parent` is the parent's image name, if known. `exclusions` holds lowercase process names.
+/// `parent` is the parent the snapshot vouched for; an unverified one protects the process.
+/// `exclusions` holds lowercase process names.
 pub fn skip_reason(
     pid: u32,
     name: &str,
-    parent: Option<&str>,
+    parent: &Parent,
     own_pid: u32,
     exclusions: &HashSet<String>,
 ) -> Option<SkipReason> {
@@ -93,8 +94,8 @@ pub struct TrimTarget {
     /// tied to the snapshot, and then the process is never trimmed.
     pub created: Option<u64>,
     pub name: String,
-    /// Parent image name from the same snapshot.
-    pub parent: Option<String>,
+    /// Parent from the same snapshot (unverified when the snapshot could not vouch for it).
+    pub parent: Parent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,13 +175,7 @@ pub fn image_name(handle: &Handle) -> Option<String> {
 
 /// True when the live image name still matches the sampled one and still passes the gate,
 /// so a reused pid or a protected process never gets a write-capable handle. Pure.
-pub fn live_name_ok(
-    pid: u32,
-    sampled: &str,
-    live: &str,
-    parent: Option<&str>,
-    own_pid: u32,
-) -> bool {
+pub fn live_name_ok(pid: u32, sampled: &str, live: &str, parent: &Parent, own_pid: u32) -> bool {
     live.eq_ignore_ascii_case(sampled)
         && skip_reason(pid, live, parent, own_pid, &HashSet::new()).is_none()
 }
@@ -199,13 +194,7 @@ pub fn live_target_ok(
     target.created.is_some()
         && target.created == live_created
         && live_name.is_some_and(|live| {
-            live_name_ok(
-                target.pid,
-                &target.name,
-                live,
-                target.parent.as_deref(),
-                own_pid,
-            )
+            live_name_ok(target.pid, &target.name, live, &target.parent, own_pid)
         })
 }
 
@@ -265,22 +254,27 @@ mod tests {
         HashSet::new()
     }
 
+    /// A parent the snapshot vouched for that protects nothing.
+    fn ok_parent() -> Parent {
+        Parent::known("explorer.exe")
+    }
+
     #[test]
     fn protects_system_and_shell_processes_case_insensitively() {
         assert_eq!(
-            skip_reason(4, "System", None, 999, &none()),
+            skip_reason(4, "System", &ok_parent(), 999, &none()),
             Some(SkipReason::System)
         );
         assert_eq!(
-            skip_reason(500, "CSRSS.exe", None, 999, &none()),
+            skip_reason(500, "CSRSS.exe", &ok_parent(), 999, &none()),
             Some(SkipReason::System)
         );
         assert_eq!(
-            skip_reason(600, "Explorer.EXE", None, 999, &none()),
+            skip_reason(600, "Explorer.EXE", &ok_parent(), 999, &none()),
             Some(SkipReason::System)
         );
         assert_eq!(
-            skip_reason(0, "anything", None, 999, &none()),
+            skip_reason(0, "anything", &ok_parent(), 999, &none()),
             Some(SkipReason::System)
         );
     }
@@ -289,7 +283,7 @@ mod tests {
     fn own_pid_is_skipped_even_if_excluded() {
         let ex: HashSet<String> = ["toolboks.exe".to_string()].into();
         assert_eq!(
-            skip_reason(77, "toolboks.exe", None, 77, &ex),
+            skip_reason(77, "toolboks.exe", &ok_parent(), 77, &ex),
             Some(SkipReason::Own)
         );
     }
@@ -298,55 +292,103 @@ mod tests {
     fn honours_exclusions_by_lowercase_name() {
         let ex: HashSet<String> = ["chrome.exe".to_string()].into();
         assert_eq!(
-            skip_reason(10, "Chrome.exe", None, 999, &ex),
+            skip_reason(10, "Chrome.exe", &ok_parent(), 999, &ex),
             Some(SkipReason::Excluded)
         );
-        assert_eq!(skip_reason(11, "firefox.exe", None, 999, &ex), None);
+        assert_eq!(skip_reason(11, "firefox.exe", &ok_parent(), 999, &ex), None);
     }
 
     #[test]
     fn game_and_anti_cheat_processes_are_protected_even_when_excluded() {
         let ex: HashSet<String> = ["cs2.exe".to_string()].into();
         assert_eq!(
-            skip_reason(20, "CS2.exe", None, 999, &ex),
+            skip_reason(20, "CS2.exe", &ok_parent(), 999, &ex),
             Some(SkipReason::Protected(Protected::KnownGame))
         );
-        let reason = skip_reason(21, "EasyAntiCheat.exe", None, 999, &none());
+        let reason = skip_reason(21, "EasyAntiCheat.exe", &ok_parent(), 999, &none());
         assert_eq!(reason, Some(SkipReason::Protected(Protected::AntiCheat)));
         assert_eq!(
             reason.unwrap().describe(),
             "Protected: anti-cheat process, Toolboks leaves it alone."
         );
-        assert_eq!(skip_reason(22, "chrome.exe", None, 999, &none()), None);
+        assert_eq!(
+            skip_reason(22, "chrome.exe", &ok_parent(), 999, &none()),
+            None
+        );
+    }
+
+    #[test]
+    fn manual_trim_gate_protects_children_of_an_unverified_parent() {
+        assert_eq!(
+            skip_reason(32, "notepad.exe", &Parent::Unverified, 999, &none()),
+            Some(SkipReason::Protected(Protected::UnverifiedParent))
+        );
+        assert!(!live_name_ok(
+            33,
+            "notepad.exe",
+            "notepad.exe",
+            &Parent::Unverified,
+            999
+        ));
     }
 
     #[test]
     fn manual_trim_gate_protects_children_of_launchers() {
         assert_eq!(
-            skip_reason(30, "IndieGame.exe", Some("steam.exe"), 999, &none()),
+            skip_reason(
+                30,
+                "IndieGame.exe",
+                &Parent::known("steam.exe"),
+                999,
+                &none()
+            ),
             Some(SkipReason::Protected(Protected::ChildOfLauncher))
         );
         assert_eq!(
-            skip_reason(31, "notepad.exe", Some("explorer.exe"), 999, &none()),
+            skip_reason(
+                31,
+                "notepad.exe",
+                &Parent::known("explorer.exe"),
+                999,
+                &none()
+            ),
             None
         );
     }
 
     #[test]
     fn live_name_gate_rejects_changed_or_protected_names() {
-        assert!(live_name_ok(40, "Chrome.exe", "chrome.exe", None, 999));
+        assert!(live_name_ok(
+            40,
+            "Chrome.exe",
+            "chrome.exe",
+            &ok_parent(),
+            999
+        ));
         // The pid now belongs to another program.
-        assert!(!live_name_ok(40, "chrome.exe", "cs2.exe", None, 999));
-        assert!(!live_name_ok(40, "chrome.exe", "notepad.exe", None, 999));
+        assert!(!live_name_ok(
+            40,
+            "chrome.exe",
+            "cs2.exe",
+            &ok_parent(),
+            999
+        ));
+        assert!(!live_name_ok(
+            40,
+            "chrome.exe",
+            "notepad.exe",
+            &ok_parent(),
+            999
+        ));
         // Same name, but now protected through its launcher parent.
         assert!(!live_name_ok(
             40,
             "game.exe",
             "game.exe",
-            Some("EpicGamesLauncher.exe"),
+            &Parent::known("EpicGamesLauncher.exe"),
             999
         ));
-        assert!(!live_name_ok(40, "vgc.exe", "vgc.exe", None, 999));
+        assert!(!live_name_ok(40, "vgc.exe", "vgc.exe", &ok_parent(), 999));
     }
 
     fn target(pid: u32, created: Option<u64>, name: &str, parent: Option<&str>) -> TrimTarget {
@@ -354,7 +396,7 @@ mod tests {
             pid,
             created,
             name: name.to_string(),
-            parent: parent.map(str::to_string),
+            parent: parent.map_or(Parent::Unverified, Parent::known),
         }
     }
 
@@ -368,13 +410,16 @@ mod tests {
         assert!(!live_target_ok(&plain, Some(8), Some("notepad.exe"), 999));
         // Creation time unknown on either side: refused.
         assert!(!live_target_ok(&plain, None, Some("notepad.exe"), 999));
-        let unknown = target(50, None, "notepad.exe", None);
+        let unknown = target(50, None, "notepad.exe", Some("explorer.exe"));
         assert!(!live_target_ok(&unknown, None, Some("notepad.exe"), 999));
         // No live name: refused.
         assert!(!live_target_ok(&plain, Some(7), None, 999));
         // Started by a listed launcher: refused even when nothing else changed.
         let child = target(51, Some(7), "IndieGame.exe", Some("steam.exe"));
         assert!(!live_target_ok(&child, Some(7), Some("IndieGame.exe"), 999));
+        // A parent the snapshot could not vouch for (exited, or its pid reused): refused.
+        let orphan = target(53, Some(7), "notepad.exe", None);
+        assert!(!live_target_ok(&orphan, Some(7), Some("notepad.exe"), 999));
         // A listed game under an unlisted parent: refused.
         let game = target(52, Some(7), "cs2.exe", Some("explorer.exe"));
         assert!(!live_target_ok(&game, Some(7), Some("cs2.exe"), 999));
@@ -431,7 +476,12 @@ mod tests {
             .spawn()
             .expect("spawn child");
         let created = child_created(&child);
-        let stale = target(child.id(), created.map(|c| c - 1), "cmd.exe", None);
+        let stale = target(
+            child.id(),
+            created.map(|c| c - 1),
+            "cmd.exe",
+            Some("explorer.exe"),
+        );
         let result = trim_process(&stale);
         let _ = child.kill();
         let _ = child.wait();
@@ -445,7 +495,12 @@ mod tests {
             .args(["/C", "ping -n 6 127.0.0.1 > nul"])
             .spawn()
             .expect("spawn child");
-        let own = target(child.id(), child_created(&child), "cmd.exe", None);
+        let own = target(
+            child.id(),
+            child_created(&child),
+            "cmd.exe",
+            Some("explorer.exe"),
+        );
         let result = trim_process(&own);
         let _ = child.kill();
         let _ = child.wait();

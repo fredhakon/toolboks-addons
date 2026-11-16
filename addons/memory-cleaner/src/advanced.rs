@@ -271,7 +271,7 @@ impl Memory {
                     let key = row_key(grouped, p);
                     let is_selected = selection.contains(&key);
                     row.set_selected(is_selected);
-                    let reason = skip_reason(p.pid, &p.name, p.parent.as_deref(), own_pid, exclusions);
+                    let reason = skip_reason(p.pid, &p.name, &p.parent, own_pid, exclusions);
                     row.col(|ui| {
                         let mut on = is_selected;
                         if ui.checkbox(&mut on, "").changed() {
@@ -434,13 +434,7 @@ impl Memory {
             private += p.private;
             first.get_or_insert(p);
             if !matches!(
-                skip_reason(
-                    p.pid,
-                    &p.name,
-                    p.parent.as_deref(),
-                    own_pid,
-                    &self.exclusions
-                ),
+                skip_reason(p.pid, &p.name, &p.parent, own_pid, &self.exclusions),
                 Some(SkipReason::System | SkipReason::Own | SkipReason::Protected(_))
             ) {
                 names.insert(p.name.to_lowercase());
@@ -475,7 +469,7 @@ impl Memory {
                 skip_reason(
                     first.pid,
                     &first.name,
-                    first.parent.as_deref(),
+                    &first.parent,
                     own_pid,
                     &self.exclusions,
                 )
@@ -643,7 +637,7 @@ impl Memory {
                 failed: 0,
             };
             for target in &plan.targets {
-                let parent = target.parent.as_deref();
+                let parent = &target.parent;
                 if skip_reason(target.pid, &target.name, parent, own_pid, &exclusions).is_some() {
                     result.skipped += 1;
                     continue;

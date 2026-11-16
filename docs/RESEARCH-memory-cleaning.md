@@ -51,9 +51,10 @@ runs the priority step alone exists (follow-up, not part of this issue). The scr
 launchers and anti-cheat, protected and excluded apps are skipped; an app must have had no input
 for 60 s and hold at least 100 MB; an app trimmed by the user in the last 10 minutes is skipped.
 The Advanced page's **Trim selected** is different: it trims exactly the processes the user
-selected and checks only `skip_reason` (the app itself, protected and excluded apps). It does not
-check foreground, idle time, audio or launchers. It is a different action and is not part of
-this benchmark.
+selected and checks only `skip_reason` (the app itself, system, game, launcher and anti-cheat
+processes, a launcher's child, a process whose parent cannot be checked, and excluded apps). It
+does not check foreground, idle time or audio. It is a different action and is not part of this
+benchmark.
 
 ## Metrics
 

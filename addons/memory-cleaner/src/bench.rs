@@ -24,6 +24,7 @@ use crate::actions::{
     self, Candidate, Cooldowns, Identity, Policy, ProcessOps, UndoLog, WindowsOps,
 };
 use crate::engine::RunSummary;
+use protected_processes::Parent;
 
 const MB: usize = 1024 * 1024;
 const PAGE: usize = 4096;
@@ -66,6 +67,18 @@ fn write_file(path: &Path, text: &str) {
     fs::rename(&tmp, path).expect("rename temp file");
 }
 
+/// Identity of one benchmark child, with its live creation time. The benchmark started the child
+/// itself (the script runs it through cargo), so its parent is vouched for here and is not a
+/// launcher; the run still goes through every other check and both write gates.
+fn bench_identity(pid: u32, image: &str) -> Option<Identity> {
+    Some(Identity {
+        pid,
+        created: actions::live_created(pid)?,
+        name: image.to_string(),
+        parent: Parent::known("cargo.exe"),
+    })
+}
+
 #[test]
 #[ignore = "benchmark helper: started by scripts/bench-memory-driven.ps1"]
 fn bench_child_workload() {
@@ -77,7 +90,7 @@ fn bench_child_workload() {
     for at in (0..buf.len()).step_by(PAGE) {
         buf[at] = 1;
     }
-    let me = actions::identity_of(pid, &image_name()).expect("own identity");
+    let me = bench_identity(pid, &image_name()).expect("own identity");
     write_file(
         &dir.join(format!("child-{pid}.ready")),
         &format!("{pid} {mb}"),
@@ -126,14 +139,13 @@ fn bench_trim_action() {
             .split_whitespace()
             .map(|p| p.parse::<u64>().unwrap_or(0));
         let (pid, mb) = (parts.next().unwrap_or(0) as u32, parts.next().unwrap_or(0));
-        if let Some(identity) = actions::identity_of(pid, &image) {
+        if let Some(identity) = bench_identity(pid, &image) {
             candidates.push(Candidate {
                 identity,
                 working_set: mb * MB as u64,
                 idle_for: Some(idle),
                 plays_audio: false,
                 is_fullscreen: false,
-                parent_name: None,
             });
         }
     }

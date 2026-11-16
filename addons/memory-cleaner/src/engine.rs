@@ -5,7 +5,6 @@
 //! The decisions are in `pressure`, `scheduler`, `growth`, `actions` and `report`. This file only
 //! feeds them and applies their answers. The pure helpers here are unit-tested.
 
-use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -74,6 +73,7 @@ fn working_set_comparison_excludes_exited_and_reused_pids() {
         pid,
         created,
         name: "app.exe".into(),
+        parent: protected_processes::Parent::known("explorer.exe"),
     };
     let before = WorkingSets::from([(app(1, 10), 800), (app(2, 20), 600), (app(3, 30), 100)]);
     let after = WorkingSets::from([(app(2, 99), 300), (app(3, 30), 50)]);
@@ -93,6 +93,9 @@ pub struct RunSummary {
 
 /// Said when a run found nothing to act on.
 pub const NOTHING_TO_TRIM: &str = "Nothing to trim right now. Your idle apps are already small.";
+/// Said when the audio sessions could not be read, so every app was left alone.
+pub const AUDIO_UNKNOWN: &str =
+    "Could not check which apps are playing sound, so nothing was changed. Try again.";
 
 fn apps(n: usize) -> String {
     format!("{n} {}", if n == 1 { "app" } else { "apps" })
@@ -201,7 +204,6 @@ impl Settling {
 /// Everything the candidate list needs from the outside world.
 pub struct Inputs<'a> {
     pub procs: &'a [ProcInfo],
-    pub parents: &'a HashMap<u32, u32>,
     pub activity: &'a Activity,
     pub now_ms: u64,
     pub foreground_pid: Option<u32>,
@@ -213,8 +215,9 @@ pub struct Inputs<'a> {
 
 /// One candidate per process that is big enough and was identified by the snapshot. The
 /// identity's creation time is the one the snapshot recorded, never one read later: the parent
-/// name below comes from the same snapshot, and a later read could pair it with a new process
-/// that reused the pid. Every action checks this creation time before it opens the process.
+/// in the identity comes from the same snapshot, and a later read could pair it with a new
+/// process that reused the pid. Every action checks this creation time before it opens the
+/// process.
 pub fn candidates(inp: &Inputs, plays_audio: &dyn Fn(u32) -> bool) -> Vec<Candidate> {
     let name_of = |pid: u32| inp.procs.iter().find(|p| p.pid == pid).map(|p| &p.name);
     let foreground_name = inp.foreground_pid.and_then(name_of);
@@ -226,6 +229,7 @@ pub fn candidates(inp: &Inputs, plays_audio: &dyn Fn(u32) -> bool) -> Vec<Candid
                 pid: p.pid,
                 created: p.created?,
                 name: p.name.clone(),
+                parent: p.parent.clone(),
             };
             let in_front_app = foreground_name.is_some_and(|f| f.eq_ignore_ascii_case(&p.name));
             Some(Candidate {
@@ -239,11 +243,6 @@ pub fn candidates(inp: &Inputs, plays_audio: &dyn Fn(u32) -> bool) -> Vec<Candid
                 ),
                 plays_audio: plays_audio(p.pid),
                 is_fullscreen: inp.fullscreen && in_front_app,
-                parent_name: inp
-                    .parents
-                    .get(&p.pid)
-                    .and_then(|parent| name_of(*parent))
-                    .cloned(),
             })
         })
         .collect()
@@ -399,7 +398,6 @@ impl Memory {
         self.cooldowns.prune(now, actions::AUTO_COOLDOWN);
         let inputs = Inputs {
             procs: &sampler.processes,
-            parents: &sampler.parents,
             activity: &self.activity,
             now_ms: self.now_ms(),
             foreground_pid: policy.foreground_pid,
@@ -407,12 +405,19 @@ impl Memory {
             system_idle: activity::system_idle(),
             min_bytes: policy.min_priority_bytes,
         };
-        let cands = candidates(&inputs, &actions::plays_audio);
+        // Read with this snapshot on the sampling thread; unknown means every app may play.
+        let playing = sampler.audio.playing(&sampler.processes);
+        let cands = candidates(&inputs, &|pid| playing.contains(&pid));
         let plan = actions::plan(&cands, &policy, &self.cooldowns, now);
 
         if plan.is_empty() {
-            self.last_run = Some(RunSummary::default());
-            self.status = None;
+            if sampler.audio.is_unknown() {
+                self.last_run = None;
+                self.status = Some(AUDIO_UNKNOWN.to_string());
+            } else {
+                self.last_run = Some(RunSummary::default());
+                self.status = None;
+            }
             return true;
         }
         let trim_processes: Vec<Identity> = plan
@@ -565,9 +570,13 @@ impl Memory {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::cell::RefCell;
+    use std::collections::{HashMap, VecDeque};
+
+    use protected_processes::Parent;
 
     use super::*;
+    use crate::audio::{AudioState, Session, SessionSource, SessionsUnavailable};
 
     const MB: u64 = 1024 * 1024;
 
@@ -578,9 +587,17 @@ mod tests {
             working_set: mb * MB,
             private: 0,
             count: 1,
-            parent: None,
+            parent: Parent::known("explorer.exe"),
+            parent_pid: None,
             created: Some(1000 + u64::from(pid)),
         }
+    }
+
+    /// `child` as started by `parent`, both as the snapshot saw them.
+    fn started_by(mut child: ProcInfo, parent: &ProcInfo) -> ProcInfo {
+        child.parent = Parent::Known(parent.name.clone());
+        child.parent_pid = Some(parent.pid);
+        child
     }
 
     fn reading(zero_free: u64, standby: u64, ws: u64) -> RunMeasurement {
@@ -658,19 +675,18 @@ mod tests {
         let mut hidden = proc(5, "hidden.exe", 100);
         // The snapshot could not tie it to a creation time (other user, or a reused pid).
         hidden.created = None;
+        let slack = proc(2, "slack.exe", 300);
         let procs = vec![
             proc(1, "chrome.exe", 800),
-            proc(2, "slack.exe", 300),
+            slack.clone(),
             proc(3, "tiny.exe", 10),
-            proc(4, "child.exe", 200),
+            started_by(proc(4, "child.exe", 200), &slack),
             hidden,
         ];
-        let parents: HashMap<u32, u32> = [(4, 2)].into();
         let mut activity = Activity::new(0);
         activity.note_foreground(100_000, Some("slack.exe"));
         let inp = Inputs {
             procs: &procs,
-            parents: &parents,
             activity: &activity,
             now_ms: 700_000,
             foreground_pid: Some(1),
@@ -692,20 +708,60 @@ mod tests {
         assert!(!slack.is_fullscreen);
         assert!(slack.plays_audio);
         assert_eq!(slack.idle_for, Some(Duration::from_secs(600)));
-        assert_eq!(cands[2].parent_name.as_deref(), Some("slack.exe"));
+        assert_eq!(cands[2].identity.parent, Parent::known("slack.exe"));
+    }
+
+    /// The processes as they are now, after the snapshot: pid -> (creation time, name). Every
+    /// action is checked against it like `WindowsOps` checks the real process.
+    #[derive(Default)]
+    struct LiveWorld {
+        procs: HashMap<u32, (u64, String)>,
+        writes: RefCell<Vec<u32>>,
+    }
+
+    impl LiveWorld {
+        fn verify(&self, id: &Identity) -> Result<(), actions::ActionError> {
+            match self.procs.get(&id.pid) {
+                Some((created, name)) if *created == id.created && name == &id.name => Ok(()),
+                _ => Err(actions::ActionError::IdentityChanged),
+            }
+        }
+    }
+
+    impl actions::ProcessOps for LiveWorld {
+        fn memory_priority(&self, id: &Identity) -> Result<u32, actions::ActionError> {
+            self.verify(id).map(|()| 5)
+        }
+        fn set_memory_priority(&self, id: &Identity, _: u32) -> Result<(), actions::ActionError> {
+            self.verify(id)?;
+            self.writes.borrow_mut().push(id.pid);
+            Ok(())
+        }
+        fn trim(&self, id: &Identity) -> Result<crate::trim::Trimmed, actions::ActionError> {
+            self.verify(id)?;
+            self.writes.borrow_mut().push(id.pid);
+            Ok(crate::trim::Trimmed {
+                before: 10,
+                after: 1,
+            })
+        }
     }
 
     #[test]
     fn a_launchers_child_from_the_snapshot_is_never_planned() {
         let launcher = proc(10, "steam.exe", 300);
-        let game = proc(11, "IndieGame.exe", 900);
+        // Started by Steam: never planned.
+        let game = started_by(proc(11, "IndieGame.exe", 900), &launcher);
         let app = proc(12, "notepad.exe", 900);
-        let procs = vec![launcher, game, app];
-        let parents: HashMap<u32, u32> = [(11, 10), (12, 99)].into();
+        // The snapshot saw an ordinary game.exe under Explorer at pid 13...
+        let old = proc(13, "game.exe", 900);
+        // ...and an app whose parent it could not vouch for (exited, or its pid reused).
+        let mut orphan = proc(14, "orphan.exe", 900);
+        orphan.parent = Parent::Unverified;
+        let procs = vec![launcher, game, app.clone(), old, orphan];
         let activity = Activity::new(0);
         let inp = Inputs {
             procs: &procs,
-            parents: &parents,
             activity: &activity,
             now_ms: 3_600_000,
             foreground_pid: None,
@@ -720,8 +776,109 @@ mod tests {
             &Cooldowns::new(),
             Instant::now(),
         );
-        assert!(plan.iter().all(|a| a.identity.pid == 12), "{plan:?}");
-        assert!(plan.iter().any(|a| a.identity.pid == 12), "{plan:?}");
+        let planned: std::collections::BTreeSet<u32> =
+            plan.iter().map(|a| a.identity.pid).collect();
+        assert_eq!(planned, [12, 13].into(), "{plan:?}");
+
+        // Before the run starts, that game.exe exits and Steam starts another game.exe that
+        // gets pid 13. The plan still names the process the snapshot saw (its creation time
+        // and Explorer parent), so the new one, a launcher's child, is never written to.
+        let world = LiveWorld {
+            procs: [
+                (12, (app.created.unwrap(), app.name.clone())),
+                (13, (5_000, "game.exe".to_string())),
+            ]
+            .into(),
+            ..LiveWorld::default()
+        };
+        let results = actions::run(
+            &plan,
+            &world,
+            &mut UndoLog::new(),
+            &mut Cooldowns::new(),
+            Instant::now(),
+        );
+        assert!(!world.writes.borrow().contains(&13), "{results:?}");
+        assert!(results
+            .iter()
+            .filter(|r| r.identity.pid == 13)
+            .all(|r| r.error == Some(actions::ActionError::IdentityChanged)));
+        // The unchanged app is still acted on (priority, then trim).
+        assert_eq!(*world.writes.borrow(), vec![12, 12]);
+    }
+
+    struct Sessions(Result<Vec<Session>, SessionsUnavailable>);
+
+    impl SessionSource for Sessions {
+        fn sessions(&self) -> Result<Vec<Session>, SessionsUnavailable> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn apps_that_play_sound_are_skipped_and_unknown_audio_skips_every_app() {
+        let music = proc(20, "music.exe", 900);
+        let helper = started_by(proc(21, "musichelper.exe", 900), &music);
+        let other = proc(22, "notepad.exe", 900);
+        let procs = vec![music, helper, other];
+        let activity = Activity::new(0);
+        let inp = Inputs {
+            procs: &procs,
+            activity: &activity,
+            now_ms: 3_600_000,
+            foreground_pid: None,
+            fullscreen: false,
+            system_idle: None,
+            min_bytes: 0,
+        };
+        let policy = policy_for(Trigger::Pressure, 1, None);
+        let plan_for = |audio: AudioState| {
+            let playing = audio.playing(&procs);
+            let cands = candidates(&inp, &|pid| playing.contains(&pid));
+            let skips: Vec<_> = cands
+                .iter()
+                .map(|c| {
+                    actions::check_eligibility(
+                        c,
+                        Kind::Trim,
+                        &policy,
+                        &Cooldowns::new(),
+                        Instant::now(),
+                    )
+                })
+                .collect();
+            (
+                skips,
+                actions::plan(&cands, &policy, &Cooldowns::new(), Instant::now()),
+            )
+        };
+
+        let active = AudioState::read(&Sessions(Ok(vec![Session {
+            pid: 20,
+            active: true,
+        }])));
+        let (skips, plan) = plan_for(active);
+        assert_eq!(
+            skips,
+            vec![
+                Err(actions::Skip::PlaysAudio),
+                Err(actions::Skip::PlaysAudio),
+                Ok(())
+            ]
+        );
+        assert!(plan.iter().all(|a| a.identity.pid == 22), "{plan:?}");
+
+        let inactive = AudioState::read(&Sessions(Ok(vec![Session {
+            pid: 20,
+            active: false,
+        }])));
+        let (skips, _) = plan_for(inactive);
+        assert!(skips.iter().all(Result::is_ok), "{skips:?}");
+
+        let failed = AudioState::read(&Sessions(Err(SessionsUnavailable)));
+        let (skips, plan) = plan_for(failed);
+        assert!(skips.iter().all(|s| *s == Err(actions::Skip::PlaysAudio)));
+        assert!(plan.is_empty(), "{plan:?}");
     }
 
     #[test]
@@ -760,12 +917,10 @@ mod tests {
     #[test]
     fn a_manual_run_finds_apps_the_automatic_one_skips() {
         let procs = vec![proc(1, "idle.exe", 150), proc(2, "small.exe", 40)];
-        let parents = HashMap::new();
         let activity = Activity::new(0);
         // Both apps were last in front when the tool started: idle for 90 s.
         let inputs = |min_bytes| Inputs {
             procs: &procs,
-            parents: &parents,
             activity: &activity,
             now_ms: 90_000,
             foreground_pid: None,
@@ -795,6 +950,7 @@ mod tests {
             pid: 1,
             created: 1,
             name: "a.exe".into(),
+            parent: Parent::known("explorer.exe"),
         };
         let mk = |kind, error| ActionResult {
             identity: id.clone(),

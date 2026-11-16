@@ -151,7 +151,8 @@ pub struct TrimPlan {
     pub targets: Vec<TrimTarget>,
     /// Number of selected rows that contribute at least one target.
     pub groups: usize,
-    /// Selected processes that are protected (system, own, excluded).
+    /// Selected processes that are protected (system, own, excluded, games and launcher
+    /// children) or that the snapshot could not tie to a creation time.
     pub skipped: usize,
 }
 
@@ -170,7 +171,11 @@ pub fn plan_trim(
         if !selected.contains(&key) {
             continue;
         }
-        if skip_reason(p.pid, &p.name, p.parent.as_deref(), own_pid, exclusions).is_some() {
+        // A process without a snapshot creation time is never trimmed (`trim_process` refuses
+        // it), so it is not counted as a target either.
+        if p.created.is_none()
+            || skip_reason(p.pid, &p.name, &p.parent, own_pid, exclusions).is_some()
+        {
             skipped += 1;
         } else {
             targets.push(TrimTarget {
@@ -209,6 +214,7 @@ pub fn trim_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protected_processes::Parent;
 
     fn lists(free: u64, modified: u64, standby: u64) -> Lists {
         Lists {
@@ -225,7 +231,8 @@ mod tests {
             working_set: 10,
             private: 10,
             count: 1,
-            parent: None,
+            parent: Parent::known("explorer.exe"),
+            parent_pid: None,
             created: Some(u64::from(pid)),
         }
     }
@@ -343,8 +350,27 @@ mod tests {
                 pid: 101,
                 created: Some(101),
                 name: "app.exe".to_string(),
-                parent: None,
+                parent: Parent::known("explorer.exe"),
             }]
+        );
+        assert_eq!(plan.groups, 1);
+    }
+
+    #[test]
+    fn plan_skips_processes_the_snapshot_could_not_vouch_for() {
+        let mut unknown = proc(300, "app.exe");
+        unknown.created = None;
+        let mut orphan = proc(301, "app.exe");
+        orphan.parent = Parent::Unverified;
+        let plain = proc(302, "app.exe");
+        let sel: HashSet<String> = ["app.exe".to_string()].into();
+        let plan = plan_trim(&[unknown, orphan, plain], &sel, true, 1, &HashSet::new());
+        // No creation time: `trim_process` would refuse it, so it is not counted as a target.
+        // An unverified parent: protected.
+        assert_eq!(plan.skipped, 2);
+        assert_eq!(
+            plan.targets.iter().map(|t| t.pid).collect::<Vec<_>>(),
+            vec![302]
         );
         assert_eq!(plan.groups, 1);
     }
@@ -352,9 +378,9 @@ mod tests {
     #[test]
     fn plan_carries_the_snapshot_identity_and_skips_launcher_children() {
         let mut game = proc(200, "IndieGame.exe");
-        game.parent = Some("steam.exe".to_string());
+        game.parent = Parent::known("steam.exe");
         let mut app = proc(201, "app.exe");
-        app.parent = Some("explorer.exe".to_string());
+        app.parent = Parent::known("explorer.exe");
         app.created = Some(77);
         let sel: HashSet<String> = ["pid:200", "pid:201"]
             .iter()
@@ -368,7 +394,7 @@ mod tests {
                 pid: 201,
                 created: Some(77),
                 name: "app.exe".to_string(),
-                parent: Some("explorer.exe".to_string()),
+                parent: Parent::known("explorer.exe"),
             }]
         );
     }

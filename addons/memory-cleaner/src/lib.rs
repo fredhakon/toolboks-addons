@@ -2,6 +2,7 @@ mod actions;
 mod activity;
 mod admin;
 mod advanced;
+mod audio;
 #[cfg(test)]
 mod bench;
 mod commit;
@@ -209,7 +210,7 @@ impl Memory {
             return false;
         }
         if self.refresh_worker.is_none() {
-            let (request, requests) = mpsc::channel();
+            let (request, requests) = mpsc::channel::<Option<RefreshAction>>();
             let (result, results) = mpsc::channel();
             let ctx = ctx.clone();
             let thread = std::thread::Builder::new()
@@ -220,7 +221,14 @@ impl Memory {
                         if sampler.is_none() {
                             sampler = Sampler::new();
                         }
-                        let snapshot = sampler.as_mut().map(Sampler::refresh);
+                        let mut snapshot = sampler.as_mut().map(Sampler::refresh);
+                        // A run needs to know which apps play sound. Read here, on this
+                        // thread, so the UI never waits for the audio service.
+                        if let (Some(snapshot), Some(RefreshAction::Optimize(_))) =
+                            (snapshot.as_mut(), action.as_ref())
+                        {
+                            snapshot.audio = audio::AudioState::read(&audio::WindowsSessions);
+                        }
                         if result.send((snapshot, action)).is_err() {
                             break;
                         }

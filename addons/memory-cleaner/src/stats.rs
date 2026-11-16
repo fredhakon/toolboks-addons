@@ -1,6 +1,9 @@
 //! Memory and process sampling. No UI here, so the logic stays testable.
 
+use protected_processes::Parent;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+use super::audio::AudioState;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcInfo {
@@ -12,8 +15,12 @@ pub struct ProcInfo {
     pub private: u64,
     /// 1 for a single process; the number of processes in a grouped row.
     pub count: usize,
-    /// Image name of the parent process, if known (to protect children of game launchers).
-    pub parent: Option<String>,
+    /// The parent this snapshot vouched for (to protect children of game launchers). A parent
+    /// that has exited, whose pid was reused, or whose creation time could not be read is
+    /// [`Parent::Unverified`], and the process is then protected.
+    pub parent: Parent,
+    /// Pid of the parent, only when `parent` is known.
+    pub parent_pid: Option<u32>,
     /// Creation time (FILETIME) of the process this snapshot saw, or `None` when it could not
     /// be read or the pid may have been reused while the snapshot was taken. Actions open a
     /// process only when its live creation time equals this, so the parent and name above
@@ -69,8 +76,29 @@ pub struct Sampler {
 pub struct Snapshot {
     pub totals: Totals,
     pub processes: Vec<ProcInfo>,
-    /// Parent pid of each process, where known.
-    pub parents: std::collections::HashMap<u32, u32>,
+    /// Audio sessions read with this snapshot for a run; [`AudioState::Unknown`] otherwise.
+    pub audio: AudioState,
+}
+
+/// Fills in each process's parent from the same snapshot. `parent_pids[i]` is the parent pid
+/// the snapshot reported for `procs[i]`. A parent is known only when it is in the snapshot and
+/// was created before the child ([`Parent::vouch`]); otherwise it stays unverified. Pure.
+pub fn link_parents(procs: &mut [ProcInfo], parent_pids: &[Option<u32>]) {
+    let seen: std::collections::HashMap<u32, (String, Option<u64>)> = procs
+        .iter()
+        .map(|p| (p.pid, (p.name.clone(), p.created)))
+        .collect();
+    for (p, ppid) in procs.iter_mut().zip(parent_pids) {
+        let found = ppid.and_then(|ppid| seen.get(&ppid).map(|parent| (ppid, parent)));
+        p.parent = Parent::vouch(
+            p.created,
+            found.map(|(_, (name, created))| (name.as_str(), *created)),
+        );
+        p.parent_pid = match p.parent {
+            Parent::Known(_) => found.map(|(ppid, _)| ppid),
+            Parent::Unverified => None,
+        };
+    }
 }
 
 impl Sampler {
@@ -95,37 +123,33 @@ impl Sampler {
             true,
             ProcessRefreshKind::nothing().with_memory(),
         );
-        let processes = self
+        let (mut processes, parent_pids): (Vec<ProcInfo>, Vec<Option<u32>>) = self
             .sys
             .processes()
             .values()
-            .map(|p| ProcInfo {
-                pid: p.pid().as_u32(),
-                name: p.name().to_string_lossy().into_owned(),
-                working_set: p.memory(),
-                private: p.virtual_memory(),
-                count: 1,
-                parent: p
-                    .parent()
-                    .and_then(|pp| self.sys.process(pp))
-                    .map(|pp| pp.name().to_string_lossy().into_owned()),
-                created: super::trim::snapshot_created(
-                    p.pid().as_u32(),
-                    p.start_time(),
-                    sample_start,
-                ),
+            .map(|p| {
+                let info = ProcInfo {
+                    pid: p.pid().as_u32(),
+                    name: p.name().to_string_lossy().into_owned(),
+                    working_set: p.memory(),
+                    private: p.virtual_memory(),
+                    count: 1,
+                    parent: Parent::Unverified,
+                    parent_pid: None,
+                    created: super::trim::snapshot_created(
+                        p.pid().as_u32(),
+                        p.start_time(),
+                        sample_start,
+                    ),
+                };
+                (info, p.parent().map(|pp| pp.as_u32()))
             })
-            .collect();
-        let parents = self
-            .sys
-            .processes()
-            .values()
-            .filter_map(|p| Some((p.pid().as_u32(), p.parent()?.as_u32())))
-            .collect();
+            .unzip();
+        link_parents(&mut processes, &parent_pids);
         Snapshot {
             totals,
             processes,
-            parents,
+            audio: AudioState::Unknown,
         }
     }
 }
@@ -192,9 +216,49 @@ mod tests {
             working_set,
             private,
             count: 1,
-            parent: None,
+            parent: Parent::Unverified,
+            parent_pid: None,
             created: None,
         }
+    }
+
+    /// A process the snapshot tied to creation time `created`.
+    fn born(pid: u32, name: &str, created: u64) -> ProcInfo {
+        ProcInfo {
+            created: Some(created),
+            ..proc(pid, name, 0, 0)
+        }
+    }
+
+    #[test]
+    fn a_parent_older_than_its_child_is_known() {
+        let mut procs = vec![born(10, "steam.exe", 100), born(11, "IndieGame.exe", 200)];
+        link_parents(&mut procs, &[None, Some(10)]);
+        assert_eq!(procs[1].parent, Parent::known("steam.exe"));
+        assert_eq!(procs[1].parent_pid, Some(10));
+        // No parent pid at all: nothing vouches for it.
+        assert_eq!(procs[0].parent, Parent::Unverified);
+    }
+
+    #[test]
+    fn a_reused_parent_pid_is_unverified() {
+        // Steam (pid 10) started the game and exited; notepad then got pid 10.
+        let mut procs = vec![born(10, "notepad.exe", 300), born(11, "IndieGame.exe", 200)];
+        link_parents(&mut procs, &[None, Some(10)]);
+        assert_eq!(procs[1].parent, Parent::Unverified);
+        assert_eq!(procs[1].parent_pid, None);
+    }
+
+    #[test]
+    fn an_exited_or_unreadable_parent_is_unverified() {
+        // The launcher exited and nothing holds its pid.
+        let mut procs = vec![born(11, "IndieGame.exe", 200)];
+        link_parents(&mut procs, &[Some(10)]);
+        assert_eq!(procs[0].parent, Parent::Unverified);
+        // The parent's creation time could not be read (other user, or born mid-snapshot).
+        let mut procs = vec![proc(10, "steam.exe", 0, 0), born(11, "IndieGame.exe", 200)];
+        link_parents(&mut procs, &[None, Some(10)]);
+        assert_eq!(procs[1].parent, Parent::Unverified);
     }
 
     #[test]

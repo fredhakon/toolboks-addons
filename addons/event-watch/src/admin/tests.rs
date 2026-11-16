@@ -38,8 +38,12 @@ struct State {
     xml: &'static [u8],
     analyze_fails: bool,
     remove_fails: bool,
-    /// Replaces the answer of `logman query`.
+    /// Replaces the answer of `logman query` (every call).
     query: Option<Run>,
+    /// One-off answers of `logman query`, used before anything else, in order.
+    queries: VecDeque<Run>,
+    /// Something else ends the session during a 1-second retry wait.
+    end_on_retry_wait: bool,
 }
 
 impl Default for State {
@@ -64,6 +68,8 @@ impl Default for State {
             analyze_fails: false,
             remove_fails: false,
             query: None,
+            queries: VecDeque::new(),
+            end_on_retry_wait: false,
         }
     }
 }
@@ -187,6 +193,9 @@ impl TraceSystem for Fake {
                 }
             }
             (Tool::Logman, "query") => {
+                if let Some(run) = s.queries.pop_front() {
+                    return run;
+                }
                 if let Some(run) = s.query.clone() {
                     return run;
                 }
@@ -223,6 +232,9 @@ impl TraceSystem for Fake {
         s.waits.push(duration);
         if let Some(next) = s.during_wait.take() {
             s.session = next;
+        }
+        if s.end_on_retry_wait && duration == Duration::from_secs(1) {
+            s.session = None;
         }
     }
     fn file_size(&mut self, path: &Path) -> Option<u64> {
@@ -535,15 +547,29 @@ fn a_session_replaced_during_the_wait_is_left_alone() {
 
 #[test]
 fn ownership_needs_our_folder_name_in_the_query_output() {
-    // A session whose path merely shares the prefix, or no path at all, is not ours.
+    // A session whose output file merely shares the prefix is another program's.
     for output in [
-        r"Output Location: C:\Windows\Temp\toolboks-latency-0000162c-5eee\latency.etl".to_string(),
-        r"Output Location: C:\Windows\Temp\toolboks-latency-0000162c\latency.etl".to_string(),
-        "Name: NT Kernel Logger\r\nStatus: Running".to_string(),
-        String::new(),
+        r"Output Location: C:\Windows\Temp\toolboks-latency-0000162c-5eee\latency.etl",
+        r"Output Location: C:\Windows\Temp\toolboks-latency-0000162c\latency.etl",
+        r"Output Location: C:\PerfLogs\Admin\Other.ETL",
     ] {
-        let fake = Fake::with(|s| s.query = Some(Run::Exited { code: 0, output }));
+        let fake = Fake::with(|s| {
+            s.query = Some(Run::Exited {
+                code: 0,
+                output: output.into(),
+            })
+        });
         assert_eq!(owner(&mut fake.clone(), Path::new(DIR)), Owner::Other);
+    }
+    // Running, but no output file in the kept output: unknown, never "another program".
+    for output in ["Name: NT Kernel Logger\r\nStatus: Running", ""] {
+        let fake = Fake::with(|s| {
+            s.query = Some(Run::Exited {
+                code: 0,
+                output: output.into(),
+            })
+        });
+        assert_eq!(owner(&mut fake.clone(), Path::new(DIR)), Owner::Unknown);
     }
     // Case does not matter.
     let output = format!("Output Location: {}\\LATENCY.ETL", DIR.to_ascii_uppercase());
@@ -616,6 +642,49 @@ fn an_unclear_query_is_never_reported_as_nothing_left_running() {
     }
     assert!(session_not_found(0x8030_0002_u32 as i32));
     assert!(!session_not_found(0) && !session_not_found(1) && !session_not_found(-1));
+}
+
+#[test]
+fn a_running_session_without_an_output_path_is_not_called_someone_elses() {
+    // The query succeeds while our session runs, but the kept output names no .etl file (for
+    // example cut off by the 4 KiB tail): nothing is stopped and the person is told to restart,
+    // never that another program took over or that nothing is left.
+    let running = Run::Exited {
+        code: 0,
+        output: "Status: Running\r\nThe command completed successfully.\r\n".into(),
+    };
+    let fake = Fake::with(|s| s.query = Some(running.clone()));
+    let err = run(&fake, 10).unwrap_err();
+    assert!(err.contains("could not stop the kernel recording"), "{err}");
+    assert!(
+        !err.contains("left it alone") && !err.contains("Nothing is left"),
+        "{err}"
+    );
+    assert_eq!(fake.count("Logman stop"), 0);
+
+    let fake = Fake::with(|s| {
+        s.start = Run::TimedOut;
+        s.start_timed_out_but_ran = true;
+        s.query = Some(running);
+    });
+    let err = run(&fake, 10).unwrap_err();
+    assert!(err.contains("could not stop the kernel recording"), "{err}");
+    assert!(!err.contains("Nothing is left"), "{err}");
+}
+
+#[test]
+fn a_session_gone_without_any_stop_of_ours_is_reported_as_ended_elsewhere() {
+    // First query unclear, then the session ends during the retry wait without our stop ever
+    // running: that is not "stopped", it was ended by something else.
+    let fake = Fake::with(|s| {
+        s.queries = VecDeque::from([Run::TimedOut]);
+        s.end_on_retry_wait = true;
+    });
+    let err = run(&fake, 10).unwrap_err();
+    assert!(err.contains("ended by another program"), "{err}");
+    assert_eq!(fake.count("Logman stop"), 0);
+    assert_eq!(fake.count("Tracerpt"), 0);
+    fake.assert_clean();
 }
 
 #[test]

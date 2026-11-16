@@ -437,10 +437,19 @@ fn owner(sys: &mut dyn TraceSystem, dir: &Path) -> Owner {
         return Owner::Unknown;
     };
     match sys.run(Tool::Logman, &query_args(), dir, LOGMAN_TIMEOUT) {
-        Run::Exited { code: 0, output } if output.to_ascii_lowercase().contains(&folder) => {
-            Owner::Ours
+        Run::Exited { code: 0, output } => {
+            let output = output.to_ascii_lowercase();
+            if output.contains(&folder) {
+                Owner::Ours
+            } else if output.contains(".etl") {
+                // Another output file is named: someone else's session.
+                Owner::Other
+            } else {
+                // Running, but no output file in what was kept of the output (the last 4 KiB):
+                // it may still be ours, so this is not proof of another owner.
+                Owner::Unknown
+            }
         }
-        Run::Exited { code: 0, .. } => Owner::Other,
         Run::Exited { code, .. } if session_not_found(code) => Owner::Gone,
         _ => Owner::Unknown,
     }
@@ -451,12 +460,15 @@ fn owner(sys: &mut dyn TraceSystem, dir: &Path) -> Owner {
 /// fails or hangs never counts as "not running", so the person is never told nothing is left
 /// when that is unknown.
 fn stop(sys: &mut dyn TraceSystem, dir: &Path) -> Result<(), Stop> {
+    // Whether a stop of ours ran against our session (even one that reported failure).
+    let mut stopped = false;
     for attempt in 0..STOP_ATTEMPTS {
         if attempt > 0 {
             sys.wait(Duration::from_secs(1));
         }
         match owner(sys, dir) {
             Owner::Ours => {
+                stopped = true;
                 if sys
                     .run(Tool::Logman, &stop_args(), dir, LOGMAN_TIMEOUT)
                     .ok()
@@ -465,10 +477,10 @@ fn stop(sys: &mut dyn TraceSystem, dir: &Path) -> Result<(), Stop> {
                 }
             }
             Owner::Other => return Err(Stop::NotOurs),
-            // Gone before any stop of ours: something else ended it.
-            Owner::Gone if attempt == 0 => return Err(Stop::NotRunning),
             // Gone after a stop of ours that reported failure: that stop took effect.
-            Owner::Gone => return Ok(()),
+            Owner::Gone if stopped => return Ok(()),
+            // Gone and we never stopped it: something else ended it.
+            Owner::Gone => return Err(Stop::NotRunning),
             Owner::Unknown => {}
         }
     }

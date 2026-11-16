@@ -14,6 +14,8 @@ pub(super) struct Panel {
     pending: Option<u64>,
     next_id: u64,
     health: crate::health::Cache,
+    /// A drive Home asked to show ("C:"), applied the next time the page is drawn.
+    wanted: Option<String>,
 }
 impl Default for Panel {
     fn default() -> Self {
@@ -27,10 +29,25 @@ impl Default for Panel {
             pending: None,
             next_id: 0,
             health: Default::default(),
+            wanted: None,
         }
     }
 }
 impl Panel {
+    /// The drive-health readings, shared with the background reporter so each drive is read once.
+    pub fn health_cache(&self) -> crate::health::Cache {
+        self.health.clone()
+    }
+    #[cfg(test)]
+    pub fn wanted_for_test(&self) -> Option<String> {
+        self.wanted.clone()
+    }
+    /// Shows `letter` ("C:") the next time the page is drawn, if that drive is listed.
+    pub fn select(&mut self, letter: &str) {
+        if backend::valid_letter(letter) {
+            self.wanted = Some(letter.to_string());
+        }
+    }
     pub fn tutorial_start(&mut self) {
         self.tour_selection = Some(self.selected.clone());
     }
@@ -118,6 +135,9 @@ impl Panel {
                 }
             }
             backend::refresh(&self.service);
+        }
+        if let Some(letter) = self.wanted.take() {
+            self.selected = letter;
         }
         let state = if tutorial {
             sample()

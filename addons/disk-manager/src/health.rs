@@ -6,7 +6,7 @@
 use crate::theme::{self, card, weak};
 use egui::RichText;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 use toolboks_shared::ui::{AMBER, GREEN, RED};
@@ -481,42 +481,88 @@ fn read(_: &str) -> Result<(Protocol, String, Vec<u8>), ReadError> {
     Err(ReadError::Unsupported)
 }
 
-/// Health per drive letter. `None` while the background read runs.
+/// Health per drive letter. `None` while the first background read runs.
 #[derive(Default)]
 pub struct State {
     generation: u64,
     results: BTreeMap<String, Option<Result<Report, ReadError>>>,
+    /// Unix seconds when each stored result was read.
+    read_at: BTreeMap<String, u64>,
+    /// Letters with a read running that keep their previous result until it finishes.
+    rereading: BTreeSet<String>,
 }
 pub type Cache = Arc<Mutex<State>>;
+/// What reads one drive. [`report`] is the real one; tests pass a fake.
+pub type ReadFn = fn(&str) -> Result<Report, ReadError>;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// Forgets every result; reads still running from before are discarded when they finish.
 pub fn clear(cache: &Cache) {
     let mut s = cache.lock().unwrap();
     s.generation += 1;
     s.results.clear();
+    s.read_at.clear();
+    s.rereading.clear();
+}
+
+/// Changes every time [`clear`] runs.
+pub fn generation(cache: &Cache) -> u64 {
+    cache.lock().unwrap().generation
 }
 
 /// Stores a finished read unless the cache was cleared after it started.
 fn store(cache: &Cache, generation: u64, letter: String, result: Result<Report, ReadError>) {
     let mut s = cache.lock().unwrap();
     if s.generation == generation {
+        s.rereading.remove(&letter);
+        s.read_at.insert(letter.clone(), unix_now());
         s.results.insert(letter, Some(result));
     }
 }
 
-/// Returns the cached result, starting a background read the first time a letter is asked for.
-pub fn get(cache: &Cache, letter: &str) -> Option<Result<Report, ReadError>> {
+/// Starts a background read of `letter` unless one is already running. A result already stored
+/// stays visible until the new one replaces it.
+pub fn refresh(cache: &Cache, letter: &str, read: ReadFn) {
     let mut s = cache.lock().unwrap();
-    if let Some(entry) = s.results.get(letter) {
-        return entry.clone();
+    let known = match s.results.get(letter) {
+        // The first read of this letter is still running.
+        Some(None) => return,
+        Some(Some(_)) => true,
+        None => false,
+    };
+    if known {
+        if !s.rereading.insert(letter.to_string()) {
+            return;
+        }
+    } else {
+        s.results.insert(letter.into(), None);
     }
-    s.results.insert(letter.into(), None);
     let (cache, letter, generation) = (cache.clone(), letter.to_string(), s.generation);
     std::thread::spawn(move || {
-        let result = report(&letter);
+        let result = read(&letter);
         store(&cache, generation, letter, result);
     });
-    None
+}
+
+/// Returns the cached result, starting a background read the first time a letter is asked for.
+pub fn get(cache: &Cache, letter: &str) -> Option<Result<Report, ReadError>> {
+    let known = cache.lock().unwrap().results.contains_key(letter);
+    if !known {
+        refresh(cache, letter, report);
+    }
+    cache.lock().unwrap().results.get(letter).cloned().flatten()
+}
+
+/// The stored result and when it was read, without starting a read.
+pub fn peek(cache: &Cache, letter: &str) -> Option<(Result<Report, ReadError>, u64)> {
+    let s = cache.lock().unwrap();
+    let result = s.results.get(letter)?.clone()?;
+    Some((result, s.read_at.get(letter).copied().unwrap_or(0)))
 }
 
 fn chip(ui: &mut egui::Ui, verdict: Verdict) {

@@ -4,7 +4,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 use toolboks_addon_proto::{
-    host_handshake, AddonMessage, FrameReader, FrameWriter, Hello, HostMessage, InputBatch, Theme,
+    host_handshake, AddonMessage, Evidence, Finding, FindingStatus, FrameReader, FrameWriter,
+    Hello, HostMessage, InputBatch, Theme,
 };
 
 struct Guard(Child, std::path::PathBuf);
@@ -176,5 +177,114 @@ fn protocol_test_host_draws_pings_and_quits() {
         }
         assert!(std::time::Instant::now() < deadline, "add-on did not quit");
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The findings in `message`, if it carries them, checked against the agreed protocol: a
+/// protocol 5 host gets `FindingsV5` (with `why` and `evidence`), a protocol 4 host the old
+/// `Findings` layout without them, and never the other one.
+fn findings_of(message: AddonMessage, protocol: u32) -> Option<Vec<Finding>> {
+    match message {
+        AddonMessage::FindingsV5(list) => {
+            assert_eq!(protocol, 5, "FindingsV5 sent to a protocol {protocol} host");
+            Some(list)
+        }
+        AddonMessage::Findings(list) => {
+            assert_eq!(
+                protocol, 4,
+                "old Findings layout sent to a protocol {protocol} host"
+            );
+            Some(list.into_iter().map(Finding::from).collect())
+        }
+        _ => None,
+    }
+}
+
+/// Suspended like Home runs it, the add-on reads this PC's fixed drives in the background and
+/// reports drive health and free space. A protocol 5 host gets each free-space finding with the
+/// bar of what is used and free, and `why` on every finding that needs attention; a protocol 4
+/// host (Toolboks 0.15) gets the old `Findings` layout without them. Read-only.
+#[test]
+fn findings_follow_the_host_protocol() {
+    if running_elevated() {
+        eprintln!(
+            "skipped: this process is elevated and the add-on runtime refuses to run elevated"
+        );
+        return;
+    }
+    for protocol in [5, 4] {
+        let exe = std::env::var("ADDON_TEST_EXE")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_disk-manager").into());
+        let data = std::path::PathBuf::from(
+            std::env::var_os("CARGO_TARGET_DIR")
+                .unwrap_or_else(|| std::env::temp_dir().into_os_string()),
+        )
+        .join(format!(
+            "disk-manager-findings-{protocol}-{}",
+            std::process::id()
+        ));
+        let mut child = Guard(
+            Command::new(exe)
+                .env("TOOLBOKS_DATA_DIR", &data)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+            data,
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let stdin = child.0.stdin.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = FrameReader::new(stdout);
+            let mut writer = FrameWriter::new(stdin);
+            let hello = host_handshake(
+                &mut reader,
+                &mut writer,
+                &Hello::with_version("toolboks.disk-manager", "test", protocol),
+            )
+            .unwrap();
+            assert_eq!(hello.protocol_version, protocol);
+            writer.write(&HostMessage::Suspend).unwrap();
+            // Wait for the free-space findings (a quick read of every fixed drive).
+            let list = loop {
+                if let Some(list) = findings_of(reader.read().unwrap(), protocol) {
+                    if list.iter().any(|f| f.id.starts_with("free-space-")) {
+                        break list;
+                    }
+                }
+            };
+            for f in &list {
+                assert!(Finding::valid_id(&f.id), "{}", f.id);
+                let attention = f.status == FindingStatus::Attention;
+                if protocol == 4 {
+                    assert_eq!((f.why.as_ref(), f.evidence.as_ref()), (None, None));
+                    continue;
+                }
+                assert_eq!(f.why.is_some(), attention, "{f:?}");
+                if let Some(why) = &f.why {
+                    assert!(why.chars().count() <= 200, "{why}");
+                }
+                if f.id.starts_with("free-space-") && f.status != FindingStatus::Unavailable {
+                    let Some(Evidence::Bar {
+                        fraction,
+                        left,
+                        right,
+                    }) = &f.evidence
+                    else {
+                        panic!("free space without its bar: {f:?}");
+                    };
+                    assert!((0.0..=1.0).contains(fraction));
+                    assert!(left.ends_with(" used") && right.ends_with(" free"), "{f:?}");
+                }
+            }
+            writer.write(&HostMessage::Quit).unwrap();
+            while let Ok(message) = reader.read::<AddonMessage>() {
+                let _ = findings_of(message, protocol);
+            }
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("protocol test host timed out or failed");
     }
 }

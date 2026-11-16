@@ -4,7 +4,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 use toolboks_addon_proto::{
-    host_handshake, AddonMessage, FrameReader, FrameWriter, Hello, HostMessage, InputBatch, Theme,
+    host_handshake, AddonMessage, Finding, FrameReader, FrameWriter, Hello, HostMessage,
+    InputBatch, Theme,
 };
 
 struct Guard(Child);
@@ -49,6 +50,26 @@ fn running_elevated() -> bool {
         .output()
         .map(|out| String::from_utf8_lossy(&out.stdout).contains("S-1-16-12288"))
         .unwrap_or(false)
+}
+
+/// The findings in `message`, if it carries them, checked against the agreed protocol: a
+/// protocol 5 host gets `FindingsV5` (with `why` and `evidence`), a protocol 4 host the old
+/// `Findings` layout without them, and never the other one.
+fn findings_of(message: AddonMessage, protocol: u32) -> Option<Vec<Finding>> {
+    match message {
+        AddonMessage::FindingsV5(list) => {
+            assert_eq!(protocol, 5, "FindingsV5 sent to a protocol {protocol} host");
+            Some(list)
+        }
+        AddonMessage::Findings(list) => {
+            assert_eq!(
+                protocol, 4,
+                "old Findings layout sent to a protocol {protocol} host"
+            );
+            Some(list.into_iter().map(Finding::from).collect())
+        }
+        _ => None,
+    }
 }
 
 #[test]
@@ -116,19 +137,17 @@ fn protocol_test_host_draws_pings_and_quits() {
                 }))
                 .unwrap();
             loop {
-                match reader.read().unwrap() {
-                    AddonMessage::Frame(frame) => {
-                        assert_eq!(frame.seq, page as u64 + 1);
-                        assert!(!frame.meshes.is_empty());
-                        break;
-                    }
-                    AddonMessage::Findings(list) => {
-                        assert_eq!(list.len(), 1);
-                        assert_eq!(list[0].id, "memory-pressure");
-                        assert!(toolboks_addon_proto::Finding::valid_id(&list[0].id));
-                        saw_finding = true;
-                    }
-                    _ => {}
+                let message = reader.read().unwrap();
+                if let AddonMessage::Frame(frame) = &message {
+                    assert_eq!(frame.seq, page as u64 + 1);
+                    assert!(!frame.meshes.is_empty());
+                    break;
+                }
+                if let Some(list) = findings_of(message, toolboks_addon_proto::PROTOCOL_VERSION) {
+                    assert_eq!(list.len(), 1);
+                    assert_eq!(list[0].id, "memory-pressure");
+                    assert!(Finding::valid_id(&list[0].id));
+                    saw_finding = true;
                 }
             }
         }
@@ -167,4 +186,68 @@ fn protocol_test_host_draws_pings_and_quits() {
         assert!(std::time::Instant::now() < deadline, "add-on did not quit");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// A protocol 4 host (Toolboks 0.15) gets the memory-pressure finding in the old `Findings`
+/// layout, without `why` and `evidence`; nothing it cannot read is sent.
+#[test]
+fn a_protocol_4_host_gets_the_old_findings_layout() {
+    if running_elevated() {
+        eprintln!(
+            "skipped: this process is elevated and the add-on runtime refuses to run elevated"
+        );
+        return;
+    }
+    let exe = std::env::var("ADDON_TEST_EXE")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_memory-cleaner").into());
+    let mut child = Guard(
+        Command::new(exe)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let stdin = child.0.stdin.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = FrameReader::new(stdout);
+        let mut writer = FrameWriter::new(stdin);
+        let hello = host_handshake(
+            &mut reader,
+            &mut writer,
+            &Hello::with_version("toolboks.memory-cleaner", "0.15.0", 4),
+        )
+        .unwrap();
+        assert_eq!(hello.protocol_version, 4);
+        writer.write(&HostMessage::Suspend).unwrap();
+        let list = loop {
+            if let Some(list) = findings_of(reader.read().unwrap(), 4) {
+                break list;
+            }
+        };
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "memory-pressure");
+        assert_eq!(
+            (list[0].why.as_ref(), list[0].evidence.as_ref()),
+            (None, None)
+        );
+        // Still answers, and nothing in the new layout arrives before the pong.
+        writer.write(&HostMessage::Ping { nonce: 4 }).unwrap();
+        loop {
+            let message = reader.read().unwrap();
+            if let AddonMessage::Pong { nonce } = message {
+                assert_eq!(nonce, 4);
+                break;
+            }
+            let _ = findings_of(message, 4);
+        }
+        writer.write(&HostMessage::Quit).unwrap();
+        while let Ok(message) = reader.read::<AddonMessage>() {
+            let _ = findings_of(message, 4);
+        }
+        tx.send(()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(20))
+        .expect("protocol test host timed out or failed");
 }

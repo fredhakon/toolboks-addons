@@ -20,19 +20,21 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `c05e12053adf981c705e2b22e67c414c7decfc90`, the commit of the
-released host **v0.15.0** (protocol 4; its SDK still agrees on 3 with a host that speaks 3). Every
-add-on is built against a host that users can actually have. `addon-repo` checks manifests as this
-host would (`PINNED_HOST` in `tools/repo/src/main.rs`), so move that constant together with the pin.
+Host dependencies pin commit `63beeb11aa8b4b5e4270f0404521f3ae6c173c4c`, the commit of the
+released host **v0.16.0** (protocol 5; its SDK still agrees on 4 or 3 with a host that speaks
+those, and sends a protocol 4 host its findings without `why` and `evidence`). Every add-on is
+built against a host that users can actually have. `addon-repo` checks manifests as this host would
+(`PINNED_HOST` in `tools/repo/src/main.rs`), so move that constant together with the pin.
 
-Every new catalog entry speaks the pinned protocol (4), so `addon-repo catalog-update` gives it
-`min_toolboks_version` 0.15.0, the first host that speaks 4, or the manifest's own minimum when that
+Every new catalog entry speaks the pinned protocol (5), so `addon-repo catalog-update` gives it
+`min_toolboks_version` 0.16.0, the first host that speaks 5, or the manifest's own minimum when that
 is newer (`PROTOCOL_HOSTS` in `tools/repo/src/main.rs`; add a row when a pin move brings a new
-protocol). Older hosts keep offering the protocol 3 versions already in the list; those entries are
-never rewritten. `catalog-update` also copies the manifest's optional `checks` (at most 6 health
-check names of at most 40 characters, checked with the host's rule), and `addon-repo validate` fails
-when the entry for the current version differs from its manifest in `data_note`, `checks` or the
-minimum host, or when any protocol 4 entry allows a host older than 0.15.0.
+protocol). Older hosts keep offering the protocol 3 and 4 versions already in the list; those
+entries are never rewritten. `catalog-update` also copies the manifest's optional `checks` (at most
+6 health check names of at most 40 characters, checked with the host's rule), and
+`addon-repo validate` fails when the entry for the current version differs from its manifest in
+`data_note`, `checks` or the minimum host, when any protocol 4 entry allows a host older than
+0.15.0, or when any protocol 5 entry allows a host older than 0.16.0.
 
 **When to move the pin:** only to a commit that is in a published host release on `main`, and only
 when an add-on needs something the newer host added (a new SDK field, a new shared helper, a

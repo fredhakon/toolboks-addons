@@ -51,9 +51,9 @@ fn catalog_update_uses_released_bytes_and_preserves_other_versions() {
         entry.protocol_version,
         toolboks_addon_proto::PROTOCOL_VERSION
     );
-    // The manifest needs 0.12.5, but the entry speaks protocol 4, which only 0.15.0 and later do.
-    assert_eq!(entry.protocol_version, 4);
-    assert_eq!(entry.min_toolboks_version, "0.15.0");
+    // The manifest needs 0.12.5, but the entry speaks protocol 5, which only 0.16.0 and later do.
+    assert_eq!(entry.protocol_version, 5);
+    assert_eq!(entry.min_toolboks_version, "0.16.0");
     assert_eq!(
         entry.download_url,
         "https://github.com/new-owner/addons/releases/download/hello-v0.1.0/hello.exe"
@@ -298,8 +298,8 @@ fn checks_and_minimum_host_are_copied_and_validated() {
         new["checks"],
         serde_json::json!(["Recent crashes", "Disk health"])
     );
-    assert_eq!(new["protocol_version"], 4);
-    assert_eq!(new["min_toolboks_version"], "0.15.0");
+    assert_eq!(new["protocol_version"], 5);
+    assert_eq!(new["min_toolboks_version"], "0.16.0");
     assert!(run(&["validate"]).status.success());
 
     // The current version's entry must carry the manifest's checks.
@@ -315,11 +315,11 @@ fn checks_and_minimum_host_are_copied_and_validated() {
     write(&manifest);
     assert!(!run(&["validate"]).status.success());
 
-    // A protocol 4 entry may not be offered to a host older than 0.15.0.
+    // A protocol 5 entry may not be offered to a host older than 0.16.0.
     manifest["manifest"]["checks"] = serde_json::json!(["Recent crashes", "Disk health"]);
     write(&manifest);
     let mut list = read();
-    list["entries"][1]["min_toolboks_version"] = "0.14.0".into();
+    list["entries"][1]["min_toolboks_version"] = "0.15.0".into();
     fs::write(
         root.join("catalog/index.json"),
         serde_json::to_vec_pretty(&list).unwrap(),
@@ -327,6 +327,6 @@ fn checks_and_minimum_host_are_copied_and_validated() {
     .unwrap();
     let out = run(&["validate"]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("0.15.0"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("0.16.0"));
     fs::remove_dir_all(root).unwrap();
 }

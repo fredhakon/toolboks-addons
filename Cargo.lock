@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "disk-manager"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "egui",
  "egui_extras",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "event-watch"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "boot-perf",
  "egui",
@@ -845,7 +845,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memory-cleaner"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "egui",
  "egui_extras",
@@ -1486,7 +1486,7 @@ dependencies = [
 [[package]]
 name = "toolboks-addon-proto"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=c05e12053adf981c705e2b22e67c414c7decfc90#c05e12053adf981c705e2b22e67c414c7decfc90"
+source = "git+https://github.com/Gusseti/toolboks?rev=63beeb11aa8b4b5e4270f0404521f3ae6c173c4c#63beeb11aa8b4b5e4270f0404521f3ae6c173c4c"
 dependencies = [
  "egui",
  "postcard",
@@ -1496,7 +1496,7 @@ dependencies = [
 [[package]]
 name = "toolboks-addon-sdk"
 version = "0.4.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=c05e12053adf981c705e2b22e67c414c7decfc90#c05e12053adf981c705e2b22e67c414c7decfc90"
+source = "git+https://github.com/Gusseti/toolboks?rev=63beeb11aa8b4b5e4270f0404521f3ae6c173c4c#63beeb11aa8b4b5e4270f0404521f3ae6c173c4c"
 dependencies = [
  "egui",
  "serde",
@@ -1508,7 +1508,7 @@ dependencies = [
 [[package]]
 name = "toolboks-catalog"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=c05e12053adf981c705e2b22e67c414c7decfc90#c05e12053adf981c705e2b22e67c414c7decfc90"
+source = "git+https://github.com/Gusseti/toolboks?rev=63beeb11aa8b4b5e4270f0404521f3ae6c173c4c#63beeb11aa8b4b5e4270f0404521f3ae6c173c4c"
 dependencies = [
  "serde",
  "serde_json",
@@ -1519,7 +1519,7 @@ dependencies = [
 [[package]]
 name = "toolboks-debloat-engine"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=c05e12053adf981c705e2b22e67c414c7decfc90#c05e12053adf981c705e2b22e67c414c7decfc90"
+source = "git+https://github.com/Gusseti/toolboks?rev=63beeb11aa8b4b5e4270f0404521f3ae6c173c4c#63beeb11aa8b4b5e4270f0404521f3ae6c173c4c"
 dependencies = [
  "serde",
  "toolboks-shared",
@@ -1529,7 +1529,7 @@ dependencies = [
 [[package]]
 name = "toolboks-shared"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=c05e12053adf981c705e2b22e67c414c7decfc90#c05e12053adf981c705e2b22e67c414c7decfc90"
+source = "git+https://github.com/Gusseti/toolboks?rev=63beeb11aa8b4b5e4270f0404521f3ae6c173c4c#63beeb11aa8b4b5e4270f0404521f3ae6c173c4c"
 dependencies = [
  "egui",
  "toolboks-addon-sdk",

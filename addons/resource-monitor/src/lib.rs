@@ -8,6 +8,7 @@ mod details;
 mod gpu;
 mod history;
 mod list;
+mod lower_confirm;
 mod nvml;
 mod overview;
 mod power;

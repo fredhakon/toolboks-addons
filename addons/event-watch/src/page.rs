@@ -1028,7 +1028,9 @@ impl Page {
                         header.col(|ui| {
                             let text = RichText::new(title).size(TEXT_CAPTION).color(MUTED);
                             if i == 0 {
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                // Right-aligned like the times below it, but pinned to the top of
+                                // the cell like the other headers (Align::Center put it lower).
+                                ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
                                     ui.label(text);
                                 });
                             } else {

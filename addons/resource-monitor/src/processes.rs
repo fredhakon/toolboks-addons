@@ -31,6 +31,8 @@ use toolboks_shared::ui::{
 };
 use toolboks_shared::win::Handle;
 
+use crate::lower_confirm::{is_confirmed, lower_text, settle, Pending};
+
 pub(super) const ROW_HEIGHT: f32 = 28.0;
 /// Header row: the column name above the system total.
 const HEADER_HEIGHT: f32 = 40.0;
@@ -879,6 +881,8 @@ enum Intent {
     AskEnd(Vec<ProcessIdentity>),
     ConfirmEnd,
     CancelEnd,
+    AskLower(Vec<ProcessIdentity>),
+    CancelLower,
     Lower,
     Restore,
     Copy(String),
@@ -900,6 +904,8 @@ pub(super) struct Page {
     selection: Selection,
     /// Process identities waiting for the second click on End task.
     confirm: Option<Vec<ProcessIdentity>>,
+    /// The open "Lower priority" question, if any.
+    lower_confirm: Option<Pending<ProcessIdentity>>,
     /// Previous priority class keyed by process identity.
     lowered: Vec<(ProcessIdentity, u32)>,
     denied: HashSet<ProcessIdentity>,
@@ -923,6 +929,7 @@ impl Page {
             descending: true,
             selection: Selection::default(),
             confirm: None,
+            lower_confirm: None,
             lowered: Vec::new(),
             denied: HashSet::new(),
             job: None,
@@ -1042,14 +1049,26 @@ impl Page {
         if self.frozen.is_some()
             && matches!(
                 intent,
-                Intent::AskEnd(_) | Intent::ConfirmEnd | Intent::Lower | Intent::Restore
+                Intent::AskEnd(_)
+                    | Intent::ConfirmEnd
+                    | Intent::AskLower(_)
+                    | Intent::Lower
+                    | Intent::Restore
             )
         {
             return;
         }
         match intent {
-            Intent::AskEnd(pids) => self.confirm = Some(pids),
+            Intent::AskEnd(pids) => {
+                self.lower_confirm = None;
+                self.confirm = Some(pids);
+            }
             Intent::CancelEnd => self.confirm = None,
+            Intent::AskLower(ids) => {
+                self.confirm = None;
+                self.lower_confirm = Pending::ask(ids);
+            }
+            Intent::CancelLower => self.lower_confirm = None,
             Intent::ConfirmEnd => {
                 let (to_end, _) = plan_end(&self.selected_procs(procs), protected);
                 if self
@@ -1062,7 +1081,10 @@ impl Page {
             }
             Intent::Lower => {
                 let (list, _) = plan_end(&self.selected_procs(procs), protected);
-                self.start_job(ctx, Action::Lower(list));
+                let asked = self.lower_confirm.take();
+                if is_confirmed(asked.as_ref(), &action_identities(&list)) {
+                    self.start_job(ctx, Action::Lower(list));
+                }
             }
             Intent::Restore => {
                 let list: Vec<(Proc, u32)> = self
@@ -1388,15 +1410,15 @@ impl Page {
         if self.confirm.as_ref().is_some_and(|c| *c != end_pids) {
             self.confirm = None;
         }
+        let label = match selected.as_slice() {
+            [one] => display_name(one)
+                .split(" (")
+                .next()
+                .unwrap_or("")
+                .to_string(),
+            many => format!("{} apps", many.len()),
+        };
         if self.confirm.is_some() && !end_pids.is_empty() {
-            let label = match selected.as_slice() {
-                [one] => display_name(one)
-                    .split(" (")
-                    .next()
-                    .unwrap_or("")
-                    .to_string(),
-                many => format!("{} apps", many.len()),
-            };
             ui.label(RichText::new(confirm_text(&label, end_pids.len())).small());
             ui.horizontal(|ui| {
                 if ui
@@ -1422,6 +1444,8 @@ impl Page {
         let can_restore = chosen
             .iter()
             .any(|p| self.lowered.iter().any(|(id, _)| Some(*id) == p.identity));
+        let lower_allowed = !paused && !can_restore && self.confirm.is_none();
+        self.lower_confirm = settle(self.lower_confirm.take(), &end_pids, lower_allowed);
         if can_restore {
             if ui
                 .add_enabled(!busy, egui::Button::new("Restore priority"))
@@ -1429,6 +1453,27 @@ impl Page {
             {
                 intent = Some(Intent::Restore);
             }
+        } else if self.lower_confirm.is_some() {
+            ui.label(RichText::new(lower_text(&label, end_pids.len())).small());
+            ui.horizontal(|ui| {
+                let cancel = ui.button("Cancel");
+                if self
+                    .lower_confirm
+                    .as_mut()
+                    .is_some_and(Pending::take_cancel_focus)
+                {
+                    cancel.request_focus();
+                }
+                if cancel.clicked() {
+                    intent = Some(Intent::CancelLower);
+                }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Lower priority"))
+                    .clicked()
+                {
+                    intent = Some(Intent::Lower);
+                }
+            });
         } else if ui
             .add_enabled(
                 !to_end.is_empty() && !busy,
@@ -1437,7 +1482,7 @@ impl Page {
             .on_hover_text("Lets other apps use the processor first. Undo it here any time.")
             .clicked()
         {
-            intent = Some(Intent::Lower);
+            intent = Some(Intent::AskLower(end_pids.clone()));
         }
         if ui.button("Copy").clicked() {
             intent = Some(Intent::Copy(copy_text(&selected, ready)));

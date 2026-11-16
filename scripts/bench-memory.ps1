@@ -23,6 +23,10 @@
   instance (the started process exits without a window) launch_ms is NA and nothing else is closed.
   Choose an -App that does not do this.
 
+  -Headless is for unattended runs where no window may open: the app is started hidden and timed
+  until the process it started exits (default: powershell.exe -NoProfile -Command exit). The row's
+  app column says so; do not compare such launch times with window-ready times.
+
   Column action_confirmed is for you: after each run read the Last run card (or the purge result)
   in Memory Cleaner and fill it in (yes / no); runs where the action did not happen are repeated.
 
@@ -38,6 +42,10 @@ param(
     [ValidateSet('none', 'trim', 'purge')]
     [string]$Arm,
     [string]$App = 'notepad.exe',
+    # Windowless launch timing for unattended runs (no window may open on the screen): the app is
+    # started hidden with -AppArgs and timed until it exits, instead of until it has a main window.
+    [switch]$Headless,
+    [string[]]$AppArgs = @('-NoProfile', '-Command', 'exit'),
     [ValidateRange(1, 100)]
     [int]$Runs = 5,
     [ValidateRange(0, 3600)]
@@ -138,6 +146,14 @@ function Measure-AppLaunch {
     # only that process. If it exits without a window (handed over to another instance) the result
     # is NA and nothing else is touched. shortcut: child processes it spawned are not closed.
     $sw = [Diagnostics.Stopwatch]::StartNew()
+    if ($Headless) {
+        # Hidden, so nothing opens on the screen. Timed until the process we started exits.
+        $p = Start-Process -FilePath $App -ArgumentList $AppArgs -WindowStyle Hidden -PassThru
+        if ($p.WaitForExit($LaunchTimeoutMs)) { $sw.Stop(); return $sw.ElapsedMilliseconds }
+        try { $p.Kill() } catch { Write-Warning "Could not stop pid $($p.Id): $($_.Exception.Message)" }
+        Write-Warning "Headless app did not exit within ${LaunchTimeoutMs} ms: launch_ms=NA."
+        return $null
+    }
     $started = Start-Process -FilePath $App -PassThru
     $ms = $null
     while ($sw.ElapsedMilliseconds -lt $LaunchTimeoutMs) {
@@ -181,8 +197,8 @@ for ($run = 1; $run -le $Runs; $run++) {
         windows_build      = $build
         arm                = $Arm
         run                = $run
-        app                = $App
-        launch_ms          = Format-Number $launch
+        app                = if ($Headless) { "$App (headless, to exit)" } else { $App }
+        launch_ms         = Format-Number $launch
         action_confirmed   = if ($Arm -eq 'none') { 'n/a' } else { '' }
         sample_mode        = $b.Mode + '/' + $a.Mode
         sample_seconds     = Format-Number $b.Seconds

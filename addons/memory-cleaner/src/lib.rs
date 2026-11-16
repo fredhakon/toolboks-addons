@@ -2,6 +2,8 @@ mod actions;
 mod activity;
 mod admin;
 mod advanced;
+#[cfg(test)]
+mod bench;
 mod commit;
 mod engine;
 mod groups;

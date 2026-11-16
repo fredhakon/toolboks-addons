@@ -5,7 +5,7 @@
     "title": "Event Watch",
     "native_provider": "toolboks.event-watch",
     "description": "Understand Windows events, crashes and slow drivers.",
-    "long_description": "Event Watch reads the Windows event logs and explains what is going on, with a closer look at crashes and restarts. It reads crash dump headers to name the stop code. It never clears your logs and changes nothing on your PC. The optional latency check names the drivers with the longest interrupt (DPC and ISR) runs. It needs administrator rights, which Windows asks you to confirm each time you start it; it records for 10 to 30 seconds, deletes the recording as soon as it has been read, and keeps the result only until you close Event Watch.",
+    "long_description": "Event Watch reads the Windows event logs and explains what is going on, with a closer look at crashes and restarts. It reads crash dump headers to name the stop code. It never clears your logs and changes nothing on your PC. The optional latency check names the drivers with the longest interrupt (DPC and ISR) runs. It needs administrator rights, which Windows asks you to confirm each time you start it; it records for 10 to 30 seconds, deletes the recording as soon as it has been read, and keeps the result only until you close Event Watch. The Boot page shows boot times and slow-startup items from Windows' boot performance log; it is read in memory only and nothing is saved. Windows only lets administrators read that log on a default PC, and an administrator can allow reading in the log's access list (Toolboks never changes it).",
     "version": "0.1.0",
     "author": "Toolboks team",
     "publisher": "Toolboks",

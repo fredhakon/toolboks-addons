@@ -11,6 +11,7 @@ toolboks-debloat-engine = { git = "https://github.com/Gusseti/toolboks", rev = "
 egui = { version = "0.37", default-features = false }
 serde_json = "1"
 protected-processes = { path = "crates/protected-processes" }
+boot-perf = { path = "crates/boot-perf" }
 
 [profile.release]
 opt-level = "s"

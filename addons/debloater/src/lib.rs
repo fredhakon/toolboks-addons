@@ -58,8 +58,11 @@ struct StartupState {
     entries: Vec<startup::Entry>,
     /// A load was started and not yet invalidated.
     started: bool,
-    loading: Option<Receiver<Result<Vec<startup::Entry>, String>>>,
+    loading: Option<Receiver<StartupLoad>>,
     error: Option<String>,
+    /// What Windows measured for slow startup items (the boot performance log), read once per
+    /// visit and again on Refresh. `None` until read; see `boot_perf` for the source.
+    cost: Option<StartupCost>,
     /// The row shown in the inspector, as (source, name).
     focus: Option<(startup::Source, String)>,
     /// A Careful entry waiting for the inline "Switch off?" confirm.
@@ -67,6 +70,20 @@ struct StartupState {
     /// Changes of this session, oldest first.
     steps: Vec<startup::UndoStep>,
     message: Option<String>,
+}
+
+/// One finished load of the Startup page: the entries, and the boot log when it was read too.
+struct StartupLoad {
+    entries: Result<Vec<startup::Entry>, String>,
+    cost: Option<StartupCost>,
+}
+
+/// The measured startup cost: whether the log could be read, and what Windows named as slow.
+struct StartupCost {
+    access: boot_perf::Access,
+    /// The log read stopped early or hit its limit, so a missing name proves nothing.
+    incomplete: bool,
+    slow: Vec<boot_perf::SlowSummary>,
 }
 
 /// The "Create a restore point first" switch, shared by Privacy and ads and Tasks. Memory only.
@@ -298,6 +315,7 @@ impl NativeAddon for Debloater {
         self.apps.confirming = false;
         self.apps.selected = HashSet::new();
         self.startup.entries = Vec::new();
+        self.startup.cost = None;
         self.startup.loading = None;
         self.startup.started = false;
         self.startup.pending = None;

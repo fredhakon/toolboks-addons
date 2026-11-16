@@ -17,10 +17,12 @@ use toolboks_addon_sdk::{NativeAddon, TutorialStep};
 
 pub const ID: &str = "toolboks.event-watch";
 /// Page names, in order. They match `host-services.json`.
-pub const PAGES: [&str; 4] = ["Live", "Crashes", "Summary", "Latency check"];
+pub const PAGES: [&str; 5] = ["Live", "Crashes", "Summary", "Latency check", "Boot"];
 /// Index of the Latency check page in [`PAGES`], looked up by name when compiling, so a page
 /// added or moved elsewhere in the list cannot make it open the wrong page.
 const LATENCY_PAGE: usize = page_index("Latency check");
+/// Index of the Boot page in [`PAGES`], looked up by name for the same reason.
+pub(crate) const BOOT_PAGE: usize = page_index("Boot");
 
 /// Position of `name` in [`PAGES`]; the build fails if it is missing.
 const fn page_index(name: &str) -> usize {
@@ -132,6 +134,12 @@ impl NativeAddon for EventWatch {
             "Latency check · slow drivers",
             "Run a short Windows recording while stutter or audio crackle happens, and see which drivers held the processor the longest. It asks for administrator rights each time and never runs on its own. The recording is deleted after it is read. A long run is a clue, not proof of the cause.",
         )))
+        .chain(std::iter::once(TutorialStep::new(
+            &BOOT_PAGE.to_string(),
+            "table",
+            "Boot · startup time and slow items",
+            "Boot shows how long each startup took and which apps, services and drivers Windows itself named as slow. Windows keeps this in a log that, on most PCs, only administrators can read. When Event Watch cannot read it, this page says so instead of showing a time, and a missing entry never means a fast boot.",
+        )))
         .collect()
     }
     fn tutorial_location(&self) -> String {
@@ -159,6 +167,28 @@ mod page_tests {
             .find(|s| s.title.starts_with("Latency check"))
             .unwrap();
         assert_eq!(step.page, LATENCY_PAGE.to_string());
+    }
+
+    #[test]
+    fn the_boot_page_index_follows_the_page_list_and_never_collides_with_latency() {
+        assert_eq!(PAGES[BOOT_PAGE], "Boot");
+        assert_ne!(BOOT_PAGE, LATENCY_PAGE);
+        assert_eq!(
+            PAGES,
+            ["Live", "Crashes", "Summary", "Latency check", "Boot"]
+        );
+        let mut watch = EventWatch::default();
+        watch.navigate(&BOOT_PAGE.to_string());
+        assert_eq!(watch.page_index(), BOOT_PAGE);
+        let steps = watch.tutorial_steps();
+        let step = steps.iter().find(|s| s.title.starts_with("Boot")).unwrap();
+        assert_eq!(step.page, BOOT_PAGE.to_string());
+        // The tour steps for the two new pages point at their own pages.
+        let latency = steps
+            .iter()
+            .find(|s| s.title.starts_with("Latency check"))
+            .unwrap();
+        assert_ne!(latency.page, step.page);
     }
 }
 

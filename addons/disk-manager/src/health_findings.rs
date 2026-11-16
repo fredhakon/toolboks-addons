@@ -10,7 +10,7 @@
 //! is out of date after [`STALE_AFTER_SECS`]. [`Reporter`] runs that cycle in the background and
 //! hands Home the findings.
 
-use crate::health::{self, Cache, ReadError, ReadFn, Report, Verdict};
+use crate::health::{self, Cache, Health, ReadError, ReadFn, Report, Verdict};
 use std::sync::{Arc, Mutex};
 use toolboks_addon_sdk::Finding;
 
@@ -125,19 +125,22 @@ pub fn check(letter: &str, read: &Result<Report, ReadError>, now: u64) -> Readin
     let shown = normalize_letter(letter).unwrap_or_else(|| "This drive".to_string());
     let (status, severity, observation) = match read {
         Ok(report) => {
-            let (verdict, reason) = crate::health::verdict(&report.health);
+            let (verdict, reason) = crate::health::assess(&report.health);
+            // Windows' own rating says in its first words whose rating it is; a drive's own
+            // values get the verdict word in front.
+            let direct = matches!(report.health, Health::Drive(_));
+            let say = |word: &str| {
+                if direct {
+                    format!("{word}. {reason}")
+                } else {
+                    reason.clone()
+                }
+            };
             match verdict {
-                Verdict::Healthy => (Status::Ok, Severity::Watch, format!("Healthy. {reason}")),
-                Verdict::Watch => (
-                    Status::Attention,
-                    Severity::Watch,
-                    format!("Watch. {reason}"),
-                ),
-                Verdict::ReplaceSoon => (
-                    Status::Attention,
-                    Severity::Problem,
-                    format!("Replace soon. {reason}"),
-                ),
+                Verdict::Healthy => (Status::Ok, Severity::Watch, say("Healthy")),
+                Verdict::Watch => (Status::Attention, Severity::Watch, say("Watch")),
+                Verdict::ReplaceSoon => (Status::Attention, Severity::Problem, say("Replace soon")),
+                Verdict::Problem => (Status::Attention, Severity::Problem, say("Problem")),
             }
         }
         Err(ReadError::AccessDenied) => (
@@ -149,7 +152,7 @@ pub fn check(letter: &str, read: &Result<Report, ReadError>, now: u64) -> Readin
         Err(ReadError::Unsupported) => (
             Status::Unavailable,
             Severity::Watch,
-            "This drive does not report health. USB, memory card, RAID and virtual drives often do not."
+            "This drive does not report health. USB, memory card and virtual drives often do not."
                 .to_string(),
         ),
         Err(ReadError::NotFound) => (
@@ -404,7 +407,23 @@ mod tests {
     fn report(page: Result<crate::health::DriveHealth, crate::health::ParseError>) -> Report {
         Report {
             model: "Test drive".into(),
-            health: page.unwrap(),
+            health: Health::Drive(page.unwrap()),
+        }
+    }
+
+    fn windows_report(health: Option<u16>, operational: &[u16], raid: bool) -> Report {
+        use crate::health::{rate, WindowsRating, WindowsStatus};
+        let status = WindowsStatus {
+            health,
+            operational: operational.to_vec(),
+        };
+        Report {
+            model: "Test drive".into(),
+            health: Health::Windows(WindowsRating {
+                rating: rate(&status).expect("a rating"),
+                status,
+                raid,
+            }),
         }
     }
 
@@ -524,6 +543,39 @@ mod tests {
         assert_limits(&r);
         let r = check("C:", &Err(ReadError::NotFound), NOW);
         assert_eq!(r.status, Status::Unavailable);
+        assert_limits(&r);
+    }
+
+    #[test]
+    fn windows_rating_of_a_raid_drive_is_ok_and_says_what_it_is() {
+        let r = check("C:", &Ok(windows_report(Some(0), &[2], true)), NOW);
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(
+            r.observation,
+            "Windows rates this drive Healthy. This PC runs its drives in RAID mode, so detailed drive data (wear, temperature, reallocated sectors) is not available."
+        );
+        assert!(!r.observation.contains("SMART"));
+        assert!(!r.observation.starts_with("Healthy."));
+        assert_limits(&r);
+    }
+
+    #[test]
+    fn windows_rating_warning_and_unhealthy_need_attention() {
+        let r = check("C:", &Ok(windows_report(Some(1), &[3], true)), NOW);
+        assert_eq!((r.status, r.severity), (Status::Attention, Severity::Watch));
+        assert!(r
+            .observation
+            .starts_with("Windows rates this drive Warning."));
+        assert!(r.observation.contains("Degraded"));
+        assert_limits(&r);
+        let r = check("C:", &Ok(windows_report(Some(2), &[13], false)), NOW);
+        assert_eq!(
+            (r.status, r.severity),
+            (Status::Attention, Severity::Problem)
+        );
+        assert!(r.observation.contains("Unhealthy"));
+        assert!(r.observation.contains("Lost communication"));
+        assert!(!r.observation.contains("RAID"));
         assert_limits(&r);
     }
 

@@ -20,9 +20,11 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `6256466565c46300eae6643d1983acc1932a0d44`, the commit of the
-released host **v0.13.2** (protocol 3, minimum host 0.12.5). Every add-on is built against a
-host that users can actually have.
+Host dependencies pin commit `8c80bab8c27710f9e726e4377dcb1baa36e4f140`, the commit of the
+released host **v0.14.0** (protocol 3). Most add-ons need host 0.12.5 or later; Disk Manager needs
+0.14.0 because its manifest has a `data_note`, which older hosts refuse. Every add-on is built
+against a host that users can actually have. `addon-repo` checks manifests as this host would
+(`PINNED_HOST` in `tools/repo/src/main.rs`), so move that constant together with the pin.
 
 **When to move the pin:** only to a commit that is in a published host release on `main`, and only
 when an add-on needs something the newer host added (a new SDK field, a new shared helper, a
@@ -120,6 +122,15 @@ the existing `settings`, `optimize_selected_drive` and `fragmentation_reports` p
 Use `--open "Disk Manager/Largest files"` after catalog installation as before. The host
 keeps `addon-data/toolboks.disk-manager/` and namespaced preferences; the old local activation
 package alone cannot install this executable. No data migration is required.
+
+Disk Manager's manifest has a `data_note` ("Keeps your last scan of each drive on this PC (file
+and folder names).") that the host shows in the install review, so it needs host 0.14.0 or later.
+
+`catalog-update` copies a manifest's optional `data_note` into the catalog entry, checked with the
+host's rule (`toolboks_addon_sdk::valid_data_note`: one line, at most 160 characters, no hidden,
+bidi or control characters); a bad note stops it before the list is written. `validate` fails when
+the catalog entry for the version that is current in `addons/<name>/<name>.tbaddon` carries a
+different note (or none, when the manifest has one). Entries for older versions are not compared.
 
 `host-services.json` is optional per-add-on metadata copied by `catalog-update` into the
 catalog entry. Disk Manager declares its page names and `background: true`, so exports and

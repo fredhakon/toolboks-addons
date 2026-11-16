@@ -3,11 +3,11 @@ members = ["addons/*", "crates/*", "tools/repo"]
 resolver = "2"
 
 [workspace.dependencies]
-toolboks-addon-sdk = { git = "https://github.com/Gusseti/toolboks", rev = "6256466565c46300eae6643d1983acc1932a0d44", features = ["runtime"] }
-toolboks-addon-proto = { git = "https://github.com/Gusseti/toolboks", rev = "6256466565c46300eae6643d1983acc1932a0d44" }
-toolboks-shared = { git = "https://github.com/Gusseti/toolboks", rev = "6256466565c46300eae6643d1983acc1932a0d44", features = ["ui"] }
-toolboks-catalog = { git = "https://github.com/Gusseti/toolboks", rev = "6256466565c46300eae6643d1983acc1932a0d44" }
-toolboks-debloat-engine = { git = "https://github.com/Gusseti/toolboks", rev = "6256466565c46300eae6643d1983acc1932a0d44" }
+toolboks-addon-sdk = { git = "https://github.com/Gusseti/toolboks", rev = "8c80bab8c27710f9e726e4377dcb1baa36e4f140", features = ["runtime"] }
+toolboks-addon-proto = { git = "https://github.com/Gusseti/toolboks", rev = "8c80bab8c27710f9e726e4377dcb1baa36e4f140" }
+toolboks-shared = { git = "https://github.com/Gusseti/toolboks", rev = "8c80bab8c27710f9e726e4377dcb1baa36e4f140", features = ["ui"] }
+toolboks-catalog = { git = "https://github.com/Gusseti/toolboks", rev = "8c80bab8c27710f9e726e4377dcb1baa36e4f140" }
+toolboks-debloat-engine = { git = "https://github.com/Gusseti/toolboks", rev = "8c80bab8c27710f9e726e4377dcb1baa36e4f140" }
 egui = { version = "0.37", default-features = false }
 serde_json = "1"
 protected-processes = { path = "crates/protected-processes" }

@@ -19,6 +19,8 @@ use toolboks_debloat_engine::{
     ChangeError,
 };
 
+use crate::saved_undo::{self, RegStep, ServiceStep, StartupStep, TaskStep};
+
 /// The one administrator operation name. The request's `kind` says which change.
 pub const OPERATION: &str = "debloat";
 
@@ -48,7 +50,7 @@ fn hive_from(name: &str) -> Option<Hive> {
     }
 }
 
-fn value_json(value: &Option<RegValue>) -> Value {
+pub(crate) fn value_json(value: &Option<RegValue>) -> Value {
     match value {
         None => Value::Null,
         Some(RegValue::Dword(n)) => json!({ "dword": n }),
@@ -56,7 +58,7 @@ fn value_json(value: &Option<RegValue>) -> Value {
     }
 }
 
-fn value_from(value: &Value) -> Result<Option<RegValue>, String> {
+pub(crate) fn value_from(value: &Value) -> Result<Option<RegValue>, String> {
     if value.is_null() {
         return Ok(None);
     }
@@ -145,12 +147,22 @@ pub fn run_from_json(value: &Value) -> Run {
     run
 }
 
-pub fn steps_from_json(value: &Value) -> Vec<UndoOp> {
+pub fn steps_from_json(value: &Value) -> Vec<RegStep> {
     value
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|step| undo_from_json(step).ok())
+        .filter_map(|step| saved_undo::reg_from(step).ok())
+        .collect()
+}
+
+/// The plain-words reasons of refused undo steps in a helper answer.
+pub fn refused_from_json(value: &Value) -> Vec<String> {
+    value["refused"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|reason| reason.as_str().map(str::to_owned))
         .collect()
 }
 
@@ -167,10 +179,10 @@ pub fn registry_apply_request(ids: &[&str], restore_point: bool) -> String {
     json!({ "kind": "registry_apply", "ids": ids, "restore_point": restore_point }).to_string()
 }
 
-pub fn registry_undo_request(steps: &[UndoOp]) -> String {
+pub fn registry_undo_request(steps: &[RegStep]) -> String {
     json!({
         "kind": "registry_undo",
-        "steps": steps.iter().map(undo_json).collect::<Vec<_>>(),
+        "steps": steps.iter().map(saved_undo::reg_json).collect::<Vec<_>>(),
     })
     .to_string()
 }
@@ -204,7 +216,7 @@ struct RegistryApply {
 }
 
 struct RegistryUndo {
-    steps: Vec<UndoOp>,
+    steps: Vec<RegStep>,
     description: String,
 }
 
@@ -259,7 +271,7 @@ fn prepare_registry_undo(value: &Value) -> Result<Box<dyn AdminChange>, String> 
         .ok_or("There is nothing to undo.")?;
     let steps = list
         .iter()
-        .map(undo_from_json)
+        .map(saved_undo::reg_from)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Box::new(RegistryUndo {
         description: undo_description(&steps),
@@ -304,7 +316,7 @@ fn apply_description(items: &[&Item], restore_point: bool) -> String {
         );
     }
     text.push_str(
-        "\nItems that are already off, or not available on this edition, are skipped.\nYou can undo this run in Toolboks until you close it.",
+        "\nItems that are already off, or not available on this edition, are skipped.\nToolboks saves how to undo this run, so you can undo it later, also after a restart.",
     );
     limited(text)
 }
@@ -317,9 +329,9 @@ fn describe_value(value: &Option<RegValue>) -> String {
     }
 }
 
-fn undo_description(steps: &[UndoOp]) -> String {
+fn undo_description(steps: &[RegStep]) -> String {
     let mut text = String::from("Put these Windows settings back?\n");
-    for op in steps {
+    for op in steps.iter().map(|step| &step.step) {
         let title = item_by_id(op.id).map_or(op.id, |item| item.title);
         let hive = match op.hive {
             Hive::CurrentUser => "HKCU",
@@ -382,11 +394,15 @@ impl AdminChange for RegistryUndo {
     }
     fn apply(self: Box<Self>) -> Result<String, String> {
         let total = self.steps.len();
-        let mut steps = self.steps;
-        plan::undo(&mut steps, &mut WinRegistry);
+        let tally = saved_undo::undo_steps(
+            self.steps.into_iter().rev().collect(),
+            |step| (step.step.hive, step.step.path, step.step.name),
+            |step| saved_undo::undo_registry(step, &mut WinRegistry),
+        );
         Ok(json!({
             "total": total,
-            "remaining": steps.iter().map(undo_json).collect::<Vec<_>>(),
+            "remaining": tally.kept.iter().rev().map(saved_undo::reg_json).collect::<Vec<_>>(),
+            "refused": tally.refused,
         })
         .to_string())
     }
@@ -424,7 +440,7 @@ pub fn restore_from_json(value: &Value) -> Option<RestoreStatus> {
     }
 }
 
-fn start_name(start: StartType) -> Option<&'static str> {
+pub(crate) fn start_name(start: StartType) -> Option<&'static str> {
     match start {
         StartType::Auto => Some("auto"),
         StartType::AutoDelayed => Some("auto_delayed"),
@@ -434,7 +450,7 @@ fn start_name(start: StartType) -> Option<&'static str> {
     }
 }
 
-fn start_from(name: &str) -> Option<StartType> {
+pub(crate) fn start_from(name: &str) -> Option<StartType> {
     match name {
         "auto" => Some(StartType::Auto),
         "auto_delayed" => Some(StartType::AutoDelayed),
@@ -541,10 +557,10 @@ pub fn service_set_request(id: &str, restore_point: bool) -> String {
     json!({ "kind": "service_set", "id": id, "restore_point": restore_point }).to_string()
 }
 
-pub fn service_undo_request(steps: &[services::UndoStep]) -> String {
+pub fn service_undo_request(steps: &[ServiceStep]) -> String {
     json!({
         "kind": "service_undo",
-        "steps": steps.iter().map(service_step_json).collect::<Vec<_>>(),
+        "steps": steps.iter().map(saved_undo::service_json).collect::<Vec<_>>(),
     })
     .to_string()
 }
@@ -554,46 +570,41 @@ pub fn task_set_request(id: &str, enable: bool, restore_point: bool) -> String {
         .to_string()
 }
 
-pub fn task_undo_request(steps: &[tasks::UndoStep]) -> String {
+pub fn task_undo_request(steps: &[TaskStep]) -> String {
     json!({
         "kind": "task_undo",
-        "steps": steps.iter().map(task_step_json).collect::<Vec<_>>(),
+        "steps": steps.iter().map(saved_undo::task_json).collect::<Vec<_>>(),
     })
     .to_string()
 }
 
-/// How an undo batch ended: how many steps worked, and the ones to keep for another try.
+/// How an undo batch ended: how many steps worked, the ones to keep for another try (newest
+/// first), and why refused steps were left alone.
 pub fn undo_batch_from_json<T>(
     value: &Value,
     step: impl Fn(&Value) -> Result<T, String>,
-) -> (usize, Vec<T>) {
+) -> saved_undo::Tally<T> {
     let kept: Vec<T> = value["kept"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|entry| step(entry).ok())
         .collect();
-    (value["done"].as_u64().unwrap_or(0) as usize, kept)
+    saved_undo::Tally {
+        done: value["done"].as_u64().unwrap_or(0) as usize,
+        kept,
+        refused: refused_from_json(value),
+    }
 }
 
-/// Undoes steps in the order given (newest first), skipping any step whose key already failed so
-/// an older value is never put back over a newer one that is still in place.
-fn undo_batch<T, K: PartialEq>(
-    steps: Vec<T>,
-    key: impl Fn(&T) -> K,
-    mut undo_one: impl FnMut(&T) -> Result<(), String>,
-) -> (usize, Vec<T>) {
-    let (mut done, mut kept, mut blocked): (usize, Vec<T>, Vec<K>) = (0, Vec::new(), Vec::new());
-    for step in steps {
-        let step_key = key(&step);
-        if !blocked.contains(&step_key) && undo_one(&step).is_ok() {
-            done += 1;
-        } else {
-            blocked.push(step_key);
-            kept.push(step);
-        }
-    }
-    (done, kept)
+/// A helper's answer for an undo batch.
+fn batch_json<T>(tally: &saved_undo::Tally<T>, step: impl Fn(&T) -> Value) -> String {
+    json!({
+        "done": tally.done,
+        "kept": tally.kept.iter().map(step).collect::<Vec<_>>(),
+        "refused": tally.refused,
+    })
+    .to_string()
 }
 
 // ---- services and tasks: the helper ----------------------------------------------------------
@@ -605,7 +616,7 @@ struct ServiceSet {
 }
 
 struct ServiceUndo {
-    steps: Vec<services::UndoStep>,
+    steps: Vec<ServiceStep>,
     description: String,
 }
 
@@ -617,7 +628,7 @@ struct TaskSet {
 }
 
 struct TaskUndo {
-    steps: Vec<tasks::UndoStep>,
+    steps: Vec<TaskStep>,
     description: String,
 }
 
@@ -638,7 +649,7 @@ fn restore_line(restore_point: bool) -> &'static str {
 
 fn service_set_description(def: &ServiceDef, restore_point: bool) -> String {
     limited(format!(
-        "Switch this Windows service off?\n\n\u{2022} {} ({}, all users of this PC)\n  {}\n  Could stop working: {}\n  Its start type becomes: {}\n{}\nWindows checks the service again before changing it.\nYou can undo this in Toolboks until you close it.",
+        "Switch this Windows service off?\n\n\u{2022} {} ({}, all users of this PC)\n  {}\n  Could stop working: {}\n  Its start type becomes: {}\n{}\nWindows checks the service again before changing it.\nToolboks saves how to undo this, so you can undo it later, also after a restart.",
         def.title,
         risk_word(def.risk),
         def.what_changes,
@@ -650,7 +661,7 @@ fn service_set_description(def: &ServiceDef, restore_point: bool) -> String {
 
 fn task_set_description(def: &TaskDef, enable: bool, restore_point: bool) -> String {
     limited(format!(
-        "Switch this scheduled task {}?\n\n\u{2022} {} ({}, all users of this PC)\n  {}\n  Could stop working: {}\n  Task: {}\n{}\nWindows checks the task again before changing it.\nYou can undo this in Toolboks until you close it.",
+        "Switch this scheduled task {}?\n\n\u{2022} {} ({}, all users of this PC)\n  {}\n  Could stop working: {}\n  Task: {}\n{}\nWindows checks the task again before changing it.\nToolboks saves how to undo this, so you can undo it later, also after a restart.",
         if enable { "on" } else { "off" },
         def.title,
         risk_word(def.risk),
@@ -661,9 +672,9 @@ fn task_set_description(def: &TaskDef, enable: bool, restore_point: bool) -> Str
     ))
 }
 
-fn service_undo_description(steps: &[services::UndoStep]) -> String {
+fn service_undo_description(steps: &[ServiceStep]) -> String {
     let mut text = String::from("Put these Windows services back?\n");
-    for step in steps {
+    for step in steps.iter().map(|step| &step.step) {
         let title = service_by_id(step.id).map_or(step.id, |def| def.title);
         text.push_str(&format!(
             "\n\u{2022} {title}\n  Start type \u{2192} {}\n",
@@ -673,9 +684,9 @@ fn service_undo_description(steps: &[services::UndoStep]) -> String {
     limited(text)
 }
 
-fn task_undo_description(steps: &[tasks::UndoStep]) -> String {
+fn task_undo_description(steps: &[TaskStep]) -> String {
     let mut text = String::from("Put these scheduled tasks back?\n");
-    for step in steps {
+    for step in steps.iter().map(|step| &step.step) {
         let title = task_by_id(step.id).map_or(step.id, |def| def.title);
         text.push_str(&format!(
             "\n\u{2022} {title}\n  \u{2192} {}\n",
@@ -727,7 +738,7 @@ fn steps_list(value: &Value) -> Result<&Vec<Value>, String> {
 fn prepare_service_undo(value: &Value) -> Result<Box<dyn AdminChange>, String> {
     let steps = steps_list(value)?
         .iter()
-        .map(service_step_from)
+        .map(saved_undo::service_from)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Box::new(ServiceUndo {
         description: service_undo_description(&steps),
@@ -738,7 +749,7 @@ fn prepare_service_undo(value: &Value) -> Result<Box<dyn AdminChange>, String> {
 fn prepare_task_undo(value: &Value) -> Result<Box<dyn AdminChange>, String> {
     let steps = steps_list(value)?
         .iter()
-        .map(task_step_from)
+        .map(saved_undo::task_from)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Box::new(TaskUndo {
         description: task_undo_description(&steps),
@@ -793,16 +804,12 @@ impl AdminChange for ServiceUndo {
         self.description.clone()
     }
     fn apply(self: Box<Self>) -> Result<String, String> {
-        let (done, kept) = undo_batch(
+        let tally = saved_undo::undo_steps(
             self.steps,
-            |step| step.name,
-            |step| services::undo(&mut WinServices, step),
+            |step| step.step.name,
+            |step| saved_undo::undo_service(step, &mut WinServices),
         );
-        Ok(json!({
-            "done": done,
-            "kept": kept.iter().map(service_step_json).collect::<Vec<_>>(),
-        })
-        .to_string())
+        Ok(batch_json(&tally, saved_undo::service_json))
     }
 }
 
@@ -840,16 +847,12 @@ impl AdminChange for TaskUndo {
     fn apply(self: Box<Self>) -> Result<String, String> {
         let steps = self.steps;
         let worker = std::thread::spawn(move || {
-            let (done, kept) = undo_batch(
+            let tally = saved_undo::undo_steps(
                 steps,
-                |step| step.path,
-                |step| tasks::undo(&mut WinTasks, step),
+                |step| step.step.path,
+                |step| saved_undo::undo_task(step, &mut WinTasks),
             );
-            json!({
-                "done": done,
-                "kept": kept.iter().map(task_step_json).collect::<Vec<_>>(),
-            })
-            .to_string()
+            batch_json(&tally, saved_undo::task_json)
         });
         worker
             .join()
@@ -937,10 +940,10 @@ pub fn startup_set_request(entry: &Entry, enable: bool) -> String {
     .to_string()
 }
 
-pub fn startup_undo_request(steps: &[startup::UndoStep]) -> String {
+pub fn startup_undo_request(steps: &[StartupStep]) -> String {
     json!({
         "kind": "startup_undo",
-        "steps": steps.iter().map(startup_step_json).collect::<Vec<_>>(),
+        "steps": steps.iter().map(saved_undo::startup_json).collect::<Vec<_>>(),
     })
     .to_string()
 }
@@ -958,7 +961,7 @@ struct StartupSet {
 }
 
 struct StartupUndo {
-    steps: Vec<startup::UndoStep>,
+    steps: Vec<StartupStep>,
     description: String,
 }
 
@@ -970,7 +973,7 @@ fn startup_set_description(entry: &Entry, enable: bool) -> String {
         _ => "",
     };
     limited(format!(
-        "Switch this startup item {}?\n\n\u{2022} {} ({})\n  Publisher: {}\n  Runs: {}{care}\n\nThe entry stays where it is; only whether it starts with Windows changes.\nYou can undo this in Toolboks until you close it.",
+        "Switch this startup item {}?\n\n\u{2022} {} ({})\n  Publisher: {}\n  Runs: {}{care}\n\nThe entry stays where it is; only whether it starts with Windows changes.\nToolboks saves how to undo this, so you can undo it later, also after a restart.",
         if enable { "on" } else { "off" },
         entry.name,
         entry.source.label(),
@@ -979,9 +982,9 @@ fn startup_set_description(entry: &Entry, enable: bool) -> String {
     ))
 }
 
-fn startup_undo_description(steps: &[startup::UndoStep]) -> String {
+fn startup_undo_description(steps: &[StartupStep]) -> String {
     let mut text = String::from("Put these startup items back?\n");
-    for step in steps {
+    for step in steps.iter().map(|step| &step.step) {
         text.push_str(&format!(
             "\n\u{2022} {} ({})\n  Its start-up setting goes back to what it was.\n",
             step.name,
@@ -1020,10 +1023,10 @@ fn prepare_startup_set(value: &Value) -> Result<Box<dyn AdminChange>, String> {
 fn prepare_startup_undo(value: &Value) -> Result<Box<dyn AdminChange>, String> {
     let steps = steps_list(value)?
         .iter()
-        .map(startup_step_from)
+        .map(saved_undo::startup_from)
         .collect::<Result<Vec<_>, _>>()?;
     let entries = current_entries()?;
-    if let Some(step) = steps.iter().find(|step| {
+    if let Some(step) = steps.iter().map(|step| &step.step).find(|step| {
         !entries
             .iter()
             .any(|entry| entry.source == step.source && entry.name == step.name)
@@ -1067,22 +1070,19 @@ impl AdminChange for StartupUndo {
         self.description.clone()
     }
     fn apply(self: Box<Self>) -> Result<String, String> {
-        let (done, kept) = undo_batch(
+        let tally = saved_undo::undo_steps(
             self.steps,
-            |step| (step.source, step.name.clone()),
-            |step| startup::undo(&mut WinStartup, step),
+            |step| (step.step.source, step.step.name.clone()),
+            |step| saved_undo::undo_startup(step, &mut WinStartup),
         );
-        Ok(json!({
-            "done": done,
-            "kept": kept.iter().map(startup_step_json).collect::<Vec<_>>(),
-        })
-        .to_string())
+        Ok(batch_json(&tally, saved_undo::startup_json))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::saved_undo::StepResult;
 
     fn request(json: &str) -> AdminRequest {
         AdminRequest {
@@ -1183,11 +1183,11 @@ mod tests {
     #[test]
     fn the_undo_preview_names_each_value() {
         let op = step_for(machine_item());
-        let text = undo_description(std::slice::from_ref(&op));
+        let text = undo_description(&[saved_undo::recovery(op.clone())]);
         assert!(text.contains(op.name) && text.contains("HKLM") && text.contains("1 (0x1)"));
         let mut removed = op;
         removed.previous = None;
-        assert!(undo_description(&[removed]).contains("removed"));
+        assert!(undo_description(&[saved_undo::recovery(removed)]).contains("removed"));
     }
 
     #[test]
@@ -1202,7 +1202,7 @@ mod tests {
             // The item may already be off on this PC.
             Err(error) => assert!(error.contains("Nothing to change"), "{error}"),
         }
-        let undo = registry_undo_request(&[step_for(item)]);
+        let undo = registry_undo_request(&[saved_undo::recovery(step_for(item))]);
         assert!(prepare_admin(&request(&undo)).is_ok());
     }
 
@@ -1299,27 +1299,47 @@ mod tests {
 
     #[test]
     fn an_undo_batch_never_puts_an_older_value_over_a_failed_newer_one() {
-        // Newest first: b2 fails, so the older b1 for the same key must be kept, not applied.
+        // Newest first: a1 fails, so the older a3 for the same key must be kept, not applied.
         let steps = vec![("a", 1), ("b", 2), ("a", 3)];
-        let (done, kept) = undo_batch(
+        let tally = saved_undo::undo_steps(
             steps,
             |step| step.0,
             |step| {
                 if step.1 == 1 {
-                    Err("no".into())
+                    StepResult::Failed("no".into())
                 } else {
-                    Ok(())
+                    StepResult::Done
                 }
             },
         );
-        assert_eq!(done, 1);
-        assert_eq!(kept, vec![("a", 1), ("a", 3)]);
-        let (done_json, kept_json) = (
-            json!({ "done": done, "kept": [] }),
-            undo_batch_from_json(&json!({ "done": 1, "kept": [] }), |_| Ok(1)),
+        assert_eq!(tally.done, 1);
+        assert_eq!(tally.kept, vec![("a", 1), ("a", 3)]);
+        let answer = batch_json(&tally, |step| json!(step.1));
+        let back = undo_batch_from_json(&serde_json::from_str(&answer).unwrap(), |v| {
+            v.as_u64().ok_or_else(String::new)
+        });
+        assert_eq!((back.done, back.kept), (1, vec![1, 3]));
+    }
+
+    #[test]
+    fn a_refused_step_is_dropped_with_its_reason_and_blocks_older_steps() {
+        let steps = vec![("a", 1), ("b", 2), ("a", 3)];
+        let tally = saved_undo::undo_steps(
+            steps,
+            |step| step.0,
+            |step| match step.1 {
+                1 => StepResult::Refused("A was changed".into()),
+                _ => StepResult::Done,
+            },
         );
-        assert_eq!(done_json["done"], 1);
-        assert_eq!(kept_json.0, 1);
+        assert_eq!(tally.done, 1);
+        assert_eq!(tally.kept, vec![("a", 3)]);
+        assert_eq!(tally.refused, vec!["A was changed".to_string()]);
+        let answer = batch_json(&tally, |step| json!(step.1));
+        let back = undo_batch_from_json(&serde_json::from_str(&answer).unwrap(), |v| {
+            v.as_u64().ok_or_else(String::new)
+        });
+        assert_eq!(back.refused, vec!["A was changed".to_string()]);
     }
 
     #[test]
@@ -1349,7 +1369,10 @@ mod tests {
             name: service.name,
             previous: StartType::Manual,
         };
-        let undo = prepare_admin(&request(&service_undo_request(&[step]))).unwrap();
+        let undo = prepare_admin(&request(&service_undo_request(&[
+            saved_undo::service_done(step),
+        ])))
+        .unwrap();
         assert!(undo.description().contains("Manual"));
         assert!(prepare_admin(&request(r#"{"kind":"task_undo","steps":[]}"#)).is_err());
     }
@@ -1414,6 +1437,11 @@ mod tests {
             name: "No Such Entry Exists 12345".into(),
             previous: None,
         };
-        assert!(prepare_admin(&request(&startup_undo_request(&[step]))).is_err());
+        assert!(
+            prepare_admin(&request(&startup_undo_request(&[saved_undo::recovery(
+                step
+            )])))
+            .is_err()
+        );
     }
 }

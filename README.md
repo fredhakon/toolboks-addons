@@ -320,9 +320,11 @@ The built-in provider stays in the host until the final removal and "Restore you
 ## Memory Cleaner benchmark
 
 Issue #32 asks whether the memory priority, targeted trim and low-priority cache purge actions
-help at all. `docs/RESEARCH-memory-cleaning.md` holds the protocol, the result tables (empty until
-measured on 8 GB and 16 GB+ PCs) and the decision rules; no benefit is claimed yet. Priority-only
-has no UI action, so only trim and purge are scripted.
+help at all. `docs/RESEARCH-memory-cleaning.md` holds the protocol, the result tables and the
+decision rules. Measured on one 32 GB PC (trim vs nothing): no benefit could be shown and a cost on
+next use was; the 8 GB class and the administrator-only purge are not measured. Priority-only
+has no UI action, so only trim and purge are scripted. `scripts/bench-memory-driven.ps1` runs the
+`none` and `trim` arms without a window or a person (benchmark-owned processes only).
 `scripts/bench-memory.ps1` collects the numbers (it does not run the action, needs no
 administrator rights and writes only under `-OutDir`); try it with `-Arm none -DryRun`.
 

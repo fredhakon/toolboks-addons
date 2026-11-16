@@ -29,6 +29,7 @@ fn manifest_matches_the_executable() {
         [
             toolboks_addon_sdk::Capability::FilesystemRead,
             toolboks_addon_sdk::Capability::LocalPreferences,
+            toolboks_addon_sdk::Capability::Administrator,
         ]
     );
 }

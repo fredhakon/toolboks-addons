@@ -1,10 +1,13 @@
 //! Event Watch: reads the Windows event logs and shows live errors and what happened before a
 //! bluescreen, a hard reset or a hardware fault. All Event Log work runs on worker threads.
-//! It only reads: it never clears a log and needs no administrator rights.
+//! It only reads: it never clears a log. The opt-in latency check (`latency`, `admin`) is the
+//! one part that asks for administrator rights, each time, through the SDK's separate helper.
 
+pub mod admin;
 pub mod analysis;
 pub mod bugchecks;
 pub mod catalog;
+mod latency;
 pub mod model;
 mod page;
 pub mod source;
@@ -14,10 +17,22 @@ use toolboks_addon_sdk::{NativeAddon, TutorialStep};
 
 pub const ID: &str = "toolboks.event-watch";
 /// Page names, in order. They match `host-services.json`.
-pub const PAGES: [&str; 3] = ["Live", "Crashes", "Summary"];
+pub const PAGES: [&str; 4] = ["Live", "Crashes", "Summary", "Latency check"];
+/// Index of the Latency check page in [`PAGES`].
+const LATENCY_PAGE: usize = 3;
+
+/// Validates the one administrator action (the latency check) inside the separate helper. It
+/// runs nothing; the SDK's confirmation window decides whether `apply` runs.
+pub fn prepare_admin(
+    request: &toolboks_addon_sdk::AdminRequest,
+) -> Result<Box<dyn toolboks_addon_sdk::admin::AdminChange>, String> {
+    admin::prepare_admin(request)
+}
 
 pub struct EventWatch {
     page: page::Page,
+    /// Kept across `suspend`, so an answer from the helper still lands. Memory only.
+    latency: latency::Latency,
     index: usize,
 }
 
@@ -25,6 +40,7 @@ impl Default for EventWatch {
     fn default() -> Self {
         Self {
             page: page::Page::new(),
+            latency: latency::Latency::default(),
             index: 0,
         }
     }
@@ -47,8 +63,27 @@ impl NativeAddon for EventWatch {
         _preferences: &mut BTreeMap<String, serde_json::Value>,
     ) -> bool {
         style_once(ui.ctx());
-        self.page.ui(ui, self.index);
+        if self.index == LATENCY_PAGE {
+            self.latency.ui(ui);
+        } else {
+            self.page.ui(ui, self.index);
+        }
         false
+    }
+    fn set_capabilities(&mut self, capabilities: &[toolboks_addon_sdk::Capability]) {
+        self.latency.set_capabilities(capabilities);
+    }
+    fn prepare_admin(
+        &mut self,
+        request: &toolboks_addon_sdk::AdminRequest,
+    ) -> Result<Box<dyn toolboks_addon_sdk::admin::AdminChange>, String> {
+        admin::prepare_admin(request)
+    }
+    fn admin_result(&mut self, id: u64, outcome: toolboks_addon_sdk::AdminOutcome) {
+        self.latency.admin_result(id, outcome);
+    }
+    fn take_host_request(&mut self) -> Option<toolboks_addon_sdk::HostRequest> {
+        self.latency.take_request()
     }
     fn navigate(&mut self, page: &str) {
         self.index = page.parse::<usize>().unwrap_or(0).min(PAGES.len() - 1);
@@ -68,6 +103,7 @@ impl NativeAddon for EventWatch {
             ("1", "table", "Crashes · episodes and timeline", "Crashes groups evidence around bluescreens, unexpected restarts and hardware faults. Select an episode to inspect the surrounding timeline. Events near a crash can be consequences rather than causes."),
             ("1", "inspector", "Crashes · evidence and dumps", "The inspector explains the selected evidence and can offer additional details or dump reading when available. A stop code or named component is a starting point for investigation, not proof of the root cause."),
             ("2", "table", "Summary · recurring patterns", "The summary highlights notable patterns in the loaded period and reports when nothing notable was found. Limited log access or retention can hide older events, so absence of evidence is not a complete health guarantee."),
+            ("3", "table", "Latency check · slow drivers", "Run a short Windows recording while stutter or audio crackle happens, and see which drivers held the processor the longest. It asks for administrator rights each time and never runs on its own. The recording is deleted after it is read. A long run is a clue, not proof of the cause."),
         ]
         .into_iter()
         .map(|(p, t, h, d)| TutorialStep::new(p, t, h, d))

@@ -510,6 +510,8 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "egui_extras",
+ "latency-trace",
+ "serde",
  "serde_json",
  "toolboks-addon-proto",
  "toolboks-addon-sdk",

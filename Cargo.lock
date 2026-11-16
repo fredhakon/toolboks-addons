@@ -1055,6 +1055,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pc-checks"
+version = "0.1.0"
+dependencies = [
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "peniko"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

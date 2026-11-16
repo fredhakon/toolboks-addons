@@ -13,6 +13,7 @@ mod nvml;
 mod overview;
 mod power;
 mod processes;
+mod recording;
 mod sampler;
 mod tutorial;
 
@@ -142,6 +143,9 @@ pub struct Resources {
     connections: connections::Page,
     /// Which page is shown: 0 Overview, 1 Details, 2 Processes, 3 Connections.
     page: usize,
+    /// Resource history recorder (off unless the preference switches it on). Kept across
+    /// `suspend`, so it records while the page is closed and Toolboks sits in the tray.
+    recording: recording::Control,
 }
 
 impl Resources {
@@ -171,6 +175,7 @@ impl Resources {
             processes: processes::Page::new(),
             connections: connections::Page::new(),
             page: 0,
+            recording: recording::Control::default(),
         }
     }
 }
@@ -236,6 +241,16 @@ fn style_once(ctx: &egui::Context) {
 }
 
 impl NativeAddon for Resources {
+    /// Starts or stops the history recorder from the add-on's own preferences (default off).
+    fn load_preferences(
+        &mut self,
+        preferences: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        self.recording.apply(
+            recording::wanted(preferences),
+            recording::Recorder::start_system,
+        );
+    }
     fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -260,10 +275,18 @@ impl NativeAddon for Resources {
         self.poll(ctx);
     }
     /// Stops sampling and drops the graphs, as the built-in tool does when it is not shown.
+    /// The history recorder is the one thing kept: it runs on its own thread.
     fn suspend(&mut self) {
         let page = self.page;
+        let recording = std::mem::take(&mut self.recording);
         *self = Self::new();
         self.page = page;
+        self.recording = recording;
+    }
+    /// False: the recorder has its own thread and needs no 200 ms background ticks, so a
+    /// suspended Resource Monitor wakes nothing (and does nothing at all with recording off).
+    fn has_background_work(&self) -> bool {
+        false
     }
     fn status_items(&self) -> Vec<StatusItem> {
         let live = self.last_at.is_some_and(|t| t.elapsed() < LIVE_WITHIN);
@@ -408,6 +431,30 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_is_off_by_default_and_survives_suspend() {
+        let mut addon = Resources::new();
+        addon.load_preferences(&Default::default());
+        assert!(!addon.recording.is_on(), "off unless switched on");
+        addon.recording.apply(true, || {
+            recording::Recorder::spawn(std::time::Duration::from_secs(3600), || None)
+        });
+        let store = addon.recording.store().unwrap();
+        addon.page = 2;
+        addon.suspend();
+        assert_eq!(addon.page, 2);
+        assert!(std::sync::Arc::ptr_eq(
+            &store,
+            &addon.recording.store().unwrap()
+        ));
+        addon.resume();
+        assert!(addon.recording.is_on());
+        // Switched off in the preferences: the recorder goes.
+        addon.load_preferences(&Default::default());
+        assert!(!addon.recording.is_on());
+        assert!(!addon.has_background_work());
+    }
 
     #[test]
     fn find_or_create_reuses_series() {

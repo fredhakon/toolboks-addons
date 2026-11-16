@@ -189,7 +189,7 @@ fn mean_mhz(freqs: &[u64]) -> u64 {
 }
 
 /// Bytes over a span of seconds; zero when the span is not a usable positive number.
-fn bytes_per_second(bytes: u64, secs: f64) -> f64 {
+pub(crate) fn bytes_per_second(bytes: u64, secs: f64) -> f64 {
     if secs <= 0.0 || !secs.is_finite() {
         0.0
     } else {
@@ -308,7 +308,7 @@ fn read_counts() -> Option<SystemCounts> {
 }
 
 /// Per-process CPU is percent of one core; this converts it to percent of the whole machine.
-fn cpu_percent_of_machine(raw: f32, logical: usize) -> f64 {
+pub(crate) fn cpu_percent_of_machine(raw: f32, logical: usize) -> f64 {
     if logical == 0 || !raw.is_finite() {
         return 0.0;
     }
@@ -345,7 +345,7 @@ fn top_n(items: impl IntoIterator<Item = (String, f64)>, n: usize) -> Vec<ProcUs
     rows
 }
 
-fn refresh_procs(sys: &mut System) {
+pub(crate) fn refresh_procs(sys: &mut System) {
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
@@ -613,7 +613,7 @@ impl Drop for CpuClock {
 }
 
 /// Sums bytes read and written by all disks since the previous refresh.
-fn disk_totals(disks: &Disks) -> (u64, u64) {
+pub(crate) fn disk_totals(disks: &Disks) -> (u64, u64) {
     disks.iter().fold((0, 0), |(r, w), d| {
         let u = d.usage();
         (r + u.read_bytes, w + u.written_bytes)
@@ -621,7 +621,7 @@ fn disk_totals(disks: &Disks) -> (u64, u64) {
 }
 
 /// Sums bytes received and sent by counted adapters since the previous refresh.
-fn net_totals(nets: &Networks) -> (u64, u64) {
+pub(crate) fn net_totals(nets: &Networks) -> (u64, u64) {
     nets.iter()
         .filter(|(name, _)| is_counted_adapter(&name.to_string_lossy()))
         .fold((0, 0), |(d, u), (_, n)| {

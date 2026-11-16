@@ -162,9 +162,10 @@ fn read_string(key: &Key, name: &str) -> Reading<String> {
             "registry value {name} is not text"
         )));
     }
-    let units: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+    let (pairs, _) = data.as_chunks::<2>();
+    let units: Vec<u16> = pairs
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .take_while(|u| *u != 0)
         .collect();
     Ok(String::from_utf16_lossy(&units))

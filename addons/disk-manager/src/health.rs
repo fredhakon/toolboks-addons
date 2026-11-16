@@ -436,7 +436,8 @@ fn read(letter: &str) -> Result<(Protocol, String, Vec<u8>), ReadError> {
             AtaFlags: (ATA_FLAGS_DATA_IN | ATA_FLAGS_DRDY_REQUIRED) as u16,
             DataTransferLength: PAGE as u32,
             TimeOutValue: 5,
-            DataBufferOffset: std::mem::offset_of!(Smart, data),
+            // `data` follows the header in this repr(C) struct, and a u8 array needs no padding.
+            DataBufferOffset: std::mem::size_of::<ATA_PASS_THROUGH_EX>(),
             CurrentTaskFile: [0xD0, 1, 1, 0x4F, 0xC2, 0xA0, 0xB0, 0],
             ..Default::default()
         },

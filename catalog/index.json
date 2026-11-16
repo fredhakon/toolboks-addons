@@ -308,6 +308,43 @@
       "release_notes": "Release disk-manager-v0.3.0.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.disk-manager",
+      "title": "Disk Manager",
+      "short_description": "Map storage and find large files. Keeps your last scan of each drive on this PC. Saved file names stay local; remembering scans can be turned off.",
+      "long_description": "Stratum's disk analysis, built for your Toolboks workspace. Scan any drive or folder, explore an interactive space map, find the largest files, filter by size and age, inspect file types, and export your findings. Analyze fragmentation, inspect Windows optimization history, defragment hard drives, or TRIM SSDs with administrator access. Optimization only runs when requested. Scans are read-only, run in the background, and can be cancelled. Links and junctions are skipped; access errors are reported transparently. Sizes are logical file lengths and may differ from allocated disk usage. Drive-changing optimization (defrag and TRIM) is made by a small separate helper that shows its own Confirm or Cancel window; Disk Manager itself never runs as administrator. Keeps your last scan of each drive on this PC, in the add-on data folder, never in preferences or online. Turn off Remember my last scan or use Delete saved scans to remove saved file names. Quick rescans compare folder times; in-place file size changes require Full rescan. Drive optimization also shows drive health (Healthy, Watch or Replace soon) from the NVMe health log or SATA SMART data, with the raw values one click away; drives that only report health to administrators are named as such.",
+      "publisher": "Toolboks",
+      "byline": "by stratum",
+      "category": "Storage",
+      "icon": "storage",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "filesystem_read",
+        "local_preferences",
+        "user_exports",
+        "drive_optimize"
+      ],
+      "pages": [
+        "Overview",
+        "Largest files",
+        "File types",
+        "Scan details",
+        "Optimization"
+      ],
+      "background": true,
+      "data_note": "Keeps your last scan of each drive on this PC (file and folder names).",
+      "kind": "native",
+      "version": "0.3.1",
+      "min_toolboks_version": "0.14.0",
+      "protocol_version": 3,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/disk-manager-v0.3.1/disk-manager.exe",
+      "size": 3785728,
+      "sha256": "9932e2f456ebb910225e232a3be91aa960e82229bd13e3445e7b12914cc254a6",
+      "release_notes": "Release disk-manager-v0.3.1.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

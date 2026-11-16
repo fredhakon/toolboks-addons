@@ -456,6 +456,72 @@ mod tests {
         assert!(!addon.has_background_work());
     }
 
+    /// The real SDK runtime loop: the host shows the page, then switches to another add-on
+    /// (or hides the window to the tray), which arrives as `Suspend`. Recording keeps adding
+    /// steps while suspended, and switching it off in the preferences ends the thread.
+    #[test]
+    fn recording_keeps_sampling_while_suspended_and_stops_when_switched_off() {
+        use std::time::{Duration, Instant};
+        use toolboks_addon_sdk::runtime::proto::memory::duplex;
+        use toolboks_addon_sdk::runtime::proto::{
+            self, AddonMessage, Hello, HostMessage, InputBatch, Theme,
+        };
+        let wait_until = |what: &str, mut done: Box<dyn FnMut() -> bool>| {
+            let until = Instant::now() + Duration::from_secs(20);
+            while !done() {
+                assert!(Instant::now() < until, "timed out: {what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let mut addon = Resources::new();
+        addon
+            .recording
+            .apply(true, || recording::fake_recorder(Duration::from_millis(10)));
+        let store = addon.recording.store().unwrap();
+        let (host, addon_side) = duplex();
+        let runtime = std::thread::spawn(move || {
+            toolboks_addon_sdk::runtime::run_addon_on(addon_side, addon, ID)
+        });
+        let (mut reader, mut writer) = host.split();
+        proto::host_handshake(&mut reader, &mut writer, &Hello::new(ID, "test")).unwrap();
+        std::thread::spawn(move || while reader.read::<AddonMessage>().is_ok() {});
+        let on = serde_json::json!({ recording::PREF_KEY: true }).to_string();
+        writer
+            .write(&HostMessage::LoadPreferences { json: on })
+            .unwrap();
+        writer
+            .write(&HostMessage::Input(InputBatch {
+                seq: 1,
+                size: [800.0, 600.0],
+                pixels_per_point: 1.0,
+                theme: Theme::Dark,
+                window_focused: true,
+                events: vec![],
+            }))
+            .unwrap();
+        // Another add-on is opened, or the window goes to the tray.
+        writer.write(&HostMessage::Suspend).unwrap();
+        let steps = || store.lock().unwrap().fine().len();
+        let at_suspend = steps();
+        wait_until(
+            "steps while suspended",
+            Box::new(|| steps() >= at_suspend + 5),
+        );
+        // Switched off: the recorder thread ends and releases its history.
+        writer
+            .write(&HostMessage::LoadPreferences { json: "{}".into() })
+            .unwrap();
+        wait_until(
+            "recorder thread ended",
+            Box::new(|| std::sync::Arc::strong_count(&store) == 1),
+        );
+        let after_off = steps();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(steps(), after_off, "nothing is recorded once off");
+        writer.write(&HostMessage::Quit).unwrap();
+        runtime.join().unwrap().unwrap();
+    }
+
     #[test]
     fn find_or_create_reuses_series() {
         let mut k = Keyed::<2>::new();

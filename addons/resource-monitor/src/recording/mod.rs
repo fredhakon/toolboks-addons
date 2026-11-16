@@ -188,6 +188,21 @@ impl Control {
     }
 }
 
+/// A recorder over a fake system with one app, for tests outside this module.
+#[cfg(test)]
+pub(crate) fn fake_recorder(step: Duration) -> Option<Recorder> {
+    struct One;
+    impl Source for One {
+        fn read(&mut self) -> Reading {
+            Reading {
+                totals: store::totals(10.0),
+                procs: vec![apps::proc("a.exe", 1.0, 100)],
+            }
+        }
+    }
+    Recorder::spawn(step, || Some(Box::new(One) as Box<dyn Source>))
+}
+
 #[cfg(test)]
 mod tests {
     use super::apps::proc;

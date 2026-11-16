@@ -17,7 +17,7 @@ use toolboks_addon_sdk::{
 };
 use windows::{core::PCWSTR, Win32::UI::Shell::ShellExecuteW};
 
-use engine::{Action, CHOICES};
+use engine::{Action, Choice, Evidence, CHOICES, GROUPS};
 use toolboks_shared::ui as theme;
 
 pub const ID: &str = "toolboks.system-profiles";
@@ -25,6 +25,8 @@ const PAGE: &str = "Gaming";
 /// Why a separate window appears when a profile is applied or restored.
 const ADMIN_NOTE: &str =
     "A separate administrator window shows exactly what will change. Confirm or cancel there.";
+/// A restore point and registry backup are made first, but neither promises a full return.
+const RECOVERY_NOTE: &str = "A restore point and a registry backup are made first. They do not guarantee full recovery: Restore only puts back the registry values and power plan Toolboks changed, and leaves values changed by something else.";
 const LOG_LINES: usize = 120;
 
 #[derive(Default)]
@@ -40,7 +42,8 @@ pub struct Gaming {
     log: VecDeque<String>,
     status: Option<Result<(), String>>,
     message: Option<String>,
-    preview: Option<Vec<String>>,
+    /// The last review. Apply needs one made for exactly the current state (see `ReviewKey`).
+    preview: Option<Review>,
 }
 
 struct Guide {
@@ -141,22 +144,137 @@ fn heading(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).size(theme::TEXT_SECTION).strong());
 }
 
+/// Only choices the user saved are on. Nothing is preselected, whatever its evidence.
+fn saved_selection(preferences: &BTreeMap<String, serde_json::Value>) -> BTreeSet<&'static str> {
+    let ids = preferences
+        .get("selected")
+        .and_then(|value| value.as_array());
+    CHOICES
+        .iter()
+        .filter(|choice| ids.is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(choice.id))))
+        .map(|choice| choice.id)
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReviewMode {
+    Apply,
+    Recovery,
+}
+
+/// What a review was made for. Apply unlocks only while this equals the current state.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ReviewKey {
+    mode: ReviewMode,
+    selected: Vec<&'static str>,
+    enable_protection: bool,
+}
+
+/// What would change, per heading, for the state in `key`.
+struct Review {
+    key: ReviewKey,
+    groups: Vec<(String, Vec<String>)>,
+}
+
+const PROTECTION_LINE: &str =
+    "Turned on for the Windows drive. Windows keeps it enabled after a profile restore.";
+
+fn review_key(
+    recovery: bool,
+    selected: &BTreeSet<&'static str>,
+    enable_protection: bool,
+) -> ReviewKey {
+    ReviewKey {
+        mode: if recovery {
+            ReviewMode::Recovery
+        } else {
+            ReviewMode::Apply
+        },
+        selected: selected.iter().copied().collect(),
+        enable_protection,
+    }
+}
+
+/// Keeps a review only if it was made for the current state.
+fn current_review(review: Option<Review>, key: &ReviewKey) -> Option<Review> {
+    review.filter(|review| review.key == *key)
+}
+
+/// The apply review: the System Protection change (if chosen) first, then each choice's values.
+fn apply_review(key: &ReviewKey, by_choice: Vec<(&'static str, Vec<String>)>) -> Review {
+    let mut groups = Vec::new();
+    if key.enable_protection {
+        groups.push((
+            "System Protection".to_string(),
+            vec![PROTECTION_LINE.into()],
+        ));
+    }
+    groups.extend(
+        by_choice
+            .into_iter()
+            .map(|(title, lines)| (title.to_string(), lines)),
+    );
+    Review {
+        key: key.clone(),
+        groups,
+    }
+}
+
+/// Apply is only offered after a review of exactly this apply selection. A recovery review or
+/// a review of an older selection never counts.
+fn can_apply(busy: bool, key: &ReviewKey, review: Option<&Review>) -> bool {
+    !busy
+        && key.mode == ReviewMode::Apply
+        && (!key.selected.is_empty() || key.enable_protection)
+        && review.is_some_and(|review| review.key == *key)
+}
+
+/// Text badge: the label carries the meaning, the colour only backs it up.
+fn badge(ui: &mut egui::Ui, evidence: Option<Evidence>) {
+    let (text, color) = match evidence {
+        Some(Evidence::Measured) => (Evidence::Measured.label(), theme::GREEN),
+        Some(Evidence::Mixed) => (Evidence::Mixed.label(), theme::AMBER),
+        Some(Evidence::Unproven) => (Evidence::Unproven.label(), theme::RED),
+        None => ("Not a speed tweak", theme::MUTED),
+    };
+    ui.label(
+        RichText::new(text)
+            .size(theme::TEXT_CAPTION)
+            .strong()
+            .color(color),
+    );
+}
+
+fn choice_row(ui: &mut egui::Ui, choice: &Choice, on: &mut bool) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        changed = ui.checkbox(on, choice.title).changed();
+        badge(ui, choice.evidence);
+    });
+    ui.indent(choice.id, |ui| {
+        ui.label(choice.why);
+        ui.label(RichText::new(format!("Changes: {}", choice.detail)).color(theme::MUTED));
+        if choice.source.starts_with("https://") {
+            ui.hyperlink_to("Source: Microsoft Learn", choice.source);
+        } else {
+            ui.label(
+                RichText::new(choice.source)
+                    .size(theme::TEXT_CAPTION)
+                    .color(theme::MUTED),
+            );
+        }
+    });
+    ui.add_space(theme::GAP);
+    changed
+}
+
 impl Gaming {
     fn initialize(&mut self, preferences: &BTreeMap<String, serde_json::Value>) {
         if self.initialized {
             return;
         }
         self.initialized = true;
-        let selected = preferences
-            .get("selected")
-            .and_then(|value| value.as_array());
-        for choice in CHOICES {
-            if selected.map_or(choice.id == "game-mode", |ids| {
-                ids.iter().any(|id| id.as_str() == Some(choice.id))
-            }) {
-                self.selected.insert(choice.id);
-            }
-        }
+        self.selected = saved_selection(preferences);
         self.enable_protection = preferences
             .get("enable_protection")
             .and_then(|value| value.as_bool())
@@ -242,63 +360,84 @@ impl Gaming {
         let busy = self.pending.is_some();
         let recovery = engine::has_backup();
         heading(ui, "Profile changes");
-        ui.label(RichText::new("Review the options you want to apply. Windows must confirm a new restore point before Toolboks changes the profile settings.").color(theme::MUTED));
+        ui.label(RichText::new("Nothing is selected by default. Pick only what you want, then review the changes. Windows must confirm a new restore point before Toolboks changes the profile settings.").color(theme::MUTED));
         ui.add_enabled_ui(!busy && !recovery, |ui| {
             changed |= ui.checkbox(&mut self.enable_protection, "Turn on System Protection for the Windows drive").changed();
             ui.label(RichText::new("Enable this if System Protection is off. Windows keeps it enabled after a profile restore.").color(theme::MUTED));
             ui.separator();
-            for choice in CHOICES {
-                let mut on = self.selected.contains(choice.id);
-                if ui.checkbox(&mut on, choice.title).changed() {
-                    changed = true;
-                    if on {
-                        self.selected.insert(choice.id);
-                    } else {
-                        self.selected.remove(choice.id);
+            for group in GROUPS {
+                ui.label(RichText::new(group.title()).size(theme::TEXT_SECTION).strong());
+                ui.label(RichText::new(group.intro()).color(theme::MUTED));
+                ui.add_space(theme::SPACE_XS);
+                for choice in CHOICES.iter().filter(|choice| choice.group == group) {
+                    let mut on = self.selected.contains(choice.id);
+                    if choice_row(ui, choice, &mut on) {
+                        changed = true;
+                        if on {
+                            self.selected.insert(choice.id);
+                        } else {
+                            self.selected.remove(choice.id);
+                        }
                     }
                 }
-                ui.label(RichText::new(choice.detail).color(theme::MUTED));
             }
         });
-        if changed {
-            self.preview = None;
-        }
+        let key = review_key(recovery, &self.selected, self.enable_protection);
+        self.preview = current_review(self.preview.take(), &key);
+        let has_changes = !self.selected.is_empty() || self.enable_protection;
+        let reviewed = self.preview.is_some();
         let review_label = if recovery {
             "Review registry edits"
         } else {
-            "Review current values"
+            "Review changes"
+        };
+        let review_button = if reviewed {
+            egui::Button::new(review_label)
+        } else {
+            primary(review_label)
         };
         if ui
-            .add_enabled(
-                !busy && (recovery || !self.selected.is_empty()),
-                egui::Button::new(review_label),
-            )
+            .add_enabled(!busy && (recovery || has_changes), review_button)
             .clicked()
         {
             self.preview = Some(if recovery {
-                engine::review_backup().unwrap_or_else(|error| vec![error])
+                let lines = engine::review_backup().unwrap_or_else(|error| vec![error]);
+                Review {
+                    key: key.clone(),
+                    groups: vec![("Saved registry edits".to_string(), lines)],
+                }
             } else {
                 let selected: Vec<_> = CHOICES
                     .iter()
                     .filter(|choice| self.selected.contains(choice.id))
                     .map(|choice| choice.id)
                     .collect();
-                engine::preview(&selected)
+                apply_review(&key, engine::preview_by_choice(&selected))
             });
         }
-        if let Some(lines) = &self.preview {
-            for line in lines {
-                ui.label(RichText::new(line).color(theme::MUTED));
+        let unlocked = can_apply(busy, &key, self.preview.as_ref());
+        if let Some(Review { groups, .. }) = &self.preview {
+            ui.label(
+                RichText::new("Now, then new value")
+                    .size(theme::TEXT_CAPTION)
+                    .color(theme::MUTED),
+            );
+            for (title, lines) in groups {
+                ui.label(RichText::new(title).strong());
+                for line in lines {
+                    ui.label(RichText::new(line).color(theme::MUTED));
+                }
             }
         }
         ui.add_space(theme::SPACE_XS);
         ui.horizontal_wrapped(|ui| {
             if !recovery {
-                let ready = !busy && (!self.selected.is_empty() || self.enable_protection);
-                if ui
-                    .add_enabled(ready, primary("Apply Gaming profile"))
-                    .clicked()
-                {
+                let apply = if unlocked {
+                    primary("Apply Gaming profile")
+                } else {
+                    egui::Button::new("Apply Gaming profile")
+                };
+                if ui.add_enabled(unlocked, apply).clicked() {
                     let selected = CHOICES
                         .iter()
                         .filter(|choice| self.selected.contains(choice.id))
@@ -326,7 +465,16 @@ impl Gaming {
                 self.message = open(engine::root().as_os_str()).err();
             }
         });
+        if !recovery && !unlocked {
+            ui.label(
+                RichText::new("Review changes first. Apply unlocks for exactly what you reviewed.")
+                    .color(theme::MUTED),
+            );
+        }
         ui.label(RichText::new(ADMIN_NOTE).color(theme::MUTED));
+        if !recovery {
+            ui.label(RichText::new(RECOVERY_NOTE).color(theme::MUTED));
+        }
         if recovery {
             ui.label(RichText::new("Restore uses the saved values for registry and power plan changes made by Toolboks. Guided changes are reversed in their original apps.").color(theme::MUTED));
         }
@@ -495,5 +643,163 @@ impl NativeAddon for Gaming {
             TutorialStep::new(PAGE, "gaming-guides", "Follow guided settings", "Open Windows and NVIDIA settings from this list. Reverse these changes in their original apps."),
             TutorialStep::new(PAGE, "gaming-changes", "Restore earlier settings", "Use Restore for settings Toolboks applied and Open backup location to view the saved registry export."),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::Group;
+
+    #[test]
+    fn every_choice_explains_itself() {
+        for choice in CHOICES {
+            assert!(!choice.why.trim().is_empty(), "{} has no why", choice.id);
+            assert!(
+                !choice.source.trim().is_empty(),
+                "{} has no source",
+                choice.id
+            );
+        }
+    }
+
+    #[test]
+    fn choice_ids_are_unique() {
+        let ids: BTreeSet<_> = CHOICES.iter().map(|choice| choice.id).collect();
+        assert_eq!(ids.len(), CHOICES.len());
+    }
+
+    #[test]
+    fn unproven_choices_exist_and_nothing_is_preselected() {
+        assert!(CHOICES
+            .iter()
+            .any(|choice| choice.evidence == Some(Evidence::Unproven)));
+        assert!(saved_selection(&BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn only_performance_choices_claim_speed() {
+        for choice in CHOICES {
+            assert_eq!(
+                choice.evidence.is_some(),
+                choice.group == Group::Performance,
+                "{}",
+                choice.id
+            );
+        }
+    }
+
+    #[test]
+    fn saved_choices_are_restored_and_unknown_ids_dropped() {
+        let mut preferences = BTreeMap::new();
+        preferences.insert("selected".to_string(), serde_json::json!(["power", "nope"]));
+        assert_eq!(saved_selection(&preferences), BTreeSet::from(["power"]));
+    }
+
+    #[test]
+    fn measured_or_mixed_needs_a_named_source() {
+        for choice in CHOICES {
+            if matches!(choice.evidence, Some(Evidence::Measured | Evidence::Mixed)) {
+                assert!(
+                    !choice.source.contains("No controlled measurement"),
+                    "{} claims evidence without a source",
+                    choice.id
+                );
+            }
+        }
+    }
+
+    fn ids(list: &[&'static str]) -> BTreeSet<&'static str> {
+        list.iter().copied().collect()
+    }
+
+    fn reviewed(key: &ReviewKey) -> Review {
+        apply_review(key, Vec::new())
+    }
+
+    #[test]
+    fn a_review_of_the_current_apply_selection_unlocks_apply() {
+        let key = review_key(false, &ids(&["power"]), false);
+        assert!(!can_apply(false, &key, None));
+        let review = reviewed(&key);
+        assert!(can_apply(false, &key, Some(&review)));
+        assert!(!can_apply(true, &key, Some(&review)));
+    }
+
+    #[test]
+    fn changing_the_selection_or_protection_invalidates_the_review() {
+        let before = review_key(false, &ids(&["power"]), false);
+        let review = reviewed(&before);
+        for after in [
+            review_key(false, &ids(&["power", "location"]), false),
+            review_key(false, &ids(&[]), false),
+            review_key(false, &ids(&["power"]), true),
+        ] {
+            assert!(!can_apply(false, &after, Some(&review)));
+            assert!(current_review(Some(reviewed(&before)), &after).is_none());
+        }
+        assert!(current_review(Some(reviewed(&before)), &before).is_some());
+    }
+
+    #[test]
+    fn selection_order_does_not_change_the_key() {
+        assert_eq!(
+            review_key(false, &ids(&["power", "location"]), false),
+            review_key(false, &ids(&["location", "power"]), false)
+        );
+    }
+
+    #[test]
+    fn a_recovery_review_never_enables_apply() {
+        let recovery = review_key(true, &ids(&["power"]), false);
+        let review = Review {
+            key: recovery.clone(),
+            groups: Vec::new(),
+        };
+        assert!(!can_apply(false, &recovery, Some(&review)));
+        let apply = review_key(false, &ids(&["power"]), false);
+        assert!(!can_apply(false, &apply, Some(&review)));
+        assert!(current_review(Some(review), &apply).is_none());
+    }
+
+    #[test]
+    fn protection_alone_can_be_reviewed_then_applied() {
+        let key = review_key(false, &ids(&[]), true);
+        assert!(!can_apply(false, &key, None));
+        let review = reviewed(&key);
+        assert_eq!(review.groups.len(), 1);
+        assert_eq!(review.groups[0].0, "System Protection");
+        assert!(can_apply(false, &key, Some(&review)));
+        let nothing = review_key(false, &ids(&[]), false);
+        assert!(!can_apply(false, &nothing, Some(&reviewed(&nothing))));
+    }
+
+    #[test]
+    fn protection_is_listed_before_the_choices() {
+        let key = review_key(false, &ids(&["power"]), true);
+        let review = apply_review(
+            &key,
+            vec![("Activate Ultimate Performance", vec!["x".into()])],
+        );
+        let titles: Vec<_> = review
+            .groups
+            .iter()
+            .map(|(title, _)| title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            ["System Protection", "Activate Ultimate Performance"]
+        );
+        let key = review_key(false, &ids(&["power"]), false);
+        assert_eq!(apply_review(&key, Vec::new()).groups.len(), 0);
+    }
+
+    #[test]
+    fn a_saved_selection_starts_unreviewed() {
+        let mut preferences = BTreeMap::new();
+        preferences.insert("selected".to_string(), serde_json::json!(["power"]));
+        let key = review_key(false, &saved_selection(&preferences), false);
+        assert!(Gaming::default().preview.is_none());
+        assert!(!can_apply(false, &key, Gaming::default().preview.as_ref()));
     }
 }

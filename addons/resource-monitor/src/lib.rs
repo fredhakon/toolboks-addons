@@ -8,10 +8,12 @@ mod details;
 mod gpu;
 mod history;
 mod list;
+mod lower_confirm;
 mod nvml;
 mod overview;
 mod power;
 mod processes;
+mod recording;
 mod sampler;
 mod tutorial;
 
@@ -141,6 +143,9 @@ pub struct Resources {
     connections: connections::Page,
     /// Which page is shown: 0 Overview, 1 Details, 2 Processes, 3 Connections.
     page: usize,
+    /// Resource history recorder (off unless the preference switches it on). Kept across
+    /// `suspend`, so it records while the page is closed and Toolboks sits in the tray.
+    recording: recording::Control,
 }
 
 impl Resources {
@@ -170,6 +175,7 @@ impl Resources {
             processes: processes::Page::new(),
             connections: connections::Page::new(),
             page: 0,
+            recording: recording::Control::default(),
         }
     }
 }
@@ -235,6 +241,16 @@ fn style_once(ctx: &egui::Context) {
 }
 
 impl NativeAddon for Resources {
+    /// Starts or stops the history recorder from the add-on's own preferences (default off).
+    fn load_preferences(
+        &mut self,
+        preferences: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        self.recording.apply(
+            recording::wanted(preferences),
+            recording::Recorder::start_system,
+        );
+    }
     fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -259,10 +275,18 @@ impl NativeAddon for Resources {
         self.poll(ctx);
     }
     /// Stops sampling and drops the graphs, as the built-in tool does when it is not shown.
+    /// The history recorder is the one thing kept: it runs on its own thread.
     fn suspend(&mut self) {
         let page = self.page;
+        let recording = std::mem::take(&mut self.recording);
         *self = Self::new();
         self.page = page;
+        self.recording = recording;
+    }
+    /// False: the recorder has its own thread and needs no 200 ms background ticks, so a
+    /// suspended Resource Monitor wakes nothing (and does nothing at all with recording off).
+    fn has_background_work(&self) -> bool {
+        false
     }
     fn status_items(&self) -> Vec<StatusItem> {
         let live = self.last_at.is_some_and(|t| t.elapsed() < LIVE_WITHIN);
@@ -302,6 +326,19 @@ impl NativeAddon for Resources {
 }
 
 impl Resources {
+    /// System totals for the Processes headers; None until a fresh reading exists.
+    fn process_totals(&self) -> Option<processes::Totals> {
+        let fresh = self.last_at.is_some_and(|t| t.elapsed() < LIVE_WITHIN);
+        let sample = self.last.as_ref().filter(|_| fresh)?;
+        Some(processes::Totals {
+            cpu: sample.cpu,
+            mem_used: sample.mem_used,
+            mem_total: self.info.as_ref().map_or(0, |i| i.mem_total),
+            disk_active: sample.disk_active,
+            disk_bps: sample.disk_read_bps + sample.disk_write_bps,
+        })
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
         self.processes.tick();
         self.connections.tick();
@@ -367,7 +404,7 @@ impl Resources {
         sampler.ping();
         match page {
             2 => {
-                self.processes.ui(ui);
+                self.processes.ui(ui, self.process_totals());
                 return;
             }
             3 => {
@@ -394,6 +431,96 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_is_off_by_default_and_survives_suspend() {
+        let mut addon = Resources::new();
+        addon.load_preferences(&Default::default());
+        assert!(!addon.recording.is_on(), "off unless switched on");
+        addon.recording.apply(true, || {
+            recording::Recorder::spawn(std::time::Duration::from_secs(3600), || None)
+        });
+        let store = addon.recording.store().unwrap();
+        addon.page = 2;
+        addon.suspend();
+        assert_eq!(addon.page, 2);
+        assert!(std::sync::Arc::ptr_eq(
+            &store,
+            &addon.recording.store().unwrap()
+        ));
+        addon.resume();
+        assert!(addon.recording.is_on());
+        // Switched off in the preferences: the recorder goes.
+        addon.load_preferences(&Default::default());
+        assert!(!addon.recording.is_on());
+        assert!(!addon.has_background_work());
+    }
+
+    /// The real SDK runtime loop: the host shows the page, then switches to another add-on
+    /// (or hides the window to the tray), which arrives as `Suspend`. Recording keeps adding
+    /// steps while suspended, and switching it off in the preferences ends the thread.
+    #[test]
+    fn recording_keeps_sampling_while_suspended_and_stops_when_switched_off() {
+        use std::time::{Duration, Instant};
+        use toolboks_addon_sdk::runtime::proto::memory::duplex;
+        use toolboks_addon_sdk::runtime::proto::{
+            self, AddonMessage, Hello, HostMessage, InputBatch, Theme,
+        };
+        let wait_until = |what: &str, mut done: Box<dyn FnMut() -> bool>| {
+            let until = Instant::now() + Duration::from_secs(20);
+            while !done() {
+                assert!(Instant::now() < until, "timed out: {what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let mut addon = Resources::new();
+        addon
+            .recording
+            .apply(true, || recording::fake_recorder(Duration::from_millis(10)));
+        let store = addon.recording.store().unwrap();
+        let (host, addon_side) = duplex();
+        let runtime = std::thread::spawn(move || {
+            toolboks_addon_sdk::runtime::run_addon_on(addon_side, addon, ID)
+        });
+        let (mut reader, mut writer) = host.split();
+        proto::host_handshake(&mut reader, &mut writer, &Hello::new(ID, "test")).unwrap();
+        std::thread::spawn(move || while reader.read::<AddonMessage>().is_ok() {});
+        let on = serde_json::json!({ recording::PREF_KEY: true }).to_string();
+        writer
+            .write(&HostMessage::LoadPreferences { json: on })
+            .unwrap();
+        writer
+            .write(&HostMessage::Input(InputBatch {
+                seq: 1,
+                size: [800.0, 600.0],
+                pixels_per_point: 1.0,
+                theme: Theme::Dark,
+                window_focused: true,
+                events: vec![],
+            }))
+            .unwrap();
+        // Another add-on is opened, or the window goes to the tray.
+        writer.write(&HostMessage::Suspend).unwrap();
+        let steps = || store.lock().unwrap().fine().len();
+        let at_suspend = steps();
+        wait_until(
+            "steps while suspended",
+            Box::new(|| steps() >= at_suspend + 5),
+        );
+        // Switched off: the recorder thread ends and releases its history.
+        writer
+            .write(&HostMessage::LoadPreferences { json: "{}".into() })
+            .unwrap();
+        wait_until(
+            "recorder thread ended",
+            Box::new(|| std::sync::Arc::strong_count(&store) == 1),
+        );
+        let after_off = steps();
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(steps(), after_off, "nothing is recorded once off");
+        writer.write(&HostMessage::Quit).unwrap();
+        runtime.join().unwrap().unwrap();
+    }
 
     #[test]
     fn find_or_create_reuses_series() {

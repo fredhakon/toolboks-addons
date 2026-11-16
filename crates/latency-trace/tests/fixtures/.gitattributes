@@ -1,0 +1,2 @@
+# Keep the fixtures byte for byte: CRLF like real tracerpt output, and deliberately invalid UTF-8.
+*.xml -text

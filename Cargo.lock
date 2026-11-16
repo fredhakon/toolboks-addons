@@ -133,6 +133,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-perf"
+version = "0.1.0"
+dependencies = [
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -319,6 +326,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 name = "debloater"
 version = "0.1.0"
 dependencies = [
+ "boot-perf",
  "egui",
  "serde_json",
  "toolboks-addon-proto",
@@ -340,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "disk-manager"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "egui",
  "egui_extras",
@@ -508,8 +516,11 @@ dependencies = [
 name = "event-watch"
 version = "0.1.0"
 dependencies = [
+ "boot-perf",
  "egui",
  "egui_extras",
+ "latency-trace",
+ "serde",
  "serde_json",
  "toolboks-addon-proto",
  "toolboks-addon-sdk",
@@ -764,6 +775,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "latency-trace"
+version = "0.1.0"
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -834,6 +849,7 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "egui_extras",
+ "protected-processes",
  "serde_json",
  "sysinfo",
  "toolboks-addon-proto",
@@ -1054,6 +1070,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pc-checks"
+version = "0.1.0"
+dependencies = [
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "peniko"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1122,6 +1145,10 @@ name = "profiling"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d595e54a326bc53c1c197b32d295e14b169e3cfeaa8dc82b529f947fba6bcf5"
+
+[[package]]
+name = "protected-processes"
+version = "0.1.0"
 
 [[package]]
 name = "quote"
@@ -1193,6 +1220,7 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "egui_extras",
+ "protected-processes",
  "serde_json",
  "sysinfo",
  "toolboks-addon-proto",
@@ -1458,7 +1486,7 @@ dependencies = [
 [[package]]
 name = "toolboks-addon-proto"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=513eedb22e9ed0a60e9a0e4641e11b9a8f0ecd30#513eedb22e9ed0a60e9a0e4641e11b9a8f0ecd30"
+source = "git+https://github.com/Gusseti/toolboks?rev=8c80bab8c27710f9e726e4377dcb1baa36e4f140#8c80bab8c27710f9e726e4377dcb1baa36e4f140"
 dependencies = [
  "egui",
  "postcard",
@@ -1468,7 +1496,7 @@ dependencies = [
 [[package]]
 name = "toolboks-addon-sdk"
 version = "0.4.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=513eedb22e9ed0a60e9a0e4641e11b9a8f0ecd30#513eedb22e9ed0a60e9a0e4641e11b9a8f0ecd30"
+source = "git+https://github.com/Gusseti/toolboks?rev=8c80bab8c27710f9e726e4377dcb1baa36e4f140#8c80bab8c27710f9e726e4377dcb1baa36e4f140"
 dependencies = [
  "egui",
  "serde",
@@ -1480,7 +1508,7 @@ dependencies = [
 [[package]]
 name = "toolboks-catalog"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=513eedb22e9ed0a60e9a0e4641e11b9a8f0ecd30#513eedb22e9ed0a60e9a0e4641e11b9a8f0ecd30"
+source = "git+https://github.com/Gusseti/toolboks?rev=8c80bab8c27710f9e726e4377dcb1baa36e4f140#8c80bab8c27710f9e726e4377dcb1baa36e4f140"
 dependencies = [
  "serde",
  "serde_json",
@@ -1491,7 +1519,7 @@ dependencies = [
 [[package]]
 name = "toolboks-debloat-engine"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=513eedb22e9ed0a60e9a0e4641e11b9a8f0ecd30#513eedb22e9ed0a60e9a0e4641e11b9a8f0ecd30"
+source = "git+https://github.com/Gusseti/toolboks?rev=8c80bab8c27710f9e726e4377dcb1baa36e4f140#8c80bab8c27710f9e726e4377dcb1baa36e4f140"
 dependencies = [
  "serde",
  "toolboks-shared",
@@ -1501,7 +1529,7 @@ dependencies = [
 [[package]]
 name = "toolboks-shared"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=513eedb22e9ed0a60e9a0e4641e11b9a8f0ecd30#513eedb22e9ed0a60e9a0e4641e11b9a8f0ecd30"
+source = "git+https://github.com/Gusseti/toolboks?rev=8c80bab8c27710f9e726e4377dcb1baa36e4f140#8c80bab8c27710f9e726e4377dcb1baa36e4f140"
 dependencies = [
  "egui",
  "toolboks-addon-sdk",

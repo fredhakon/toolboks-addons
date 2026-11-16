@@ -1,0 +1,9 @@
+[package]
+name = "protected-processes"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Game, launcher and anti-cheat processes that Toolboks add-ons never change"
+publish = false
+
+[dependencies]

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
 
-use super::actions::{identity_of, Identity};
+use super::actions::{live_created, Identity};
 use super::growth::{PrivateMemory, WindowsPrivateMemory};
 use super::memlist;
 use super::pressure::{RateCounter, PAGES_INPUT_PATH, PAGE_FAULTS_PATH};
@@ -38,10 +38,7 @@ impl WindowsSampler {
         let sets = processes
             .iter()
             .filter_map(|id| {
-                let matches = || {
-                    identity_of(id.pid, &id.name)
-                        .is_some_and(|current| current.created == id.created)
-                };
+                let matches = || live_created(id.pid) == Some(id.created);
                 if !matches() {
                     return None;
                 }

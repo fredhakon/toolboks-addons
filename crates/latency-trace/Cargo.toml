@@ -1,0 +1,9 @@
+[package]
+name = "latency-trace"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Turns a recorded Windows kernel DPC/ISR trace (tracerpt XML) into a plain-language ranking of drivers by latency"
+publish = false
+
+[dependencies]

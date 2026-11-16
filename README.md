@@ -8,7 +8,9 @@ is only a small pipeline fixture.
 
 - `addons/<name>/`: one crate, one `<name>.tbaddon` SDK manifest, and `tests/protocol.rs`.
 - `catalog/index.json`: the host's format 1, initially empty and unsigned.
-- `tools/repo/`: manifest/index validation and release-to-catalog automation using host types.
+- `tools/repo/`: manifest/index validation, release-to-catalog automation using host types,
+  and the `measure` command.
+- `budgets.json`: the size, start-up and memory limits `measure` checks.
 - `.github/workflows/`: the isolated per-add-on release workflow. There is no CI: checks run locally before merging.
 
 Folder, crate and executable names must agree. The manifest version matches Cargo's
@@ -18,9 +20,20 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `a96b0ab766648033af8937ac12ed269b58d4bbd7` (host staging,
-protocol 3, minimum host 0.12.5). They are not on host main yet. Upgrade all four git
-dependencies together, regenerate `Cargo.lock`, review compatibility and rerun checks.
+Host dependencies pin commit `8c80bab8c27710f9e726e4377dcb1baa36e4f140`, the commit of the
+released host **v0.14.0** (protocol 3). Most add-ons need host 0.12.5 or later; Disk Manager needs
+0.14.0 because its manifest has a `data_note`, which older hosts refuse. Every add-on is built
+against a host that users can actually have. `addon-repo` checks manifests as this host would
+(`PINNED_HOST` in `tools/repo/src/main.rs`), so move that constant together with the pin.
+
+**When to move the pin:** only to a commit that is in a published host release on `main`, and only
+when an add-on needs something the newer host added (a new SDK field, a new shared helper, a
+protocol change) or a host fix that affects the add-ons' tests. A host release that does not
+touch `sdk/` or `shared/` needs no move. **How:** edit the `rev` of all five host git dependencies
+in the root `Cargo.toml` to the new release commit (`gh release view vX.Y.Z --repo Gusseti/toolboks
+--json targetCommitish`), run `cargo update -p toolboks-addon-sdk -p toolboks-addon-proto -p
+toolboks-shared -p toolboks-catalog -p toolboks-debloat-engine`, then run the checks below for the
+whole workspace and open the PR into `staging`.
 
 ## Build and test
 
@@ -39,6 +52,28 @@ cargo test --locked -p hello --test protocol
 
 Run these checks locally for all add-ons before merging; nothing runs them for you. For interactive inspection, use the pinned
 host's `cargo run --example addon_host -- <absolute-hello.exe-path> toolboks.hello`.
+
+## Budgets
+
+Every add-on is a separate process, so each one has to stay small (host issue #97).
+`budgets.json` holds the limits: the first frame within 1000 ms of starting the exe, and
+under 25 MB of memory when idle.
+
+```powershell
+cargo build --locked --release -p hello
+cargo run --locked -p addon-repo -- measure            # every add-on; fails when one is over
+cargo run --locked -p addon-repo -- measure hello --report-only --json target/measure.json
+```
+
+It starts each release exe 5 times (`--runs <n>` changes that) the way the protocol test
+does, and prints the median: exe size, time to the handshake, time to the first drawn
+frame, and memory after 3 idle seconds. "Idle memory" is the working set, which is at least
+what Task Manager shows; "Private bytes" is the memory only that process holds.
+Nothing runs it for you: run it locally before merging.
+
+It measures the add-on alone. The named pipes, the launch token and the host's own drawing
+are not part of it, and neither are the host budgets (host exe size, no process for a hidden
+add-on); those are checked in the host repository.
 
 ## Release flow
 
@@ -87,6 +122,15 @@ the existing `settings`, `optimize_selected_drive` and `fragmentation_reports` p
 Use `--open "Disk Manager/Largest files"` after catalog installation as before. The host
 keeps `addon-data/toolboks.disk-manager/` and namespaced preferences; the old local activation
 package alone cannot install this executable. No data migration is required.
+
+Disk Manager's manifest has a `data_note` ("Keeps your last scan of each drive on this PC (file
+and folder names).") that the host shows in the install review, so it needs host 0.14.0 or later.
+
+`catalog-update` copies a manifest's optional `data_note` into the catalog entry, checked with the
+host's rule (`toolboks_addon_sdk::valid_data_note`: one line, at most 160 characters, no hidden,
+bidi or control characters); a bad note stops it before the list is written. `validate` fails when
+the catalog entry for the version that is current in `addons/<name>/<name>.tbaddon` carries a
+different note (or none, when the manifest has one). Entries for older versions are not compared.
 
 `host-services.json` is optional per-add-on metadata copied by `catalog-update` into the
 catalog entry. Disk Manager declares its page names and `background: true`, so exports and
@@ -256,6 +300,18 @@ for registry locations the catalog itself lists.
 
 All families are now done, so nothing in the Debloater is listed as unavailable any more.
 
+**Saved undo list (#81, decision Gusseti/toolboks#52).** Undo survives closing Toolboks and a
+restart: after every change and every undo the add-on rewrites `undo/undo.jsonl` in its own data
+folder (`addon-data/toolboks.debloater/`, so "delete my data" removes it), as a temp file renamed
+over the old one. The file has a header line (format, version, length, checksum) and a body with
+only what undo needs: each previous registry value, service start type, task switch and startup
+approval, what Debloater set it to, and the catalog ids of removed apps (they come back from the
+Microsoft Store). A damaged file is moved to `undo-damaged-1.jsonl` (the three newest are kept) and not used, and if it cannot be moved, saving pauses so it is never replaced; a file from a newer
+Debloater is left untouched and not overwritten; an entry for an item this version no longer
+offers is kept but not used. An undo whose item something else changed since, or whose startup
+entry is gone, is refused with the reason and leaves the list, in the add-on and in the helper. Every page shows what is kept and where, with a "Delete
+saved undo" button.
+
 Real UAC validation of the new operations has not been done; the owner chose to test on use and
 report anything found.
 
@@ -283,4 +339,15 @@ nothing. Real UAC validation is still required (host issue #142).
 
 The built-in provider stays in the host until the final removal and "Restore your tools" step
 (host #94). Measure with `cargo run --locked -p addon-repo -- measure system-profiles`.
+
+## Memory Cleaner benchmark
+
+Issue #32 asks whether the memory priority, targeted trim and low-priority cache purge actions
+help at all. `docs/RESEARCH-memory-cleaning.md` holds the protocol, the result tables and the
+decision rules. Measured on one 32 GB PC (trim vs nothing): no benefit could be shown and a cost on
+next use was; the 8 GB class and the administrator-only purge are not measured. Priority-only
+has no UI action, so only trim and purge are scripted. `scripts/bench-memory-driven.ps1` runs the
+`none` and `trim` arms without a window or a person (benchmark-owned processes only).
+`scripts/bench-memory.ps1` collects the numbers (it does not run the action, needs no
+administrator rights and writes only under `-OutDir`); try it with `-Arm none -DryRun`.
 

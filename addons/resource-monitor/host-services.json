@@ -1,3 +1,4 @@
 {
-  "pages": ["Overview", "Details", "Processes", "Connections"]
+  "pages": ["Overview", "Details", "Processes", "Connections"],
+  "background": true
 }

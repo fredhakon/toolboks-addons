@@ -8,12 +8,15 @@ description = "Event Watch - native Toolboks add-on that explains Windows events
 [dependencies]
 egui = { version = "0.37", default-features = false }
 egui_extras = { version = "0.37", default-features = false }
+boot-perf.workspace = true
 toolboks-addon-sdk.workspace = true
+serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+latency-trace = { path = "../../crates/latency-trace" }
 toolboks-shared.workspace = true
 
 [dev-dependencies]
 toolboks-addon-proto.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_EventLog", "Win32_System_IO"] }
+windows = { version = "0.62", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_EventLog", "Win32_System_IO", "Win32_System_SystemInformation"] }

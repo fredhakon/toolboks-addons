@@ -14,20 +14,20 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
-use windows::core::{HRESULT, PWSTR};
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, FILETIME, HANDLE};
+use windows::core::HRESULT;
+use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
 use windows::Win32::System::ProcessStatus::{
     EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
 };
 use windows::Win32::System::Threading::{
-    GetProcessInformation, GetProcessTimes, OpenProcess, ProcessMemoryPriority,
-    QueryFullProcessImageNameW, SetProcessInformation, MEMORY_PRIORITY,
-    MEMORY_PRIORITY_INFORMATION, PROCESS_ACCESS_RIGHTS, PROCESS_NAME_WIN32,
+    GetProcessInformation, OpenProcess, ProcessMemoryPriority, SetProcessInformation,
+    MEMORY_PRIORITY, MEMORY_PRIORITY_INFORMATION, PROCESS_ACCESS_RIGHTS,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_SET_QUOTA,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::trim::{skip_reason, Trimmed};
+use super::trim::{creation_time, image_name, live_name_ok, skip_reason, SkipReason, Trimmed};
+use protected_processes::Parent;
 use toolboks_shared::win::Handle;
 
 /// Memory priority applied to idle background apps (MEMORY_PRIORITY_LOW).
@@ -73,23 +73,6 @@ const EXTRA_PROTECTED: &[&str] = &[
     "taskhostw.exe",
 ];
 
-/// Known game launchers and anti-cheat services. Matched against the app and its parent.
-const LAUNCHERS: &[&str] = &[
-    "steam.exe",
-    "steamwebhelper.exe",
-    "epicgameslauncher.exe",
-    "battle.net.exe",
-    "eadesktop.exe",
-    "origin.exe",
-    "upc.exe",
-    "ubisoftconnect.exe",
-    "galaxyclient.exe",
-    "riotclientservices.exe",
-    "easyanticheat.exe",
-    "beservice.exe",
-    "vgc.exe",
-];
-
 /// Who a process is. A pid alone is not enough: pids get reused.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Identity {
@@ -98,6 +81,10 @@ pub struct Identity {
     pub created: u64,
     /// Image file name such as `chrome.exe`, compared case-insensitively.
     pub name: String,
+    /// The parent the same snapshot vouched for. Travels with the identity so planning and the
+    /// write open (run and undo) both check it: a launcher's child, or a process whose parent
+    /// could not be vouched for, is refused twice.
+    pub parent: Parent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,8 +106,6 @@ pub struct Candidate {
     pub idle_for: Option<Duration>,
     pub plays_audio: bool,
     pub is_fullscreen: bool,
-    /// Image name of the parent process, if known (to catch children of game launchers).
-    pub parent_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +173,7 @@ pub enum Skip {
     NotIdle,
     PlaysAudio,
     Fullscreen,
+    /// A game, game launcher or anti-cheat process, or a child of a launcher.
     Launcher,
     TooSmall,
     Cooldown,
@@ -239,7 +225,15 @@ pub fn check_eligibility(
     if c.identity.pid == policy.own_pid {
         return Err(Skip::Own);
     }
-    if skip_reason(c.identity.pid, &name, policy.own_pid, &HashSet::new()).is_some()
+    // Game and anti-cheat processes are checked below together with their parent.
+    let parent = &c.identity.parent;
+    if skip_reason(
+        c.identity.pid,
+        &name,
+        parent,
+        policy.own_pid,
+        &HashSet::new(),
+    ) == Some(SkipReason::System)
         || EXTRA_PROTECTED.contains(&name.as_str())
     {
         return Err(Skip::System);
@@ -256,11 +250,7 @@ pub fn check_eligibility(
     if c.is_fullscreen {
         return Err(Skip::Fullscreen);
     }
-    let parent_is_launcher = c
-        .parent_name
-        .as_ref()
-        .is_some_and(|p| LAUNCHERS.contains(&p.to_lowercase().as_str()));
-    if LAUNCHERS.contains(&name.as_str()) || parent_is_launcher {
+    if protected_processes::protected_reason(&name, parent).is_some() {
         return Err(Skip::Launcher);
     }
     if c.plays_audio {
@@ -473,13 +463,6 @@ pub fn foreground_pid() -> Option<u32> {
     }
 }
 
-/// Whether the app has an active audio session.
-/// Stub: real detection needs the COM audio session APIs (IAudioSessionManager2), which this
-/// slice does not pull in. Returns `false`, so callers must also rely on other signals.
-pub fn plays_audio(_pid: u32) -> bool {
-    false
-}
-
 fn classify(e: &windows::core::Error) -> ActionError {
     if e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
         ActionError::AccessDenied
@@ -488,60 +471,45 @@ fn classify(e: &windows::core::Error) -> ActionError {
     }
 }
 
-fn filetime(t: FILETIME) -> u64 {
-    (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
-}
-
-fn creation_time(handle: HANDLE) -> windows::core::Result<u64> {
-    let (mut created, mut exited, mut kernel, mut user) = Default::default();
-    // SAFETY: the handle has query access and all four outputs are valid FILETIME buffers.
-    unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) }?;
-    Ok(filetime(created))
-}
-
-/// Identity of a running process (pid, creation time, given image name), or `None` if it cannot
-/// be opened (protected, other user) or has no creation time.
-pub fn identity_of(pid: u32, name: &str) -> Option<Identity> {
+/// Creation time of whatever process holds `pid` right now, or `None` if it cannot be opened
+/// (protected, other user) or has no creation time. Only for rechecking a known identity: an
+/// identity for a process from a snapshot takes the creation time the snapshot recorded
+/// (`ProcInfo::created`), so a reused pid never inherits the old process's sampled parent.
+pub fn live_created(pid: u32) -> Option<u64> {
     // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
         .map(Handle)
         .ok()?;
-    let created = creation_time(handle.0).ok()?;
-    Some(Identity {
-        pid,
-        created,
-        name: name.to_string(),
-    })
+    creation_time(handle.0).ok()
 }
 
 /// Opens the process and verifies start time and image name before returning the handle.
 fn open_verified(id: &Identity, access: PROCESS_ACCESS_RIGHTS) -> Result<Handle, ActionError> {
+    // First gate: game, launcher and anti-cheat processes, a launcher's child and a process
+    // whose parent could not be vouched for are refused before any process handle exists.
+    if protected_processes::protected_reason(&id.name, &id.parent).is_some() {
+        return Err(ActionError::AccessDenied);
+    }
+    // Verify with a query-only handle first. While it stays open the pid cannot be reused, so
+    // the write-capable handle below belongs to the verified process. The parent comes from
+    // the same snapshot as the identity's creation time, so a matching creation time means the
+    // parent describes this process; the second gate checks the live name with that parent.
     // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
+    let query = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, id.pid) }
+        .map(Handle)
+        .map_err(|e| classify(&e))?;
+    if creation_time(query.0).ok() != Some(id.created) {
+        return Err(ActionError::IdentityChanged);
+    }
+    let live = image_name(&query).ok_or(ActionError::IdentityChanged)?;
+    if !live_name_ok(id.pid, &id.name, &live, &id.parent, std::process::id()) {
+        return Err(ActionError::IdentityChanged);
+    }
+    // SAFETY: as above.
     let handle = unsafe { OpenProcess(access | PROCESS_QUERY_LIMITED_INFORMATION, false, id.pid) }
         .map(Handle)
         .map_err(|e| classify(&e))?;
-    if creation_time(handle.0).ok() != Some(id.created) {
-        return Err(ActionError::IdentityChanged);
-    }
-    let mut image = vec![0u16; 32_768];
-    let mut len = image.len() as u32;
-    // SAFETY: the handle has query access and the buffer holds `len` UTF-16 units.
-    unsafe {
-        QueryFullProcessImageNameW(
-            handle.0,
-            PROCESS_NAME_WIN32,
-            PWSTR(image.as_mut_ptr()),
-            &mut len,
-        )
-    }
-    .map_err(|_| ActionError::IdentityChanged)?;
-    let image = String::from_utf16_lossy(&image[..len as usize]);
-    let name = image.rsplit('\\').next().unwrap_or_default();
-    if !name.eq_ignore_ascii_case(&id.name)
-        || skip_reason(id.pid, name, std::process::id(), &HashSet::new()).is_some()
-    {
-        return Err(ActionError::IdentityChanged);
-    }
+    drop(query);
     Ok(handle)
 }
 
@@ -613,6 +581,7 @@ mod tests {
             pid,
             created: 1000 + u64::from(pid),
             name: name.to_string(),
+            parent: Parent::known("explorer.exe"),
         }
     }
 
@@ -623,7 +592,6 @@ mod tests {
             idle_for: Some(Duration::from_secs(3600)),
             plays_audio: false,
             is_fullscreen: false,
-            parent_name: None,
         }
     }
 
@@ -747,8 +715,20 @@ mod tests {
             Err(Skip::Launcher)
         );
         let mut child = cand(8, "game.exe", 500);
-        child.parent_name = Some("EpicGamesLauncher.exe".into());
+        child.identity.parent = Parent::known("EpicGamesLauncher.exe");
         assert_eq!(check(&child, Kind::Trim), Err(Skip::Launcher));
+        // Its launcher may have exited, or its pid now belongs to another program.
+        let mut orphan = cand(9, "game.exe", 500);
+        orphan.identity.parent = Parent::Unverified;
+        assert_eq!(check(&orphan, Kind::Trim), Err(Skip::Launcher));
+        assert_eq!(check(&orphan, Kind::LowerPriority), Err(Skip::Launcher));
+        for name in ["BEService.exe", "vgc.exe", "cs2.exe"] {
+            assert_eq!(
+                check(&cand(8, name, 500), Kind::LowerPriority),
+                Err(Skip::Launcher),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1008,6 +988,7 @@ mod tests {
             pid: 40,
             created: 9999,
             name: "other.exe".into(),
+            parent: Parent::known("explorer.exe"),
         };
         fake.add(&newcomer, 400 * MB);
         let restored = undo.restore_all(&fake);
@@ -1077,6 +1058,7 @@ mod tests {
                 pid,
                 created: creation_time(h.0).ok()?,
                 name: "cmd.exe".into(),
+                parent: Parent::known("explorer.exe"),
             })
         });
         let outcome = identity.map(|i| {
@@ -1091,5 +1073,38 @@ mod tests {
         let (prev, set, now) = outcome.expect("identity of child");
         assert!(prev.is_ok() && set.is_ok(), "{prev:?} {set:?}");
         assert_eq!(now, Ok(LOW_PRIORITY));
+    }
+
+    #[test]
+    fn the_write_open_refuses_a_launchers_child_and_an_unverified_parent() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 6 127.0.0.1 > nul"])
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let outcome = live_created(pid).map(|created| {
+            let as_child_of = |parent: Parent| Identity {
+                pid,
+                created,
+                name: "cmd.exe".into(),
+                parent,
+            };
+            let ops = WindowsOps;
+            (
+                ops.set_memory_priority(&as_child_of(Parent::known("steam.exe")), LOW_PRIORITY),
+                ops.trim(&as_child_of(Parent::Unverified)),
+                ops.memory_priority(&as_child_of(Parent::Unverified)),
+                ops.memory_priority(&as_child_of(Parent::known("explorer.exe"))),
+            )
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        let (launcher, trim, query, plain) = outcome.expect("creation time of child");
+        // Refused before any process handle exists, whatever the action.
+        assert_eq!(launcher, Err(ActionError::AccessDenied));
+        assert_eq!(trim, Err(ActionError::AccessDenied));
+        assert_eq!(query, Err(ActionError::AccessDenied));
+        // The same process under a known, unlisted parent may be opened.
+        assert!(plain.is_ok(), "{plain:?}");
     }
 }

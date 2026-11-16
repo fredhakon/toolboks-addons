@@ -300,6 +300,9 @@ mod tests {
             working_set: ws,
             private: 0,
             count: 1,
+            parent: protected_processes::Parent::Unverified,
+            parent_pid: None,
+            created: None,
         }
     }
 

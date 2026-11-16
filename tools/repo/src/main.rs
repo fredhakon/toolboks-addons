@@ -1,6 +1,6 @@
 //! Repository automation; catalog types and validation belong to the host, not this repo.
 use std::{env, fs, path::Path};
-use toolboks_addon_sdk::Package;
+use toolboks_addon_sdk::{valid_data_note, Manifest, Package, MAX_DATA_NOTE_CHARS};
 use toolboks_catalog::{Channel, Entry, Index, Kind};
 mod measure;
 
@@ -35,7 +35,48 @@ fn package(name: &str) -> Package {
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
     );
     let path = format!("addons/{name}/{name}.tbaddon");
-    Package::parse(&fs::read(path).unwrap(), "0.12.5").expect("host manifest validation")
+    Package::parse(&fs::read(path).unwrap(), PINNED_HOST).expect("host manifest validation")
+}
+
+/// The host release the workspace is pinned to (README, "When to move the pin"). Manifests are
+/// checked as this host checks them, so an add-on may need this host but nothing newer.
+const PINNED_HOST: &str = "0.14.0";
+
+/// The manifest's data note for the catalog entry, checked with the host's own rule (the one the
+/// catalog applies to entries). No note in the manifest means no note in the entry.
+fn data_note(m: &Manifest) -> Result<Option<String>, String> {
+    match &m.data_note {
+        Some(note) if !valid_data_note(note) => Err(format!(
+            "{}: the data note must be one line of plain text, 1 to {MAX_DATA_NOTE_CHARS} characters, with no spaces at either end and no hidden or control characters",
+            m.id
+        )),
+        note => Ok(note.clone()),
+    }
+}
+
+/// A catalog entry for the version that is current in `addons/<name>/<name>.tbaddon` must carry
+/// exactly that manifest's data note (both set and equal, or both absent). Entries for older
+/// versions are not checked: their manifest is the one at their release tag, not the one here.
+/// `entries` is (id, version, note).
+fn data_note_problem(
+    entries: &[(&str, &str, Option<&str>)],
+    manifests: &[Manifest],
+) -> Option<String> {
+    for (id, version, note) in entries {
+        let Some(m) = manifests
+            .iter()
+            .find(|m| m.id == *id && m.version == *version)
+        else {
+            continue;
+        };
+        if *note != m.data_note.as_deref() {
+            return Some(format!(
+                "{id} {version}: the catalog entry's data_note {note:?} differs from the manifest's {:?}",
+                m.data_note.as_deref()
+            ));
+        }
+    }
+    None
 }
 
 /// The sidebar icons the host can draw for an add-on. The names `grid`, `home`, `menu` and `gear`
@@ -77,11 +118,20 @@ fn validate() {
     let index =
         Index::parse(&fs::read("catalog/index.json").unwrap()).expect("host catalog validation");
     check_icons(&index);
+    let mut manifests = Vec::new();
     for dir in fs::read_dir("addons").unwrap() {
         let dir = dir.unwrap();
         if dir.file_type().unwrap().is_dir() {
-            package(dir.file_name().to_str().unwrap());
+            manifests.push(package(dir.file_name().to_str().unwrap()).manifest);
         }
+    }
+    let entries: Vec<(&str, &str, Option<&str>)> = index
+        .entries
+        .iter()
+        .map(|e| (e.id.as_str(), e.version.as_str(), e.data_note.as_deref()))
+        .collect();
+    if let Some(problem) = data_note_problem(&entries, &manifests) {
+        panic!("{problem}");
     }
 }
 
@@ -93,6 +143,7 @@ fn update(name: &str, version: &str, repository: &str, exe: &Path) {
     let m = package(name).manifest;
     let (pages, background) = host_services(name);
     assert_eq!(m.version, version);
+    let data_note = data_note(&m).unwrap_or_else(|problem| panic!("{problem}"));
     let bytes = fs::read(exe).expect("release executable");
     let entry = Entry {
         id: m.id,
@@ -109,6 +160,7 @@ fn update(name: &str, version: &str, repository: &str, exe: &Path) {
             .unwrap(),
         pages,
         background,
+        data_note,
         kind: Kind::Native,
         version: version.into(),
         min_toolboks_version: m.min_toolboks_version,
@@ -146,12 +198,12 @@ fn main() {
         .as_slice()
     {
         ["validate"] => validate(),
-        ["measure", name] => measure::run(name),
         ["catalog-update", name, version, repository, exe] => {
             update(name, version, repository, Path::new(exe))
         }
+        ["measure", options @ ..] => measure::measure(options),
         _ => panic!(
-            "usage: addon-repo validate | measure <name> | catalog-update <name> <version> <owner/repo> <exe>"
+            "usage: addon-repo validate | catalog-update <name> <version> <owner/repo> <exe> | measure [--report-only] [--runs <n>] [--json <file>] [<add-on>...]"
         ),
     }
 }
@@ -172,5 +224,80 @@ mod tests {
             .unwrap()
             .contains("not one the host draws"));
         assert!(icon_problem(&[("a", "gear")]).is_some());
+    }
+
+    const NOTE: &str = "Keeps your last scan of each drive on this PC (file and folder names).";
+
+    /// The Hello manifest with the given version and data note. Deserializing does not validate,
+    /// so a bad note reaches `data_note` the way a manifest built by hand would.
+    fn manifest(version: &str, note: Option<&str>) -> Manifest {
+        let mut v: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../../../addons/hello/hello.tbaddon")).unwrap();
+        v["manifest"]["version"] = version.into();
+        if let Some(note) = note {
+            v["manifest"]["data_note"] = note.into();
+        }
+        serde_json::from_value(v["manifest"].clone()).unwrap()
+    }
+
+    #[test]
+    fn data_note_is_copied_only_when_valid() {
+        assert_eq!(
+            data_note(&manifest("1.0.0", Some(NOTE))),
+            Ok(Some(NOTE.to_string()))
+        );
+        assert_eq!(data_note(&manifest("1.0.0", None)), Ok(None));
+        assert_eq!(
+            data_note(&manifest("1.0.0", Some(&"a".repeat(160)))),
+            Ok(Some("a".repeat(160)))
+        );
+        for bad in [
+            "a".repeat(161),
+            String::new(),
+            " Keeps scans.".into(),
+            "Keeps\nscans.".into(),
+            "Keeps \u{202e}snacs.".into(),
+            "Keeps\u{200b}scans.".into(),
+            "Keeps\u{1b}[31mscans.".into(),
+        ] {
+            assert!(
+                data_note(&manifest("1.0.0", Some(&bad))).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn current_entry_note_must_match_the_manifest() {
+        let id = "toolboks.hello";
+        let current = [manifest("2.0.0", Some(NOTE))];
+        // The current version with the same note, and older versions with anything.
+        assert_eq!(
+            data_note_problem(
+                &[
+                    (id, "1.0.0", None),
+                    (id, "1.5.0", Some("An older note.")),
+                    (id, "2.0.0", Some(NOTE))
+                ],
+                &current
+            ),
+            None
+        );
+        // Another add-on's entries are not compared with this manifest.
+        assert_eq!(
+            data_note_problem(&[("toolboks.other", "2.0.0", Some("Other."))], &current),
+            None
+        );
+        // A different note, or none at all, for the current version fails.
+        assert!(
+            data_note_problem(&[(id, "2.0.0", Some("Keeps scans."))], &current)
+                .unwrap()
+                .contains("differs")
+        );
+        assert!(data_note_problem(&[(id, "2.0.0", None)], &current).is_some());
+        // A note the current manifest does not have fails too.
+        let without = [manifest("2.0.0", None)];
+        assert!(data_note_problem(&[(id, "2.0.0", Some(NOTE))], &without).is_some());
+        assert_eq!(data_note_problem(&[(id, "2.0.0", None)], &without), None);
     }
 }

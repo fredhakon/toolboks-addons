@@ -1,0 +1,12 @@
+[package]
+name = "boot-perf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Boot time and slow-startup items from the Windows boot performance log, read-only"
+publish = false
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_EventLog", "Win32_System_IO"] }

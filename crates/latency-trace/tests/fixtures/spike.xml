@@ -1,0 +1,222 @@
+<Events>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+	<System>
+		<Provider Guid="{9e814aad-3204-11d2-9a82-006008a86939}" />
+		<EventID>0</EventID>
+		<Version>2</Version>
+		<Level>0</Level>
+		<Task>0</Task>
+		<Opcode>68</Opcode>
+		<Keywords>0x0</Keywords>
+		<TimeCreated SystemTime="2026-11-16T10:00:00.00001500+00:59" />
+		<Correlation ActivityID="{00000000-0000-0000-0000-000000000000}" />
+		<Execution ProcessID="0" ThreadID="0" ProcessorID="0" KernelTime="0" UserTime="0" />
+		<Channel />
+		<Computer />
+	</System>
+	<EventData>
+		<Data Name="InitialTime">134392932000000000</Data>
+		<Data Name="Routine">0xFFFFF80010001234</Data>
+	</EventData>
+	<RenderingInfo Culture="en-US">
+		<Opcode>DPC</Opcode>
+		<Provider>MSNT_SystemTrace</Provider>
+		<EventName xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">PerfInfo</EventName>
+	</RenderingInfo>
+	<ExtendedTracingInfo xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">
+		<EventGuid>{ce1dbfb4-137e-4da6-87b0-3f59aa102cbc}</EventGuid>
+	</ExtendedTracingInfo>
+</Event>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+	<System>
+		<Provider Guid="{9e814aad-3204-11d2-9a82-006008a86939}" />
+		<EventID>0</EventID>
+		<Version>2</Version>
+		<Level>0</Level>
+		<Task>0</Task>
+		<Opcode>68</Opcode>
+		<Keywords>0x0</Keywords>
+		<TimeCreated SystemTime="2026-11-16T10:00:00.25001500+00:59" />
+		<Correlation ActivityID="{00000000-0000-0000-0000-000000000000}" />
+		<Execution ProcessID="0" ThreadID="0" ProcessorID="0" KernelTime="0" UserTime="0" />
+		<Channel />
+		<Computer />
+	</System>
+	<EventData>
+		<Data Name="InitialTime">134392932002500000</Data>
+		<Data Name="Routine">0xFFFFF80010001234</Data>
+	</EventData>
+	<RenderingInfo Culture="en-US">
+		<Opcode>DPC</Opcode>
+		<Provider>MSNT_SystemTrace</Provider>
+		<EventName xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">PerfInfo</EventName>
+	</RenderingInfo>
+	<ExtendedTracingInfo xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">
+		<EventGuid>{ce1dbfb4-137e-4da6-87b0-3f59aa102cbc}</EventGuid>
+	</ExtendedTracingInfo>
+</Event>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+	<System>
+		<Provider Guid="{9e814aad-3204-11d2-9a82-006008a86939}" />
+		<EventID>0</EventID>
+		<Version>2</Version>
+		<Level>0</Level>
+		<Task>0</Task>
+		<Opcode>68</Opcode>
+		<Keywords>0x0</Keywords>
+		<TimeCreated SystemTime="2026-11-16T10:00:00.50001500+00:59" />
+		<Correlation ActivityID="{00000000-0000-0000-0000-000000000000}" />
+		<Execution ProcessID="0" ThreadID="0" ProcessorID="2" KernelTime="0" UserTime="0" />
+		<Channel />
+		<Computer />
+	</System>
+	<EventData>
+		<Data Name="InitialTime">134392932005000000</Data>
+		<Data Name="Routine">0xFFFFF80010001234</Data>
+	</EventData>
+	<RenderingInfo Culture="en-US">
+		<Opcode>DPC</Opcode>
+		<Provider>MSNT_SystemTrace</Provider>
+		<EventName xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">PerfInfo</EventName>
+	</RenderingInfo>
+	<ExtendedTracingInfo xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">
+		<EventGuid>{ce1dbfb4-137e-4da6-87b0-3f59aa102cbc}</EventGuid>
+	</ExtendedTracingInfo>
+</Event>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+	<System>
+		<Provider Guid="{9e814aad-3204-11d2-9a82-006008a86939}" />
+		<EventID>0</EventID>
+		<Version>2</Version>
+		<Level>0</Level>
+		<Task>0</Task>
+		<Opcode>68</Opcode>
+		<Keywords>0x0</Keywords>
+		<TimeCreated SystemTime="2026-11-16T10:00:03.25090000+00:59" />
+		<Correlation ActivityID="{00000000-0000-0000-0000-000000000000}" />
+		<Execution ProcessID="0" ThreadID="0" ProcessorID="5" KernelTime="0" UserTime="0" />
+		<Channel />
+		<Computer />
+	</System>
+	<EventData>
+		<Data Name="InitialTime">134392932032500000</Data>
+		<Data Name="Routine">0xFFFFF80050002000</Data>
+	</EventData>
+	<RenderingInfo Culture="en-US">
+		<Opcode>DPC</Opcode>
+		<Provider>MSNT_SystemTrace</Provider>
+		<EventName xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">PerfInfo</EventName>
+	</RenderingInfo>
+	<ExtendedTracingInfo xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">
+		<EventGuid>{ce1dbfb4-137e-4da6-87b0-3f59aa102cbc}</EventGuid>
+	</ExtendedTracingInfo>
+</Event>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+	<System>
+		<Provider Guid="{9e814aad-3204-11d2-9a82-006008a86939}" />
+		<EventID>0</EventID>
+		<Version>2</Version>
+		<Level>0</Level>
+		<Task>0</Task>
+		<Opcode>68</Opcode>
+		<Keywords>0x0</Keywords>
+		<TimeCreated SystemTime="2026-11-16T10:00:04.00001500+00:59" />
+		<Correlation ActivityID="{00000000-0000-0000-0000-000000000000}" />
+		<Execution ProcessID="0" ThreadID="0" ProcessorID="0" KernelTime="0" UserTime="0" />
+		<Channel />
+		<Computer />
+	</System>
+	<EventData>
+		<Data Name="InitialTime">134392932040000000</Data>
+		<Data Name="Routine">0xFFFFF80010001234</Data>
+	</EventData>
+	<RenderingInfo Culture="en-US">
+		<Opcode>DPC</Opcode>
+		<Provider>MSNT_SystemTrace</Provider>
+		<EventName xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">PerfInfo</EventName>
+	</RenderingInfo>
+	<ExtendedTracingInfo xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">
+		<EventGuid>{ce1dbfb4-137e-4da6-87b0-3f59aa102cbc}</EventGuid>
+	</ExtendedTracingInfo>
+</Event>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+	<System>
+		<Provider Guid="{9e814aad-3204-11d2-9a82-006008a86939}" />
+		<EventID>0</EventID>
+		<Version>2</Version>
+		<Level>0</Level>
+		<Task>0</Task>
+		<Opcode>4</Opcode>
+		<Keywords>0x0</Keywords>
+		<TimeCreated SystemTime="2026-11-16T10:00:04.10000000+00:59" />
+		<Correlation ActivityID="{00000000-0000-0000-0000-000000000000}" />
+		<Execution ProcessID="4" ThreadID="0" ProcessorID="0" KernelTime="0" UserTime="0" />
+		<Channel />
+		<Computer />
+	</System>
+	<EventData>
+		<Data Name="ImageBase">0xFFFFF80010000000</Data>
+		<Data Name="ImageSize">0x200000</Data>
+		<Data Name="ProcessId">       0</Data>
+		<Data Name="ImageCheckSum">  123456</Data>
+		<Data Name="TimeDateStamp">1700000000</Data>
+		<Data Name="SignatureLevel">0</Data>
+		<Data Name="SignatureType">0</Data>
+		<Data Name="Reserved0">0</Data>
+		<Data Name="DefaultBase">0xFFFFF80010000000</Data>
+		<Data Name="Reserved1">0</Data>
+		<Data Name="Reserved2">0</Data>
+		<Data Name="Reserved3">0</Data>
+		<Data Name="Reserved4">0</Data>
+		<Data Name="FileName">\SystemRoot\System32\drivers\ndis.sys</Data>
+	</EventData>
+	<RenderingInfo Culture="en-US">
+		<Opcode>DCEnd</Opcode>
+		<Provider>MSNT_SystemTrace</Provider>
+		<EventName xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">Image</EventName>
+	</RenderingInfo>
+	<ExtendedTracingInfo xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">
+		<EventGuid>{2cb15d1d-5fc1-11d2-abe1-00a0c911f518}</EventGuid>
+	</ExtendedTracingInfo>
+</Event>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+	<System>
+		<Provider Guid="{9e814aad-3204-11d2-9a82-006008a86939}" />
+		<EventID>0</EventID>
+		<Version>2</Version>
+		<Level>0</Level>
+		<Task>0</Task>
+		<Opcode>4</Opcode>
+		<Keywords>0x0</Keywords>
+		<TimeCreated SystemTime="2026-11-16T10:00:04.10000000+00:59" />
+		<Correlation ActivityID="{00000000-0000-0000-0000-000000000000}" />
+		<Execution ProcessID="4" ThreadID="0" ProcessorID="0" KernelTime="0" UserTime="0" />
+		<Channel />
+		<Computer />
+	</System>
+	<EventData>
+		<Data Name="ImageBase">0xfffff80050000000</Data>
+		<Data Name="ImageSize">0x80000</Data>
+		<Data Name="ProcessId">       0</Data>
+		<Data Name="ImageCheckSum">  123456</Data>
+		<Data Name="TimeDateStamp">1700000000</Data>
+		<Data Name="SignatureLevel">0</Data>
+		<Data Name="SignatureType">0</Data>
+		<Data Name="Reserved0">0</Data>
+		<Data Name="DefaultBase">0xfffff80050000000</Data>
+		<Data Name="Reserved1">0</Data>
+		<Data Name="Reserved2">0</Data>
+		<Data Name="Reserved3">0</Data>
+		<Data Name="Reserved4">0</Data>
+		<Data Name="FileName">\SystemRoot\System32\drivers\audiodrv.sys</Data>
+	</EventData>
+	<RenderingInfo Culture="en-US">
+		<Opcode>DCEnd</Opcode>
+		<Provider>MSNT_SystemTrace</Provider>
+		<EventName xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">Image</EventName>
+	</RenderingInfo>
+	<ExtendedTracingInfo xmlns="http://schemas.microsoft.com/win/2004/08/events/trace">
+		<EventGuid>{2cb15d1d-5fc1-11d2-abe1-00a0c911f518}</EventGuid>
+	</ExtendedTracingInfo>
+</Event>
+</Events>

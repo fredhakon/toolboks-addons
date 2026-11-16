@@ -144,9 +144,7 @@ pub struct Resources {
     /// Which page is shown: 0 Overview, 1 Details, 2 Processes, 3 Connections.
     page: usize,
     /// Resource history recorder (off unless the preference switches it on). Kept across
-    /// `suspend`, so once the add-on is marked as background (#45, after #91) it records while
-    /// the page is closed and Toolboks sits in the tray. Until then the host ends the process
-    /// when the page is left.
+    /// `suspend`, so it records while the page is closed and Toolboks sits in the tray.
     recording: recording::Control,
 }
 

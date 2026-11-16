@@ -7,11 +7,6 @@
 //! is off there is no recorder thread, no reading and no stored history: nothing is sampled,
 //! held or written. Switching it off drops everything recorded in this run.
 //!
-//! Part 1 records only while the add-on process runs. Resource Monitor is not yet marked as a
-//! background add-on (`host-services.json`), so the host still ends it when the page is left.
-//! The `background` flag comes with the switch (#45), once the memory a suspended add-on keeps
-//! is fixed (#91). Until then recording in the tray does not happen.
-//!
 //! # What is recorded (and what is not)
 //!
 //! Every step (about [`STEP`]), in memory only. Nothing is written to disk yet (#40):

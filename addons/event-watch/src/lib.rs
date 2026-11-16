@@ -173,15 +173,15 @@ mod page_tests {
     fn the_boot_page_index_follows_the_page_list_and_never_collides_with_latency() {
         assert_eq!(PAGES[BOOT_PAGE], "Boot");
         assert_ne!(BOOT_PAGE, LATENCY_PAGE);
-        assert_eq!(PAGES, ["Live", "Crashes", "Summary", "Latency check", "Boot"]);
+        assert_eq!(
+            PAGES,
+            ["Live", "Crashes", "Summary", "Latency check", "Boot"]
+        );
         let mut watch = EventWatch::default();
         watch.navigate(&BOOT_PAGE.to_string());
         assert_eq!(watch.page_index(), BOOT_PAGE);
         let steps = watch.tutorial_steps();
-        let step = steps
-            .iter()
-            .find(|s| s.title.starts_with("Boot"))
-            .unwrap();
+        let step = steps.iter().find(|s| s.title.starts_with("Boot")).unwrap();
         assert_eq!(step.page, BOOT_PAGE.to_string());
         // The tour steps for the two new pages point at their own pages.
         let latency = steps

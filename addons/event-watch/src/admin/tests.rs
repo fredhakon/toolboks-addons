@@ -8,13 +8,18 @@ use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
 
 const BASIC: &[u8] = include_bytes!("../../../../crates/latency-trace/tests/fixtures/basic.xml");
-const DIR: &str = r"C:\Windows\Temp\toolboks-latency-test";
+const DIR: &str = r"C:\Windows\Temp\toolboks-latency-0000162c-5eed";
+/// Where another program's kernel session writes.
+const OTHER: &str = r"C:\PerfLogs\Admin\other-tool.etl";
 
 struct State {
     calls: Vec<String>,
     waits: Vec<Duration>,
-    /// The kernel session is running (ours, or another program's when set up front).
-    session: bool,
+    /// The running kernel session's output file (ours, or another program's), if any.
+    session: Option<String>,
+    /// During the recording wait, the session is replaced by this (another program stops ours
+    /// and starts its own, or just stops ours).
+    during_wait: Option<Option<String>>,
     files: BTreeSet<PathBuf>,
     workspace: Option<PathBuf>,
     workspace_fails: bool,
@@ -33,6 +38,8 @@ struct State {
     xml: &'static [u8],
     analyze_fails: bool,
     remove_fails: bool,
+    /// Replaces the answer of `logman query`.
+    query: Option<Run>,
 }
 
 impl Default for State {
@@ -40,7 +47,8 @@ impl Default for State {
         Self {
             calls: vec![],
             waits: vec![],
-            session: false,
+            session: None,
+            during_wait: None,
             files: BTreeSet::new(),
             workspace: None,
             workspace_fails: false,
@@ -55,6 +63,7 @@ impl Default for State {
             xml: BASIC,
             analyze_fails: false,
             remove_fails: false,
+            query: None,
         }
     }
 }
@@ -94,11 +103,14 @@ impl Fake {
             .filter(|c| c.starts_with(prefix))
             .count()
     }
+    fn session(&self) -> Option<String> {
+        self.0.borrow().session.clone()
+    }
     /// What must hold after every run: our session ended, no files, no folder.
     fn assert_clean(&self) {
         let s = self.0.borrow();
         assert!(
-            !s.session,
+            s.session.is_none(),
             "the kernel session was left running: {:?}",
             s.calls
         );
@@ -135,7 +147,15 @@ impl TraceSystem for Fake {
         let etl = PathBuf::from(DIR).join(ETL_NAME);
         match (tool, text[0].as_str()) {
             (Tool::Logman, "start") => {
-                if s.session {
+                let ours = || etl.to_string_lossy().into_owned();
+                if s.start == Run::TimedOut {
+                    if s.start_timed_out_but_ran && s.session.is_none() {
+                        s.session = Some(ours());
+                        s.files.insert(etl.clone());
+                    }
+                    return Run::TimedOut;
+                }
+                if s.session.is_some() {
                     // The single kernel logger is taken.
                     return Run::Exited {
                         code: 0x8007_00B7_u32 as i32,
@@ -143,8 +163,8 @@ impl TraceSystem for Fake {
                     };
                 }
                 let run = s.start.clone();
-                if run.ok() || (run == Run::TimedOut && s.start_timed_out_but_ran) {
-                    s.session = true;
+                if run.ok() {
+                    s.session = Some(ours());
                     if s.etl_bytes > 0 {
                         s.files.insert(etl);
                     }
@@ -152,28 +172,42 @@ impl TraceSystem for Fake {
                 run
             }
             (Tool::Logman, "stop") => {
-                if !s.session {
-                    return exit(-2144337918);
+                // Like the real one: it stops whatever NT Kernel Logger session runs.
+                if s.session.is_none() {
+                    return exit(0x8030_0002_u32 as i32);
                 }
                 if s.stops.pop_front().unwrap_or(true) {
-                    s.session = false;
+                    s.session = None;
                     ok()
                 } else {
                     if s.stop_failure_ends_session {
-                        s.session = false;
+                        s.session = None;
                     }
                     exit(5)
                 }
             }
             (Tool::Logman, "query") => {
-                if s.session {
-                    ok()
-                } else {
-                    exit(-2144337918)
+                if let Some(run) = s.query.clone() {
+                    return run;
+                }
+                match &s.session {
+                    // The shape of real `logman query "NT Kernel Logger" -ets` output.
+                    Some(path) => Run::Exited {
+                        code: 0,
+                        output: format!(
+                            "\r\nName:                 NT Kernel Logger\r\nStatus:               \
+                             Running\r\nOutput Location:      {path}\r\nLog Mode:             \
+                             Sequential\r\n\r\nThe command completed successfully.\r\n"
+                        ),
+                    },
+                    None => exit(0x8030_0002_u32 as i32),
                 }
             }
             (Tool::Tracerpt, _) => {
-                assert!(!s.session, "converted while still recording");
+                assert!(
+                    s.session.as_deref() != Some(&*etl.to_string_lossy()),
+                    "converted while still recording"
+                );
                 let run = s.tracerpt.clone();
                 if run.ok() && s.tracerpt_writes_xml {
                     s.files.insert(PathBuf::from(DIR).join(XML_NAME));
@@ -187,6 +221,9 @@ impl TraceSystem for Fake {
         let mut s = self.s();
         s.calls.push(format!("wait {}s", duration.as_secs()));
         s.waits.push(duration);
+        if let Some(next) = s.during_wait.take() {
+            s.session = next;
+        }
     }
     fn file_size(&mut self, path: &Path) -> Option<u64> {
         let s = self.0.borrow();
@@ -314,6 +351,7 @@ fn preparing_and_previewing_runs_nothing_so_a_cancel_runs_nothing() {
     assert!(text.starts_with("Run a 20-second latency check"));
     assert!(text.contains("Nothing on your PC is changed"));
     assert!(text.contains("deleted"));
+    assert!(text.contains("written to the Windows Temp folder (it needs about 4 GB free)"));
     assert!(!text.trim().is_empty() && text.len() <= 8000 && !text.contains('\0'));
     // The SDK drops the change without calling apply when the person cancels.
     drop(change);
@@ -343,6 +381,7 @@ fn a_check_runs_the_fixed_commands_in_order_and_leaves_nothing_behind() {
                 "Logman start | NT Kernel Logger | -p | Windows Kernel Trace | (dpc,isr,img) | -o | {etl} | -ct | perf | -bs | 256 | -nb | 32 | 256 | -max | 64 | -ets"
             ),
             "wait 30s".into(),
+            "Logman query | NT Kernel Logger | -ets".into(),
             "Logman stop | NT Kernel Logger | -ets".into(),
             "free_bytes".into(),
             format!("Tracerpt {etl} | -o | {xml} | -of | XML | -y"),
@@ -433,18 +472,19 @@ fn a_failed_start_stops_nothing() {
 #[test]
 fn another_programs_kernel_session_is_left_alone() {
     // Someone else holds the single NT Kernel Logger: we must not stop it.
-    let fake = Fake::with(|s| s.session = true);
+    let fake = Fake::with(|s| s.session = Some(OTHER.into()));
     let err = run(&fake, 10).unwrap_err();
     assert!(err.contains("Another program"), "{err}");
     assert_eq!(fake.count("Logman stop"), 0);
-    assert!(
-        fake.0.borrow().session,
+    assert_eq!(
+        fake.session().as_deref(),
+        Some(OTHER),
         "the other program's session was stopped"
     );
 }
 
 #[test]
-fn a_start_that_timed_out_is_stopped() {
+fn a_start_that_timed_out_is_stopped_only_if_it_is_ours() {
     for ran in [true, false] {
         let fake = Fake::with(|s| {
             s.start = Run::TimedOut;
@@ -455,10 +495,60 @@ fn a_start_that_timed_out_is_stopped() {
             err.contains("in time") && err.contains("Nothing is left running"),
             "{err}"
         );
-        assert!(fake.count("Logman stop") >= 1);
+        assert_eq!(fake.count("Logman query"), 1);
+        assert_eq!(fake.count("Logman stop"), usize::from(ran));
         assert_eq!(fake.count("Tracerpt"), 0);
         fake.assert_clean();
     }
+}
+
+#[test]
+fn another_programs_session_after_our_start_timed_out_is_left_alone() {
+    // Our start hung; the kernel logger that runs belongs to another program.
+    let fake = Fake::with(|s| {
+        s.start = Run::TimedOut;
+        s.session = Some(OTHER.into());
+    });
+    let err = run(&fake, 10).unwrap_err();
+    assert!(
+        err.contains("in time") && err.contains("left it alone"),
+        "{err}"
+    );
+    assert_eq!(fake.count("Logman stop"), 0);
+    assert_eq!(fake.session().as_deref(), Some(OTHER));
+    let s = fake.0.borrow();
+    assert!(s.files.is_empty() && s.workspace.is_none());
+}
+
+#[test]
+fn a_session_replaced_during_the_wait_is_left_alone() {
+    // Another program stopped ours during the recording and started its own.
+    let fake = Fake::with(|s| s.during_wait = Some(Some(OTHER.into())));
+    let err = run(&fake, 10).unwrap_err();
+    assert!(err.contains("left it alone"), "{err}");
+    assert_eq!(fake.count("Logman stop"), 0);
+    assert_eq!(fake.count("Tracerpt"), 0);
+    assert_eq!(fake.session().as_deref(), Some(OTHER));
+    let s = fake.0.borrow();
+    assert!(s.files.is_empty() && s.workspace.is_none());
+}
+
+#[test]
+fn ownership_needs_our_folder_name_in_the_query_output() {
+    // A session whose path merely shares the prefix, or no path at all, is not ours.
+    for output in [
+        r"Output Location: C:\Windows\Temp\toolboks-latency-0000162c-5eee\latency.etl".to_string(),
+        r"Output Location: C:\Windows\Temp\toolboks-latency-0000162c\latency.etl".to_string(),
+        "Name: NT Kernel Logger\r\nStatus: Running".to_string(),
+        String::new(),
+    ] {
+        let fake = Fake::with(|s| s.query = Some(Run::Exited { code: 0, output }));
+        assert_eq!(owner(&mut fake.clone(), Path::new(DIR)), Owner::Other);
+    }
+    // Case does not matter.
+    let output = format!("Output Location: {}\\LATENCY.ETL", DIR.to_ascii_uppercase());
+    let fake = Fake::with(|s| s.query = Some(Run::Exited { code: 0, output }));
+    assert_eq!(owner(&mut fake.clone(), Path::new(DIR)), Owner::Ours);
 }
 
 #[test]
@@ -476,7 +566,7 @@ fn a_stop_that_keeps_failing_is_reported_and_files_are_still_removed() {
     assert!(err.contains("could not stop the kernel recording"), "{err}");
     assert!(err.contains("64 MB"), "{err}");
     assert_eq!(fake.count("Logman stop"), STOP_ATTEMPTS);
-    assert_eq!(fake.count("Logman query"), 1);
+    assert_eq!(fake.count("Logman query"), STOP_ATTEMPTS);
     assert_eq!(fake.count("Tracerpt"), 0);
     let s = fake.0.borrow();
     assert!(s.files.is_empty());
@@ -484,14 +574,48 @@ fn a_stop_that_keeps_failing_is_reported_and_files_are_still_removed() {
 }
 
 #[test]
-fn a_session_ended_by_someone_else_is_reported_plainly() {
+fn a_failed_stop_that_took_effect_counts_as_stopped() {
     let fake = Fake::with(|s| {
         s.stops = VecDeque::from([false]);
         s.stop_failure_ends_session = true;
     });
+    run(&fake, 10).unwrap();
+    assert_eq!(fake.count("Logman stop"), 1);
+    fake.assert_clean();
+}
+
+#[test]
+fn a_session_ended_by_someone_else_during_the_wait_is_reported_plainly() {
+    let fake = Fake::with(|s| s.during_wait = Some(None));
     let err = run(&fake, 10).unwrap_err();
     assert!(err.contains("ended by another program"), "{err}");
+    assert_eq!(fake.count("Logman stop"), 0);
     fake.assert_clean();
+}
+
+#[test]
+fn an_unclear_query_is_never_reported_as_nothing_left_running() {
+    // The query hangs, errors or cannot start: ownership is unknown, so nothing is stopped, and
+    // the person is told to restart, never that nothing is left.
+    for query in [Run::TimedOut, exit(5), Run::NotStarted("denied".into())] {
+        let fake = Fake::with(|s| s.query = Some(query.clone()));
+        let err = run(&fake, 10).unwrap_err();
+        assert!(err.contains("could not stop the kernel recording"), "{err}");
+        assert!(!err.contains("Nothing is left running"), "{err}");
+        assert_eq!(fake.count("Logman query"), STOP_ATTEMPTS);
+        assert_eq!(fake.count("Logman stop"), 0);
+
+        let fake = Fake::with(|s| {
+            s.start = Run::TimedOut;
+            s.start_timed_out_but_ran = true;
+            s.query = Some(query);
+        });
+        let err = run(&fake, 10).unwrap_err();
+        assert!(err.contains("could not stop the kernel recording"), "{err}");
+        assert_eq!(fake.count("Logman stop"), 0);
+    }
+    assert!(session_not_found(0x8030_0002_u32 as i32));
+    assert!(!session_not_found(0) && !session_not_found(1) && !session_not_found(-1));
 }
 
 #[test]
@@ -552,11 +676,27 @@ fn garbage_xml_gives_an_honest_empty_result() {
 
 #[test]
 fn files_that_cannot_be_deleted_are_reported_not_hidden() {
+    // The text names the Windows Temp folder, never our folder's path.
+    let no_path = |text: &str| {
+        let lower = text.to_ascii_lowercase();
+        assert!(!lower.contains("toolboks-latency"), "{text}");
+        assert!(!lower.contains(r"c:\"), "{text}");
+        assert!(!lower.contains(r"c:\\"), "{text}");
+        assert!(
+            !lower.contains("latency.etl") && !lower.contains("latency.xml"),
+            "{text}"
+        );
+    };
     let fake = Fake::with(|s| s.remove_fails = true);
-    let result = LatencyResult::parse(&run(&fake, 10).unwrap()).unwrap();
+    let json = run(&fake, 10).unwrap();
+    no_path(&json);
+    let result = LatencyResult::parse(&json).unwrap();
     let warning = result.cleanup_warning.unwrap();
-    assert!(warning.contains("could not be deleted"), "{warning}");
-    assert!(!fake.0.borrow().session);
+    assert!(
+        warning.contains("could not be deleted from the Windows Temp folder"),
+        "{warning}"
+    );
+    assert!(fake.session().is_none());
 
     let fake = Fake::with(|s| {
         s.remove_fails = true;
@@ -567,6 +707,7 @@ fn files_that_cannot_be_deleted_are_reported_not_hidden() {
         err.contains("could not be read") && err.contains("could not be deleted"),
         "{err}"
     );
+    no_path(&err);
 }
 
 #[test]

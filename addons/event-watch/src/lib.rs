@@ -18,8 +18,28 @@ use toolboks_addon_sdk::{NativeAddon, TutorialStep};
 pub const ID: &str = "toolboks.event-watch";
 /// Page names, in order. They match `host-services.json`.
 pub const PAGES: [&str; 4] = ["Live", "Crashes", "Summary", "Latency check"];
-/// Index of the Latency check page in [`PAGES`].
-const LATENCY_PAGE: usize = 3;
+/// Index of the Latency check page in [`PAGES`], looked up by name when compiling, so a page
+/// added or moved elsewhere in the list cannot make it open the wrong page.
+const LATENCY_PAGE: usize = page_index("Latency check");
+
+/// Position of `name` in [`PAGES`]; the build fails if it is missing.
+const fn page_index(name: &str) -> usize {
+    let mut i = 0;
+    while i < PAGES.len() {
+        let (a, b) = (PAGES[i].as_bytes(), name.as_bytes());
+        if a.len() == b.len() {
+            let mut j = 0;
+            while j < a.len() && a[j] == b[j] {
+                j += 1;
+            }
+            if j == a.len() {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    panic!("page missing from PAGES")
+}
 
 /// Validates the one administrator action (the latency check) inside the separate helper. It
 /// runs nothing; the SDK's confirmation window decides whether `apply` runs.
@@ -103,10 +123,15 @@ impl NativeAddon for EventWatch {
             ("1", "table", "Crashes · episodes and timeline", "Crashes groups evidence around bluescreens, unexpected restarts and hardware faults. Select an episode to inspect the surrounding timeline. Events near a crash can be consequences rather than causes."),
             ("1", "inspector", "Crashes · evidence and dumps", "The inspector explains the selected evidence and can offer additional details or dump reading when available. A stop code or named component is a starting point for investigation, not proof of the root cause."),
             ("2", "table", "Summary · recurring patterns", "The summary highlights notable patterns in the loaded period and reports when nothing notable was found. Limited log access or retention can hide older events, so absence of evidence is not a complete health guarantee."),
-            ("3", "table", "Latency check · slow drivers", "Run a short Windows recording while stutter or audio crackle happens, and see which drivers held the processor the longest. It asks for administrator rights each time and never runs on its own. The recording is deleted after it is read. A long run is a clue, not proof of the cause."),
         ]
         .into_iter()
         .map(|(p, t, h, d)| TutorialStep::new(p, t, h, d))
+        .chain(std::iter::once(TutorialStep::new(
+            &LATENCY_PAGE.to_string(),
+            "table",
+            "Latency check · slow drivers",
+            "Run a short Windows recording while stutter or audio crackle happens, and see which drivers held the processor the longest. It asks for administrator rights each time and never runs on its own. The recording is deleted after it is read. A long run is a clue, not proof of the cause.",
+        )))
         .collect()
     }
     fn tutorial_location(&self) -> String {
@@ -114,6 +139,26 @@ impl NativeAddon for EventWatch {
     }
     fn tutorial_navigate(&mut self, page: &str) {
         self.navigate(page);
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+
+    #[test]
+    fn the_latency_page_index_follows_the_page_list() {
+        assert_eq!(PAGES[LATENCY_PAGE], "Latency check");
+        assert_eq!(page_index("Live"), 0);
+        let mut watch = EventWatch::default();
+        watch.navigate(&LATENCY_PAGE.to_string());
+        assert_eq!(watch.page_index(), LATENCY_PAGE);
+        let steps = watch.tutorial_steps();
+        let step = steps
+            .iter()
+            .find(|s| s.title.starts_with("Latency check"))
+            .unwrap();
+        assert_eq!(step.page, LATENCY_PAGE.to_string());
     }
 }
 

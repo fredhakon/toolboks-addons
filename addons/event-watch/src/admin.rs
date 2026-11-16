@@ -13,9 +13,10 @@
 //! 4. `tracerpt <etl> -o <xml> -of XML -y`, then read the XML with `latency-trace`.
 //! 5. Delete both files and the folder, and return the ranking as JSON (at most 32 KiB).
 //!
-//! The kernel session is stopped on every path after a successful start. When the start itself
-//! fails, nothing is stopped: Windows has a single NT Kernel Logger, and a failed start usually
-//! means another program owns it.
+//! The kernel session is stopped on every path after a successful start, and only ours: before
+//! each stop, `logman query "NT Kernel Logger" -ets` must show an output file inside our
+//! uniquely named folder. When the start itself fails, nothing is stopped: Windows has a single
+//! NT Kernel Logger, and a failed start usually means another program owns it.
 //!
 //! Microsoft documentation behind the commands:
 //! - logman create trace (the options `logman start ... -ets` takes: `-p`, `-o`, `-ct`, `-bs`,
@@ -327,9 +328,14 @@ fn record_in(
             ))
         }
         Run::TimedOut => {
-            // It may have started anyway: stop it before giving up.
+            // It may have started anyway. `stop` only stops a session that writes into our own
+            // folder, so another program's session is never touched.
             return Err(match stop(sys, dir) {
                 Err(Stop::StillRunning) => stop_failed(),
+                Err(Stop::NotOurs) => format!(
+                    "Windows did not start the recording in time. {OTHER_PROGRAM} Nothing of \
+                     this check is left running."
+                ),
                 Ok(()) | Err(Stop::NotRunning) => {
                     "Windows did not start the recording in time. Nothing is left running.".into()
                 }
@@ -340,6 +346,10 @@ fn record_in(
     sys.wait(Duration::from_secs(u64::from(seconds)));
     stop(sys, dir).map_err(|stop| match stop {
         Stop::StillRunning => stop_failed(),
+        Stop::NotOurs => format!(
+            "The recording was ended before the check finished. {OTHER_PROGRAM} Try again when \
+             it is done."
+        ),
         Stop::NotRunning => "The recording was ended by another program before the check \
                              finished. Nothing is left running. Try again."
             .to_string(),
@@ -391,36 +401,85 @@ fn record_in(
         .map_err(|_| "The recording could not be read. It was deleted.".to_string())
 }
 
+/// Said when the kernel session belongs to someone else.
+const OTHER_PROGRAM: &str =
+    "Another program is now using the kernel recording, and Event Watch left it alone.";
+
 /// Why a stop did not succeed.
 #[derive(Debug, PartialEq, Eq)]
 enum Stop {
-    /// The session is still running after every attempt.
+    /// Our session may still be running: it would not stop, or Windows could not say.
     StillRunning,
     /// No kernel session is running (it never started, or something else ended it).
     NotRunning,
+    /// The kernel session running now writes somewhere else: another program's. Not stopped.
+    NotOurs,
 }
 
-/// Stops the session, retrying; on failure asks Windows whether it is still running.
+/// Whose kernel session is running, from `logman query "NT Kernel Logger" -ets`.
+#[derive(Debug, PartialEq, Eq)]
+enum Owner {
+    /// Its output file is in our private folder. The folder name is random and unique, and
+    /// logman prints the output path as given, whatever the display language.
+    Ours,
+    Other,
+    Gone,
+    /// The query failed, hung or could not start.
+    Unknown,
+}
+
+fn owner(sys: &mut dyn TraceSystem, dir: &Path) -> Owner {
+    let Some(folder) = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+    else {
+        return Owner::Unknown;
+    };
+    match sys.run(Tool::Logman, &query_args(), dir, LOGMAN_TIMEOUT) {
+        Run::Exited { code: 0, output } if output.to_ascii_lowercase().contains(&folder) => {
+            Owner::Ours
+        }
+        Run::Exited { code: 0, .. } => Owner::Other,
+        Run::Exited { code, .. } if session_not_found(code) => Owner::Gone,
+        _ => Owner::Unknown,
+    }
+}
+
+/// Stops our session. Before every stop it asks Windows whose session is running and stops only
+/// one that writes into our folder; another program's session is left alone. A query that
+/// fails or hangs never counts as "not running", so the person is never told nothing is left
+/// when that is unknown.
 fn stop(sys: &mut dyn TraceSystem, dir: &Path) -> Result<(), Stop> {
     for attempt in 0..STOP_ATTEMPTS {
         if attempt > 0 {
             sys.wait(Duration::from_secs(1));
         }
-        if sys
-            .run(Tool::Logman, &stop_args(), dir, LOGMAN_TIMEOUT)
-            .ok()
-        {
-            return Ok(());
+        match owner(sys, dir) {
+            Owner::Ours => {
+                if sys
+                    .run(Tool::Logman, &stop_args(), dir, LOGMAN_TIMEOUT)
+                    .ok()
+                {
+                    return Ok(());
+                }
+            }
+            Owner::Other => return Err(Stop::NotOurs),
+            // Gone before any stop of ours: something else ended it.
+            Owner::Gone if attempt == 0 => return Err(Stop::NotRunning),
+            // Gone after a stop of ours that reported failure: that stop took effect.
+            Owner::Gone => return Ok(()),
+            Owner::Unknown => {}
         }
     }
-    if sys
-        .run(Tool::Logman, &query_args(), dir, LOGMAN_TIMEOUT)
-        .ok()
-    {
-        Err(Stop::StillRunning)
-    } else {
-        Err(Stop::NotRunning)
-    }
+    Err(Stop::StillRunning)
+}
+
+/// logman's answer for a session that does not exist: PLA_E_DCS_NOT_FOUND (0x80300002, "Data
+/// Collector Set was not found", seen from `logman query "NT Kernel Logger" -ets` on Windows 11),
+/// or ERROR_WMI_INSTANCE_NOT_FOUND (4201) as a code or HRESULT.
+fn session_not_found(code: i32) -> bool {
+    matches!(code as u32, 0x8030_0002 | 4201 | 0x8007_1069)
 }
 
 /// ERROR_ALREADY_EXISTS (183), as a plain code or as an HRESULT.
@@ -468,12 +527,13 @@ fn cleanup(sys: &mut dyn TraceSystem, dir: &Path, files: &[&Path]) -> Result<(),
     if sys.remove_workspace(dir).is_err() {
         failed = true;
     }
+    // No path in the text: it reaches the drawing side and the folder name helps nobody.
     if failed {
-        Err(format!(
-            "Some temporary recording files could not be deleted from {}. Windows Disk Cleanup \
-             (Temporary files) removes them.",
-            dir.display()
-        ))
+        Err(
+            "Some temporary recording files could not be deleted from the Windows Temp folder. \
+             Windows Disk Cleanup (Temporary files) removes them."
+                .into(),
+        )
     } else {
         Ok(())
     }
@@ -590,7 +650,8 @@ impl AdminChange for PreparedTrace {
             "Run a {n}-second latency check\n\n\
              Windows will record how long each driver's interrupt and deferred work (ISR and DPC) \
              runs, for about {n} seconds, then convert and read the recording. The processor is \
-             a little busier while it records.\n\n\
+             a little busier while it records. The recording is written to the Windows Temp \
+             folder (it needs about 4 GB free) and deleted afterwards.\n\n\
              Nothing on your PC is changed. The recording files are deleted as soon as they have \
              been read, and the result is kept only in Event Watch until you close it."
         )
@@ -673,7 +734,7 @@ impl TraceSystem for WindowsTrace {
     fn create_workspace(&mut self) -> Result<PathBuf, String> {
         use windows::core::{w, PCWSTR};
         use windows::Win32::Foundation::{
-            GetLastError, LocalFree, ERROR_ALREADY_EXISTS, HLOCAL, INVALID_HANDLE_VALUE,
+            LocalFree, ERROR_ALREADY_EXISTS, HLOCAL, INVALID_HANDLE_VALUE,
         };
         use windows::Win32::Security::Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -722,12 +783,13 @@ impl TraceSystem for WindowsTrace {
             let path = temp.join(name);
             let w = wide(&path);
             // Fails when the name exists, so a folder made by someone else is never used.
-            if unsafe { CreateDirectoryW(PCWSTR(w.as_ptr()), Some(&attributes)) }.is_ok() {
-                made = Some(path);
-                break;
-            }
-            if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
-                break;
+            match unsafe { CreateDirectoryW(PCWSTR(w.as_ptr()), Some(&attributes)) } {
+                Ok(()) => {
+                    made = Some(path);
+                    break;
+                }
+                Err(e) if e.code() == ERROR_ALREADY_EXISTS.to_hresult() => {}
+                Err(_) => break,
             }
         }
         unsafe {
@@ -763,6 +825,8 @@ impl TraceSystem for WindowsTrace {
         self.dir = Some(handle);
         if !plain {
             self.close_dir();
+            // `remove_dir` removes a link itself, never what it points to.
+            let _ = std::fs::remove_dir(&path);
             return Err(refused("The private working folder is not a plain folder."));
         }
         Ok(path)

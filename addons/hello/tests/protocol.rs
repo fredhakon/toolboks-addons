@@ -40,6 +40,22 @@ fn running_elevated() -> bool {
 
 #[test]
 fn protocol_test_host_draws_pings_and_quits() {
+    // A host that speaks this SDK's protocol (4) agrees on it.
+    draws_pings_and_quits(
+        Hello::new("toolboks.hello", "test"),
+        toolboks_addon_proto::PROTOCOL_VERSION,
+    );
+}
+
+/// A host that speaks only protocol 3 (Toolboks 0.14 and older, or an entry recorded at 3) still
+/// gets a working add-on: the SDK answers with the host's version.
+#[test]
+fn a_protocol_3_host_agrees_on_3() {
+    assert_eq!(toolboks_addon_proto::MIN_PROTOCOL_VERSION, 3);
+    draws_pings_and_quits(Hello::with_version("toolboks.hello", "test", 3), 3);
+}
+
+fn draws_pings_and_quits(host_hello: Hello, agreed: u32) {
     if running_elevated() {
         eprintln!(
             "skipped: this process is elevated and the add-on runtime refuses to run elevated"
@@ -62,13 +78,9 @@ fn protocol_test_host_draws_pings_and_quits() {
     std::thread::spawn(move || {
         let mut reader = FrameReader::new(stdout);
         let mut writer = FrameWriter::new(stdin);
-        let hello = host_handshake(
-            &mut reader,
-            &mut writer,
-            &Hello::new("toolboks.hello", "test"),
-        )
-        .unwrap();
+        let hello = host_handshake(&mut reader, &mut writer, &host_hello).unwrap();
         assert_eq!(hello.addon_id, "toolboks.hello");
+        assert_eq!(hello.protocol_version, agreed);
         writer
             .write(&HostMessage::Input(InputBatch {
                 seq: 1,

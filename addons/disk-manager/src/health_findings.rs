@@ -112,7 +112,7 @@ fn clean(text: &str, max: usize) -> String {
 
 fn id_for(letter: &str) -> String {
     match normalize_letter(letter) {
-        Some(l) => format!("{ID_PREFIX}-{}", &l[..1].to_ascii_lowercase()),
+        Some(l) => format!("{ID_PREFIX}-{}", l[..1].to_ascii_lowercase()),
         None => ID_PREFIX.to_string(),
     }
 }

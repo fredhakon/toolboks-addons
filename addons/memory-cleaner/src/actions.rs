@@ -27,6 +27,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::trim::{creation_time, image_name, live_name_ok, skip_reason, SkipReason, Trimmed};
+use protected_processes::Parent;
 use toolboks_shared::win::Handle;
 
 /// Memory priority applied to idle background apps (MEMORY_PRIORITY_LOW).
@@ -80,6 +81,10 @@ pub struct Identity {
     pub created: u64,
     /// Image file name such as `chrome.exe`, compared case-insensitively.
     pub name: String,
+    /// The parent the same snapshot vouched for. Travels with the identity so planning and the
+    /// write open (run and undo) both check it: a launcher's child, or a process whose parent
+    /// could not be vouched for, is refused twice.
+    pub parent: Parent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,8 +106,6 @@ pub struct Candidate {
     pub idle_for: Option<Duration>,
     pub plays_audio: bool,
     pub is_fullscreen: bool,
-    /// Image name of the parent process, if known (to catch children of game launchers).
-    pub parent_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -223,8 +226,14 @@ pub fn check_eligibility(
         return Err(Skip::Own);
     }
     // Game and anti-cheat processes are checked below together with their parent.
-    if skip_reason(c.identity.pid, &name, None, policy.own_pid, &HashSet::new())
-        == Some(SkipReason::System)
+    let parent = &c.identity.parent;
+    if skip_reason(
+        c.identity.pid,
+        &name,
+        parent,
+        policy.own_pid,
+        &HashSet::new(),
+    ) == Some(SkipReason::System)
         || EXTRA_PROTECTED.contains(&name.as_str())
     {
         return Err(Skip::System);
@@ -241,7 +250,7 @@ pub fn check_eligibility(
     if c.is_fullscreen {
         return Err(Skip::Fullscreen);
     }
-    if protected_processes::protected_reason(&name, c.parent_name.as_deref()).is_some() {
+    if protected_processes::protected_reason(&name, parent).is_some() {
         return Err(Skip::Launcher);
     }
     if c.plays_audio {
@@ -454,13 +463,6 @@ pub fn foreground_pid() -> Option<u32> {
     }
 }
 
-/// Whether the app has an active audio session.
-/// Stub: real detection needs the COM audio session APIs (IAudioSessionManager2), which this
-/// slice does not pull in. Returns `false`, so callers must also rely on other signals.
-pub fn plays_audio(_pid: u32) -> bool {
-    false
-}
-
 fn classify(e: &windows::core::Error) -> ActionError {
     if e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0) {
         ActionError::AccessDenied
@@ -469,34 +471,29 @@ fn classify(e: &windows::core::Error) -> ActionError {
     }
 }
 
-/// Identity of whatever process holds `pid` right now (pid, creation time, given image name), or
-/// `None` if it cannot be opened (protected, other user) or has no creation time. Only for
-/// rechecking a known identity: an identity for a process from a snapshot takes the creation
-/// time the snapshot recorded (`ProcInfo::created`), so a reused pid never inherits the old
-/// process's sampled parent.
-pub fn identity_of(pid: u32, name: &str) -> Option<Identity> {
+/// Creation time of whatever process holds `pid` right now, or `None` if it cannot be opened
+/// (protected, other user) or has no creation time. Only for rechecking a known identity: an
+/// identity for a process from a snapshot takes the creation time the snapshot recorded
+/// (`ProcInfo::created`), so a reused pid never inherits the old process's sampled parent.
+pub fn live_created(pid: u32) -> Option<u64> {
     // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
         .map(Handle)
         .ok()?;
-    let created = creation_time(handle.0).ok()?;
-    Some(Identity {
-        pid,
-        created,
-        name: name.to_string(),
-    })
+    creation_time(handle.0).ok()
 }
 
 /// Opens the process and verifies start time and image name before returning the handle.
 fn open_verified(id: &Identity, access: PROCESS_ACCESS_RIGHTS) -> Result<Handle, ActionError> {
-    // Game and anti-cheat processes are refused before any handle with write access exists.
-    if protected_processes::protected_reason(&id.name, None).is_some() {
+    // First gate: game, launcher and anti-cheat processes, a launcher's child and a process
+    // whose parent could not be vouched for are refused before any process handle exists.
+    if protected_processes::protected_reason(&id.name, &id.parent).is_some() {
         return Err(ActionError::AccessDenied);
     }
     // Verify with a query-only handle first. While it stays open the pid cannot be reused, so
-    // the write-capable handle below belongs to the verified process. Its parent was checked
-    // when the action was planned; the identity's creation time comes from the same snapshot
-    // as that parent, so a matching creation time means the parent check was about this process.
+    // the write-capable handle below belongs to the verified process. The parent comes from
+    // the same snapshot as the identity's creation time, so a matching creation time means the
+    // parent describes this process; the second gate checks the live name with that parent.
     // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
     let query = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, id.pid) }
         .map(Handle)
@@ -505,7 +502,7 @@ fn open_verified(id: &Identity, access: PROCESS_ACCESS_RIGHTS) -> Result<Handle,
         return Err(ActionError::IdentityChanged);
     }
     let live = image_name(&query).ok_or(ActionError::IdentityChanged)?;
-    if !live_name_ok(id.pid, &id.name, &live, None, std::process::id()) {
+    if !live_name_ok(id.pid, &id.name, &live, &id.parent, std::process::id()) {
         return Err(ActionError::IdentityChanged);
     }
     // SAFETY: as above.
@@ -584,6 +581,7 @@ mod tests {
             pid,
             created: 1000 + u64::from(pid),
             name: name.to_string(),
+            parent: Parent::known("explorer.exe"),
         }
     }
 
@@ -594,7 +592,6 @@ mod tests {
             idle_for: Some(Duration::from_secs(3600)),
             plays_audio: false,
             is_fullscreen: false,
-            parent_name: None,
         }
     }
 
@@ -718,8 +715,13 @@ mod tests {
             Err(Skip::Launcher)
         );
         let mut child = cand(8, "game.exe", 500);
-        child.parent_name = Some("EpicGamesLauncher.exe".into());
+        child.identity.parent = Parent::known("EpicGamesLauncher.exe");
         assert_eq!(check(&child, Kind::Trim), Err(Skip::Launcher));
+        // Its launcher may have exited, or its pid now belongs to another program.
+        let mut orphan = cand(9, "game.exe", 500);
+        orphan.identity.parent = Parent::Unverified;
+        assert_eq!(check(&orphan, Kind::Trim), Err(Skip::Launcher));
+        assert_eq!(check(&orphan, Kind::LowerPriority), Err(Skip::Launcher));
         for name in ["BEService.exe", "vgc.exe", "cs2.exe"] {
             assert_eq!(
                 check(&cand(8, name, 500), Kind::LowerPriority),
@@ -986,6 +988,7 @@ mod tests {
             pid: 40,
             created: 9999,
             name: "other.exe".into(),
+            parent: Parent::known("explorer.exe"),
         };
         fake.add(&newcomer, 400 * MB);
         let restored = undo.restore_all(&fake);
@@ -1055,6 +1058,7 @@ mod tests {
                 pid,
                 created: creation_time(h.0).ok()?,
                 name: "cmd.exe".into(),
+                parent: Parent::known("explorer.exe"),
             })
         });
         let outcome = identity.map(|i| {
@@ -1069,5 +1073,38 @@ mod tests {
         let (prev, set, now) = outcome.expect("identity of child");
         assert!(prev.is_ok() && set.is_ok(), "{prev:?} {set:?}");
         assert_eq!(now, Ok(LOW_PRIORITY));
+    }
+
+    #[test]
+    fn the_write_open_refuses_a_launchers_child_and_an_unverified_parent() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 6 127.0.0.1 > nul"])
+            .spawn()
+            .expect("spawn child");
+        let pid = child.id();
+        let outcome = live_created(pid).map(|created| {
+            let as_child_of = |parent: Parent| Identity {
+                pid,
+                created,
+                name: "cmd.exe".into(),
+                parent,
+            };
+            let ops = WindowsOps;
+            (
+                ops.set_memory_priority(&as_child_of(Parent::known("steam.exe")), LOW_PRIORITY),
+                ops.trim(&as_child_of(Parent::Unverified)),
+                ops.memory_priority(&as_child_of(Parent::Unverified)),
+                ops.memory_priority(&as_child_of(Parent::known("explorer.exe"))),
+            )
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        let (launcher, trim, query, plain) = outcome.expect("creation time of child");
+        // Refused before any process handle exists, whatever the action.
+        assert_eq!(launcher, Err(ActionError::AccessDenied));
+        assert_eq!(trim, Err(ActionError::AccessDenied));
+        assert_eq!(query, Err(ActionError::AccessDenied));
+        // The same process under a known, unlisted parent may be opened.
+        assert!(plain.is_ok(), "{plain:?}");
     }
 }

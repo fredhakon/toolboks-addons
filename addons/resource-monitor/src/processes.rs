@@ -24,6 +24,7 @@ use windows::Win32::System::Threading::{
     PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
 };
 
+use protected_processes::Parent;
 use toolboks_shared::format::{friendly_name, rate, size_plain, uptime};
 use toolboks_shared::ui::{
     body_cell, header_cell, inspector_edge, inspector_frame, row_rule, switch_row, table_style,
@@ -86,8 +87,10 @@ struct Proc {
     disk: Option<f64>,
     run_secs: u64,
     exe: Option<String>,
-    /// Image name of the parent process, if known (to protect children of game launchers).
-    parent: Option<String>,
+    /// The parent this refresh vouched for (to protect children of game launchers). A parent
+    /// that has exited, whose pid was reused, or whose creation time could not be read is
+    /// unverified, and the process is then protected.
+    parent: Parent,
 }
 
 /// One table row: a process, or all processes of one name when grouped.
@@ -105,8 +108,8 @@ struct Row {
     disk: Option<f64>,
     run_secs: u64,
     exe: Option<String>,
-    /// Parent image name of the first process in the row.
-    parent: Option<String>,
+    /// Parent of the first process in the row.
+    parent: Parent,
     /// True when every process in the row is protected.
     protected: bool,
 }
@@ -122,8 +125,8 @@ enum SortKey {
 
 /// True for processes Windows needs, this app itself, and game, launcher and anti-cheat
 /// processes. Protected processes are only ever opened with query access for the listing.
-/// `parent` is the parent's image name, if known.
-pub(super) fn is_protected(pid: u32, name: &str, parent: Option<&str>, own_pid: u32) -> bool {
+/// `parent` is the parent the refresh vouched for; an unverified one protects the process.
+pub(super) fn is_protected(pid: u32, name: &str, parent: &Parent, own_pid: u32) -> bool {
     pid == own_pid
         || pid == 0
         || pid == 4
@@ -134,7 +137,7 @@ pub(super) fn is_protected(pid: u32, name: &str, parent: Option<&str>, own_pid: 
 }
 
 /// Why a protected process is left alone, for hovers and the inspector.
-pub(super) fn protected_note(name: &str, parent: Option<&str>) -> &'static str {
+pub(super) fn protected_note(name: &str, parent: &Parent) -> &'static str {
     protected_processes::protected_reason(name, parent).map_or(PROTECTED_NOTE, |p| p.describe())
 }
 
@@ -151,6 +154,23 @@ fn row_key(grouped: bool, p: &Proc) -> String {
 #[cfg(test)]
 fn shown<'a>(live: &'a [Proc], frozen: Option<&'a [Proc]>) -> &'a [Proc] {
     frozen.unwrap_or(live)
+}
+
+/// Fills in each process's parent from the same refresh. `parent_pids[i]` is the parent pid
+/// the refresh reported for `procs[i]`. A parent is known only when it is in the refresh and
+/// was created before the child ([`Parent::vouch`]); otherwise it stays unverified. Pure.
+fn link_parents(procs: &mut [Proc], parent_pids: &[Option<u32>]) {
+    let seen: std::collections::HashMap<u32, (String, Option<u64>)> = procs
+        .iter()
+        .map(|p| (p.pid, (p.name.clone(), p.identity.map(|id| id.created))))
+        .collect();
+    for (p, ppid) in procs.iter_mut().zip(parent_pids) {
+        let parent = ppid.and_then(|ppid| seen.get(&ppid));
+        p.parent = Parent::vouch(
+            p.identity.map(|id| id.created),
+            parent.map(|(name, created)| (name.as_str(), *created)),
+        );
+    }
 }
 
 /// Rows for the table; grouped rows sum CPU, memory and disk of every process with the same name.
@@ -537,14 +557,14 @@ pub(super) fn sampled_identity(
 
 /// True when the live image name still matches the sampled one and the process is still not
 /// protected, so a reused pid never gets a write-capable handle. Pure.
-fn live_name_ok(pid: u32, sampled: &str, live: &str, parent: Option<&str>, own_pid: u32) -> bool {
+fn live_name_ok(pid: u32, sampled: &str, live: &str, parent: &Parent, own_pid: u32) -> bool {
     live.eq_ignore_ascii_case(sampled) && !is_protected(pid, live, parent, own_pid)
 }
 
 fn action_handle(
     identity: ProcessIdentity,
     expected_name: &str,
-    parent: Option<&str>,
+    parent: &Parent,
     access: PROCESS_ACCESS_RIGHTS,
 ) -> Result<Handle, ActionError> {
     let own_pid = std::process::id();
@@ -598,7 +618,7 @@ fn action_handle(
 pub(super) fn end_process(
     identity: ProcessIdentity,
     name: &str,
-    parent: Option<&str>,
+    parent: &Parent,
 ) -> Result<(), ActionError> {
     let handle = action_handle(identity, name, parent, PROCESS_TERMINATE)?;
     // SAFETY: the handle is valid and was opened with PROCESS_TERMINATE.
@@ -630,7 +650,7 @@ fn lowering_keeps_idle_and_below_normal_priorities() {
 fn set_priority(
     identity: ProcessIdentity,
     name: &str,
-    parent: Option<&str>,
+    parent: &Parent,
     class: u32,
     lower_only: bool,
 ) -> Result<u32, ActionError> {
@@ -697,7 +717,7 @@ fn run_action(action: Action) -> Done {
                 let result = p
                     .identity
                     .ok_or(ActionError::IdentityChanged)
-                    .and_then(|id| end_process(id, &p.name, p.parent.as_deref()));
+                    .and_then(|id| end_process(id, &p.name, &p.parent));
                 note(&mut done, p, "Ended", result);
             }
         }
@@ -707,14 +727,8 @@ fn run_action(action: Action) -> Done {
                     .identity
                     .ok_or(ActionError::IdentityChanged)
                     .and_then(|id| {
-                        set_priority(
-                            id,
-                            &p.name,
-                            p.parent.as_deref(),
-                            BELOW_NORMAL_PRIORITY_CLASS.0,
-                            true,
-                        )
-                        .map(|prev| (id, prev))
+                        set_priority(id, &p.name, &p.parent, BELOW_NORMAL_PRIORITY_CLASS.0, true)
+                            .map(|prev| (id, prev))
                     });
                 match result {
                     Ok((id, prev)) => {
@@ -733,7 +747,7 @@ fn run_action(action: Action) -> Done {
                     .identity
                     .ok_or(ActionError::IdentityChanged)
                     .and_then(|id| {
-                        set_priority(id, &p.name, p.parent.as_deref(), *prev, false)?;
+                        set_priority(id, &p.name, &p.parent, *prev, false)?;
                         done.restored.push(id);
                         Ok(())
                     });
@@ -808,7 +822,7 @@ impl Worker {
                     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
                     let was_primed = last.is_some();
                     last = Some(Instant::now());
-                    let procs = sys
+                    let (mut procs, parent_pids): (Vec<Proc>, Vec<Option<u32>>) = sys
                         .processes()
                         .values()
                         .map(|p| {
@@ -820,7 +834,7 @@ impl Worker {
                                 u.read_bytes.saturating_add(u.written_bytes),
                                 secs,
                             );
-                            Proc {
+                            let proc = Proc {
                                 pid: p.pid().as_u32(),
                                 identity,
                                 lower_name: name.to_lowercase(),
@@ -830,13 +844,12 @@ impl Worker {
                                 disk,
                                 run_secs: p.run_time(),
                                 exe: p.exe().map(|e| e.display().to_string()),
-                                parent: p
-                                    .parent()
-                                    .and_then(|parent| sys.process(parent))
-                                    .map(|parent| parent.name().to_string_lossy().into_owned()),
-                            }
+                                parent: Parent::Unverified,
+                            };
+                            (proc, p.parent().map(|parent| parent.as_u32()))
                         })
-                        .collect::<Vec<Proc>>();
+                        .unzip();
+                    link_parents(&mut procs, &parent_pids);
                     disk_baseline.commit(procs.iter().filter_map(|p| p.identity));
                     ready = was_primed;
                     if tx
@@ -981,7 +994,7 @@ impl Page {
             self.rows = None;
         }
         let own_pid = std::process::id();
-        let protected = move |p: &Proc| is_protected(p.pid, &p.name, p.parent.as_deref(), own_pid);
+        let protected = move |p: &Proc| is_protected(p.pid, &p.name, &p.parent, own_pid);
         let procs = Arc::clone(self.frozen.as_ref().unwrap_or(&self.live));
         if self.rows.is_none() {
             let rows = build_rows(&procs, self.grouped, &protected);
@@ -1247,7 +1260,7 @@ impl Page {
                     let cell = |ui: &mut egui::Ui, text: String| {
                         let l = body_cell(ui, text, true, r.protected);
                         if r.protected {
-                            l.on_hover_text(protected_note(&r.name, r.parent.as_deref()));
+                            l.on_hover_text(protected_note(&r.name, &r.parent));
                         }
                     };
                     row.col(|ui| {
@@ -1259,7 +1272,7 @@ impl Page {
                     row.col(|ui| {
                         let l = body_cell(ui, display_name(r), false, r.protected);
                         if r.protected {
-                            l.on_hover_text(protected_note(&r.name, r.parent.as_deref()));
+                            l.on_hover_text(protected_note(&r.name, &r.parent));
                         }
                     });
                     if !grouped {
@@ -1378,9 +1391,9 @@ impl Page {
             let note = if chosen.iter().any(|p| p.identity.is_none() && !protected(p)) {
                 "Windows could not verify the selected processes."
             } else {
-                chosen.first().map_or(PROTECTED_NOTE, |p| {
-                    protected_note(&p.name, p.parent.as_deref())
-                })
+                chosen
+                    .first()
+                    .map_or(PROTECTED_NOTE, |p| protected_note(&p.name, &p.parent))
             };
             ui.label(RichText::new(note).weak().small());
         } else if !skipped.is_empty() {
@@ -1542,8 +1555,13 @@ mod tests {
             disk: None,
             run_secs: pid as u64,
             exe: None,
-            parent: None,
+            parent: ok(),
         }
+    }
+
+    /// A parent the refresh vouched for that protects nothing.
+    fn ok() -> Parent {
+        Parent::known("explorer.exe")
     }
 
     fn none(_: &Proc) -> bool {
@@ -1808,45 +1826,55 @@ mod tests {
         };
 
         assert_eq!(
-            end_process(stale, &name, None),
+            end_process(stale, &name, &ok()),
             Err(ActionError::IdentityChanged)
         );
         assert_eq!(
-            end_process(identity, "other.exe", None),
+            end_process(identity, "other.exe", &ok()),
             Err(ActionError::IdentityChanged)
         );
         assert_eq!(
-            set_priority(stale, &name, None, BELOW_NORMAL_PRIORITY_CLASS.0, true),
+            set_priority(stale, &name, &ok(), BELOW_NORMAL_PRIORITY_CLASS.0, true),
             Err(ActionError::IdentityChanged)
         );
         assert!(child.try_wait().unwrap().is_none());
 
         let previous =
-            set_priority(identity, &name, None, BELOW_NORMAL_PRIORITY_CLASS.0, false).unwrap();
+            set_priority(identity, &name, &ok(), BELOW_NORMAL_PRIORITY_CLASS.0, false).unwrap();
         assert_eq!(
-            set_priority(identity, &name, None, previous, false),
+            set_priority(identity, &name, &ok(), previous, false),
             Ok(BELOW_NORMAL_PRIORITY_CLASS.0)
         );
-        end_process(identity, &name, None).unwrap();
+        end_process(identity, &name, &ok()).unwrap();
         assert_eq!(child.wait().unwrap().code(), Some(1));
     }
 
     #[test]
     fn game_and_anti_cheat_processes_are_refused_before_opening() {
         for name in ["steam.exe", "BEService.exe", "cs2.exe"] {
-            assert!(is_protected(500, name, None, 1), "{name}");
+            assert!(is_protected(500, name, &ok(), 1), "{name}");
         }
-        assert!(is_protected(500, "IndieGame.exe", Some("steam.exe"), 1));
-        assert!(!is_protected(500, "notepad.exe", Some("explorer.exe"), 1));
+        assert!(is_protected(
+            500,
+            "IndieGame.exe",
+            &Parent::known("steam.exe"),
+            1
+        ));
+        assert!(!is_protected(
+            500,
+            "notepad.exe",
+            &Parent::known("explorer.exe"),
+            1
+        ));
         assert_eq!(
-            protected_note("vgc.exe", None),
+            protected_note("vgc.exe", &ok()),
             "Protected: anti-cheat process, Toolboks leaves it alone."
         );
         assert_eq!(
-            protected_note("IndieGame.exe", Some("Steam.exe")),
+            protected_note("IndieGame.exe", &Parent::known("Steam.exe")),
             "Protected: started by a game launcher, Toolboks leaves it alone."
         );
-        assert_eq!(protected_note("csrss.exe", None), PROTECTED_NOTE);
+        assert_eq!(protected_note("csrss.exe", &ok()), PROTECTED_NOTE);
         // Pids are multiples of 4 on Windows, so no real process is touched here.
         let fake = ProcessIdentity {
             pid: u32::MAX - 1,
@@ -1855,16 +1883,20 @@ mod tests {
         let refused = Err(ActionError::Protected(
             "Protected: game process, Toolboks leaves it alone.",
         ));
-        assert_eq!(end_process(fake, "cs2.exe", None), refused);
+        assert_eq!(end_process(fake, "cs2.exe", &ok()), refused);
         assert!(matches!(
-            end_process(fake, "IndieGame.exe", Some("EpicGamesLauncher.exe")),
+            end_process(
+                fake,
+                "IndieGame.exe",
+                &Parent::known("EpicGamesLauncher.exe")
+            ),
             Err(ActionError::Protected(_))
         ));
         assert!(matches!(
             set_priority(
                 fake,
                 "EasyAntiCheat.exe",
-                None,
+                &ok(),
                 BELOW_NORMAL_PRIORITY_CLASS.0,
                 true
             ),
@@ -1878,16 +1910,16 @@ mod tests {
 
     #[test]
     fn live_name_gate_rejects_changed_or_protected_names() {
-        assert!(live_name_ok(40, "Chrome.exe", "chrome.exe", None, 1));
+        assert!(live_name_ok(40, "Chrome.exe", "chrome.exe", &ok(), 1));
         // The pid now belongs to another program.
-        assert!(!live_name_ok(40, "chrome.exe", "notepad.exe", None, 1));
-        assert!(!live_name_ok(40, "chrome.exe", "cs2.exe", None, 1));
+        assert!(!live_name_ok(40, "chrome.exe", "notepad.exe", &ok(), 1));
+        assert!(!live_name_ok(40, "chrome.exe", "cs2.exe", &ok(), 1));
         // Same name, but protected through its launcher parent.
         assert!(!live_name_ok(
             40,
             "game.exe",
             "game.exe",
-            Some("steam.exe"),
+            &Parent::known("steam.exe"),
             1
         ));
     }
@@ -1901,12 +1933,104 @@ mod tests {
             "Memory Compression",
             "dwm.exe",
         ] {
-            assert!(is_protected(500, name, None, 1), "{name}");
+            assert!(is_protected(500, name, &ok(), 1), "{name}");
         }
-        assert!(is_protected(0, "anything", None, 1));
-        assert!(is_protected(1234, "whatever.exe", None, 1234));
-        assert!(!is_protected(777, "refused.exe", None, 1));
-        assert!(!is_protected(500, "chrome.exe", None, 1));
+        assert!(is_protected(0, "anything", &ok(), 1));
+        assert!(is_protected(1234, "whatever.exe", &ok(), 1234));
+        assert!(!is_protected(777, "refused.exe", &ok(), 1));
+        assert!(!is_protected(500, "chrome.exe", &ok(), 1));
+    }
+
+    /// A process the refresh tied to creation time `created`, parent not linked yet.
+    fn born(pid: u32, name: &str, created: Option<u64>) -> Proc {
+        Proc {
+            identity: created.map(|created| ProcessIdentity { pid, created }),
+            parent: Parent::Unverified,
+            ..p(pid, name, 0.0, 0)
+        }
+    }
+
+    #[test]
+    fn a_parent_older_than_its_child_is_known() {
+        let mut procs = vec![
+            born(10, "steam.exe", Some(100)),
+            born(11, "IndieGame.exe", Some(200)),
+            born(12, "notepad.exe", Some(300)),
+            born(13, "explorer.exe", Some(50)),
+        ];
+        link_parents(&mut procs, &[None, Some(10), Some(13), None]);
+        assert_eq!(procs[1].parent, Parent::known("steam.exe"));
+        assert!(is_protected(11, "IndieGame.exe", &procs[1].parent, 1));
+        // A normal parent leaves an ordinary app unprotected.
+        assert_eq!(procs[2].parent, Parent::known("explorer.exe"));
+        assert!(!is_protected(12, "notepad.exe", &procs[2].parent, 1));
+    }
+
+    #[test]
+    fn a_reused_parent_pid_is_unverified_and_protects_the_child() {
+        // Steam (pid 10) started the game and exited; notepad then got pid 10.
+        let mut procs = vec![
+            born(10, "notepad.exe", Some(300)),
+            born(11, "IndieGame.exe", Some(200)),
+        ];
+        link_parents(&mut procs, &[None, Some(10)]);
+        assert_eq!(procs[1].parent, Parent::Unverified);
+        assert!(is_protected(11, "IndieGame.exe", &procs[1].parent, 1));
+        assert_eq!(
+            protected_note("IndieGame.exe", &procs[1].parent),
+            "Protected: the program that started it has closed or cannot be checked, \
+             Toolboks leaves it alone."
+        );
+    }
+
+    #[test]
+    fn an_exited_or_unreadable_parent_is_unverified() {
+        // The launcher exited and nothing holds its pid.
+        let mut procs = vec![born(11, "IndieGame.exe", Some(200))];
+        link_parents(&mut procs, &[Some(10)]);
+        assert_eq!(procs[0].parent, Parent::Unverified);
+        // The parent's creation time could not be read (other user, or born mid-refresh).
+        let mut procs = vec![
+            born(10, "steam.exe", None),
+            born(11, "IndieGame.exe", Some(200)),
+        ];
+        link_parents(&mut procs, &[None, Some(10)]);
+        assert_eq!(procs[1].parent, Parent::Unverified);
+    }
+
+    #[test]
+    fn an_unverified_parent_is_refused_before_opening() {
+        // Pids are multiples of 4 on Windows, so no real process is touched here.
+        let fake = ProcessIdentity {
+            pid: u32::MAX - 1,
+            created: 1,
+        };
+        let refused = Err(ActionError::Protected(
+            "Protected: the program that started it has closed or cannot be checked, \
+             Toolboks leaves it alone.",
+        ));
+        assert_eq!(
+            end_process(fake, "notepad.exe", &Parent::Unverified),
+            refused
+        );
+        assert_eq!(
+            set_priority(
+                fake,
+                "notepad.exe",
+                &Parent::Unverified,
+                BELOW_NORMAL_PRIORITY_CLASS.0,
+                true
+            )
+            .map(|_| ()),
+            refused
+        );
+        assert!(!live_name_ok(
+            40,
+            "notepad.exe",
+            "notepad.exe",
+            &Parent::Unverified,
+            1
+        ));
     }
 
     #[test]

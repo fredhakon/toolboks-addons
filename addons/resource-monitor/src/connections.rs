@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use egui::{self, Align, Layout, RichText, Sense, Vec2};
 use egui_extras::{Column, TableBuilder};
+use protected_processes::Parent;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use windows::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
@@ -75,9 +76,9 @@ struct Conn {
     identity: Option<ProcessIdentity>,
     name: String,
     exe: Option<String>,
-    /// Image name of the owner's parent from the same snapshot, so a game a listed launcher
-    /// started is protected here too.
-    parent: Option<String>,
+    /// The owner's parent as the same snapshot vouched for it, so a game a listed launcher
+    /// started is protected here too, also after the launcher exited or its pid was reused.
+    parent: Parent,
     proto: Proto,
     local: (IpAddr, u16),
     /// None for UDP and for listening sockets.
@@ -105,7 +106,7 @@ impl Conn {
     /// Planning gate: true when "End process" must stay off for this owner (Windows, this app,
     /// or a game, launcher, anti-cheat process or a launcher's child).
     fn end_blocked(&self, own_pid: u32) -> bool {
-        is_protected(self.pid, &self.name, self.parent.as_deref(), own_pid)
+        is_protected(self.pid, &self.name, &self.parent, own_pid)
     }
 
     /// What the execution gate gets: the owner exactly as the snapshot saw it.
@@ -124,7 +125,7 @@ impl Conn {
 struct EndTarget {
     identity: ProcessIdentity,
     name: String,
-    parent: Option<String>,
+    parent: Parent,
 }
 
 impl EndTarget {
@@ -132,7 +133,7 @@ impl EndTarget {
     /// process, and checks creation time and name on a pinned query handle before it opens the
     /// process with terminate access.
     fn end(&self) -> Result<(), ActionError> {
-        end_process(self.identity, &self.name, self.parent.as_deref())
+        end_process(self.identity, &self.name, &self.parent)
     }
 }
 
@@ -389,8 +390,8 @@ fn name_rows(raw: Vec<Raw>, names: &HashMap<u32, Owner>) -> Vec<Conn> {
                     owner.identity,
                     owner.parent.clone(),
                 ),
-                None if r.pid == 0 => ("System".to_string(), None, None, None),
-                None => ("Unknown".to_string(), None, None, None),
+                None if r.pid == 0 => ("System".to_string(), None, None, Parent::Unverified),
+                None => ("Unknown".to_string(), None, None, Parent::Unverified),
             };
             Conn {
                 pid: r.pid,
@@ -411,22 +412,45 @@ struct Owner {
     name: String,
     exe: Option<String>,
     identity: Option<ProcessIdentity>,
-    /// Parent image name from the same refresh as `identity`.
-    parent: Option<String>,
+    /// Parent from the same refresh as `identity`, known only when it started first.
+    parent: Parent,
+}
+
+/// The owner's parent as the refresh can vouch for it: known only when the parent was sampled
+/// with an identity created before the owner's. A parent that has exited, whose pid was
+/// reused, or that has no identity is unverified (and protects the owner). Pure.
+fn owner_parent(
+    owner: Option<ProcessIdentity>,
+    parent: Option<(&str, Option<ProcessIdentity>)>,
+) -> Parent {
+    Parent::vouch(
+        owner.map(|id| id.created),
+        parent.map(|(name, id)| (name, id.map(|id| id.created))),
+    )
 }
 
 /// The owner of `pid` as the refreshed `sys` saw it. The identity only exists when the process
 /// started before `sample_start`, so its name and parent describe that same process.
 fn owner_of(sys: &System, pid: u32, sample_start: u64) -> Option<Owner> {
     let process = sys.process(sysinfo::Pid::from_u32(pid))?;
+    let identity = sampled_identity(process, sample_start);
+    let parent = process
+        .parent()
+        .and_then(|parent| sys.process(parent))
+        .map(|parent| {
+            (
+                parent.name().to_string_lossy().into_owned(),
+                sampled_identity(parent, sample_start),
+            )
+        });
     Some(Owner {
         name: process.name().to_string_lossy().into_owned(),
         exe: process.exe().map(|e| e.display().to_string()),
-        identity: sampled_identity(process, sample_start),
-        parent: process
-            .parent()
-            .and_then(|parent| sys.process(parent))
-            .map(|parent| parent.name().to_string_lossy().into_owned()),
+        identity,
+        parent: owner_parent(
+            identity,
+            parent.as_ref().map(|(name, id)| (name.as_str(), *id)),
+        ),
     })
 }
 
@@ -986,7 +1010,7 @@ impl Page {
         if protected {
             ui.add_enabled(false, egui::Button::new("End process"));
             ui.label(
-                RichText::new(protected_note(&c.name, c.parent.as_deref()))
+                RichText::new(protected_note(&c.name, &c.parent))
                     .weak()
                     .small(),
             );
@@ -1113,7 +1137,7 @@ mod tests {
             identity: None,
             name: name.to_string(),
             exe: None,
-            parent: None,
+            parent: Parent::known("explorer.exe"),
             proto: Proto::Tcp,
             local,
             remote,
@@ -1381,7 +1405,7 @@ mod tests {
                     pid: 7,
                     created: 123,
                 }),
-                parent: Some("launcher.exe".into()),
+                parent: Parent::known("launcher.exe"),
             },
         );
         let raw = vec![
@@ -1393,8 +1417,9 @@ mod tests {
         assert_eq!(named[0].name, "x.exe");
         assert_eq!(named[0].exe.as_deref(), Some("C:\\x.exe"));
         assert_eq!(named[0].identity.unwrap().created, 123);
-        assert_eq!(named[0].parent.as_deref(), Some("launcher.exe"));
-        assert_eq!(named[1].parent, None);
+        assert_eq!(named[0].parent, Parent::known("launcher.exe"));
+        // No owner in the snapshot: nothing vouches for a parent.
+        assert_eq!(named[1].parent, Parent::Unverified);
         let mut replacement = named[0].clone();
         replacement.identity.as_mut().unwrap().created += 1;
         assert_ne!(named[0].key(), replacement.key());
@@ -1405,19 +1430,56 @@ mod tests {
     }
 
     #[test]
+    fn the_owners_parent_is_trusted_only_when_it_started_first() {
+        let id = |pid, created| Some(ProcessIdentity { pid, created });
+        // A normal parent, created before the owner.
+        assert_eq!(
+            owner_parent(id(8, 200), Some(("steam.exe", id(4, 100)))),
+            Parent::known("steam.exe")
+        );
+        // The launcher exited and notepad got its pid: younger than the owner.
+        assert_eq!(
+            owner_parent(id(8, 200), Some(("notepad.exe", id(4, 300)))),
+            Parent::Unverified
+        );
+        // The launcher exited and nothing holds its pid.
+        assert_eq!(owner_parent(id(8, 200), None), Parent::Unverified);
+        // The parent has no identity (other user, or started during the refresh).
+        assert_eq!(
+            owner_parent(id(8, 200), Some(("explorer.exe", None))),
+            Parent::Unverified
+        );
+    }
+
+    #[test]
+    fn an_owner_with_an_unverified_parent_is_refused_by_both_end_gates() {
+        let pid = u32::MAX - 1;
+        let mut app = conn(pid, "IndieGame.exe", (v4(0, 0, 0, 0), 1), None);
+        app.identity = Some(ProcessIdentity { pid, created: 5 });
+        app.parent = Parent::Unverified;
+        assert!(app.end_blocked(1));
+        let note = "Protected: the program that started it has closed or cannot be checked, \
+                    Toolboks leaves it alone.";
+        assert_eq!(
+            app.end_target().unwrap().end(),
+            Err(ActionError::Protected(note))
+        );
+    }
+
+    #[test]
     fn a_launchers_child_is_refused_by_both_end_gates() {
         let own_pid = 1;
         // Pids are multiples of 4 on Windows, so this one never names a real process.
         let pid = u32::MAX - 1;
         let mut game = conn(pid, "IndieGame.exe", (v4(0, 0, 0, 0), 1), None);
         game.identity = Some(ProcessIdentity { pid, created: 5 });
-        game.parent = Some(r"C:\Steam\steam.exe".into());
+        game.parent = Parent::known(r"C:\Steam\steam.exe");
         // Planning gate: the button stays off and the note names the reason.
         assert!(game.end_blocked(own_pid));
         // Execution gate: the parent travels with the target and is refused before any
         // handle exists.
         let target = game.end_target().expect("verified owner");
-        assert_eq!(target.parent.as_deref(), Some(r"C:\Steam\steam.exe"));
+        assert_eq!(target.parent, Parent::known(r"C:\Steam\steam.exe"));
         let note = "Protected: started by a game launcher, Toolboks leaves it alone.";
         assert_eq!(target.end(), Err(ActionError::Protected(note)));
 
@@ -1425,7 +1487,7 @@ mod tests {
         for name in ["cs2.exe", "EasyAntiCheat.exe", "steam.exe"] {
             let mut c = conn(pid, name, (v4(0, 0, 0, 0), 1), None);
             c.identity = Some(ProcessIdentity { pid, created: 5 });
-            c.parent = Some("explorer.exe".into());
+            c.parent = Parent::known("explorer.exe");
             assert!(c.end_blocked(own_pid), "{name}");
             assert!(
                 matches!(
@@ -1440,7 +1502,7 @@ mod tests {
         // execution gate goes on to open the pid, which fails only because it is not real.
         let mut app = conn(pid, "notepad.exe", (v4(0, 0, 0, 0), 1), None);
         app.identity = Some(ProcessIdentity { pid, created: 5 });
-        app.parent = Some("explorer.exe".into());
+        app.parent = Parent::known("explorer.exe");
         assert!(!app.end_blocked(own_pid));
         let r = app.end_target().unwrap().end();
         assert!(!matches!(r, Err(ActionError::Protected(_))), "{r:?}");
@@ -1502,7 +1564,7 @@ mod tests {
         assert!(
             target
                 .parent
-                .as_deref()
+                .name()
                 .is_some_and(|p| p.eq_ignore_ascii_case(&own_name)),
             "{target:?}"
         );

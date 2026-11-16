@@ -8,7 +8,7 @@
 use super::analysis::{detect_crashes, ms_to_text, DEFAULT_WINDOW_MS};
 use super::bugchecks;
 use super::model::{CrashKind, Event};
-use toolboks_addon_sdk::{Finding, Severity as FindingSeverity};
+use toolboks_addon_sdk::{Evidence, Finding, Severity as FindingSeverity};
 
 /// The finding's id. Stable across runs.
 pub const ID: &str = "recent-crashes";
@@ -27,6 +27,13 @@ pub const ROUTE: &str = "Crashes";
 pub const TITLE_MAX: usize = 80;
 pub const OBSERVATION_MAX: usize = 240;
 pub const LABEL_MAX: usize = 40;
+pub const WHY_MAX: usize = 200;
+
+/// Why blue screens matter. Plain words, no promise of a cause.
+pub const WHY_BLUE_SCREEN: &str = "Each blue screen stops Windows and loses unsaved work. Repeated ones can come from a driver, failing hardware or overheating. The Crashes page shows the stop code.";
+/// Why repeated unexpected restarts matter.
+pub const WHY_RESTARTS: &str = "Each unexpected restart loses unsaved work. Repeated ones can come from power problems, overheating or a failing part.";
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -59,6 +66,10 @@ pub struct Reading {
     pub measured_at: u64,
     pub stale_after_secs: u32,
     pub action: Option<Action>,
+    /// Protocol 5: why it matters. Set when the reading needs attention.
+    pub why: Option<String>,
+    /// Protocol 5: crashes per day over the window, when the reading needs attention.
+    pub evidence: Option<Evidence>,
 }
 
 impl Reading {
@@ -81,6 +92,9 @@ impl Reading {
         }
         .measured_at(self.measured_at)
         .stale_after(self.stale_after_secs);
+        let mut finding = finding;
+        finding.why = self.why.clone();
+        finding.evidence = self.evidence.clone();
         match &self.action {
             Some(Action::OpenPage { label, route }) => finding.open_page(label, route),
             None => finding,
@@ -144,6 +158,12 @@ fn from_events(events: &[Event], now_secs: u64) -> Reading {
         .filter(|c| matches!(c.kind, CrashKind::BlueScreen { .. }))
         .collect();
     let restarts = crashes.len() - blue.len();
+    let days = per_day(crashes.iter().map(|c| c.noticed_ms), now_secs);
+    let attention = |severity, title: String, observation: String, why: &str| Reading {
+        why: Some(clip(why, WHY_MAX)),
+        evidence: Some(days.clone()),
+        ..reading(now_secs, Status::Attention, severity, title, observation)
+    };
 
     if let Some(latest) = blue.first() {
         let code = match latest.kind {
@@ -154,9 +174,7 @@ fn from_events(events: &[Event], now_secs: u64) -> Reading {
             _ => String::new(),
         };
         let n = blue.len();
-        return reading(
-            now_secs,
-            Status::Attention,
+        return attention(
             Severity::Problem,
             format!(
                 "{} in the last {WINDOW_DAYS} days",
@@ -175,13 +193,12 @@ fn from_events(events: &[Event], now_secs: u64) -> Reading {
                     String::new()
                 }
             ),
+            WHY_BLUE_SCREEN,
         );
     }
     if restarts >= RESTARTS_TO_WATCH {
         let latest = crashes.first().map_or(0, |c| c.noticed_ms);
-        return reading(
-            now_secs,
-            Status::Attention,
+        return attention(
             Severity::Watch,
             format!(
                 "{} in the last {WINDOW_DAYS} days",
@@ -192,20 +209,18 @@ fn from_events(events: &[Event], now_secs: u64) -> Reading {
                  No blue screen was recorded.",
                 ms_to_text(latest)
             ),
+            WHY_RESTARTS,
         );
     }
+    // OK rows: Home shows a short observation as the row's value, so it is kept short; the
+    // title already says what was found.
     if restarts == 1 {
-        let latest = crashes.first().map_or(0, |c| c.noticed_ms);
         return reading(
             now_secs,
             Status::Ok,
             Severity::Watch,
             format!("One unexpected restart in the last {WINDOW_DAYS} days"),
-            format!(
-                "Windows restarted once without a clean shutdown, on {} UTC. No blue screen was \
-                 recorded. This is not reported as a problem unless it happens again.",
-                ms_to_text(latest)
-            ),
+            "No blue screen".into(),
         );
     }
     reading(
@@ -213,7 +228,25 @@ fn from_events(events: &[Event], now_secs: u64) -> Reading {
         Status::Ok,
         Severity::Watch,
         format!("No crashes in the last {WINDOW_DAYS} days"),
-        format!("No crashes recorded in the last {WINDOW_DAYS} days."),
+        format!("None in {WINDOW_DAYS} days"),
+    )
+}
+
+/// Crashes per day over the window, oldest day first: one column per 24 hours back from the
+/// check (the last column is the last 24 hours), each the day's count over the busiest day's.
+fn per_day(noticed_ms: impl Iterator<Item = i64>, now_secs: u64) -> Evidence {
+    let now_ms = since_ms(now_secs).saturating_add(WINDOW_MS);
+    let days = WINDOW_DAYS as usize;
+    let mut counts = vec![0u32; days];
+    for t in noticed_ms {
+        let back = (now_ms.saturating_sub(t).max(0) / DAY_MS) as usize;
+        counts[days - 1 - back.min(days - 1)] += 1;
+    }
+    let most = counts.iter().copied().max().unwrap_or(0).max(1) as f32;
+    Evidence::series(
+        counts.iter().map(|n| *n as f32 / most).collect(),
+        format!("{WINDOW_DAYS} days ago"),
+        "now",
     )
 }
 
@@ -244,6 +277,8 @@ fn reading(
             label: clip("Open crashes", LABEL_MAX),
             route: ROUTE.into(),
         }),
+        why: None,
+        evidence: None,
     }
 }
 
@@ -373,13 +408,72 @@ mod tests {
         if r.status != Status::Attention {
             assert_eq!(r.severity, Severity::Watch);
         }
+        // Protocol 5: every reading that needs attention says why and shows the days.
+        assert_eq!(r.why.is_some(), r.status == Status::Attention);
+        assert_eq!(r.evidence.is_some(), r.status == Status::Attention);
+        if let Some(why) = &r.why {
+            assert!(why.chars().count() <= WHY_MAX, "{why}");
+            assert!(!why.chars().any(char::is_control));
+        }
+        if let Some(Evidence::Series {
+            values,
+            left,
+            right,
+        }) = &r.evidence
+        {
+            assert_eq!(values.len(), 7);
+            assert!(values.iter().all(|v| (0.0..=1.0).contains(v)));
+            assert!(values.contains(&1.0), "the busiest day fills its column");
+            assert_eq!((left.as_str(), right.as_str()), ("7 days ago", "now"));
+        }
+        if r.status == Status::Ok {
+            assert!(r.observation.chars().count() <= 24, "{}", r.observation);
+        }
+    }
+
+    fn values(r: &Reading) -> Vec<f32> {
+        match &r.evidence {
+            Some(Evidence::Series { values, .. }) => values.clone(),
+            other => panic!("no series: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attention_says_why_and_shows_crashes_per_day() {
+        // Two blue screens 2 days ago (an hour apart), one restart 5 days ago, one in the last
+        // 24 hours. Columns are 24-hour spans back from the check, oldest first.
+        let r = run(&[
+            restart(NOW_MS - 5 * DAY_MS - 1000),
+            blue_screen(NOW_MS - 2 * DAY_MS - 1000),
+            blue_screen(NOW_MS - 2 * DAY_MS - 3_600_000),
+            restart(NOW_MS - 1000),
+        ]);
+        assert_eq!(r.severity, Severity::Problem);
+        assert_eq!(r.why.as_deref(), Some(WHY_BLUE_SCREEN));
+        assert_eq!(values(&r), [0.0, 0.5, 0.0, 0.0, 1.0, 0.0, 0.5]);
+        assert_limits(&r);
+        // Restarts only: their own why; one per day fills each column.
+        let r = run(&[restart(NOW_MS - 3 * DAY_MS), restart(NOW_MS - DAY_MS / 2)]);
+        assert_eq!(r.severity, Severity::Watch);
+        assert_eq!(r.why.as_deref(), Some(WHY_RESTARTS));
+        assert_eq!(values(&r), [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+        assert_limits(&r);
+        // The edge of the window is the oldest column.
+        let r = run(&[blue_screen(NOW_MS - 7 * DAY_MS)]);
+        assert_eq!(values(&r), [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        // The finding carries both.
+        let f = r.finding();
+        assert_eq!(f.why, r.why);
+        assert_eq!(f.evidence, r.evidence);
     }
 
     #[test]
     fn no_crashes_is_ok_and_says_what_was_measured() {
         let r = run(&[noise(NOW_MS - DAY_MS)]);
         assert_eq!(r.status, Status::Ok);
-        assert_eq!(r.observation, "No crashes recorded in the last 7 days.");
+        // Short: Home shows it as the row's value. The title says the rest.
+        assert_eq!(r.observation, "None in 7 days");
+        assert_eq!((r.why.as_ref(), r.evidence.as_ref()), (None, None));
         assert!(!r.observation.to_lowercase().contains("healthy"));
         assert!(!r.title.to_lowercase().contains("healthy"));
         assert_limits(&r);
@@ -397,7 +491,8 @@ mod tests {
         let r = run(&[restart(NOW_MS - 2 * DAY_MS)]);
         assert_eq!(r.status, Status::Ok);
         assert!(r.title.contains("One unexpected restart"), "{}", r.title);
-        assert!(!r.observation.contains("No crashes recorded"));
+        assert_eq!(r.observation, "No blue screen");
+        assert_eq!((r.why.as_ref(), r.evidence.as_ref()), (None, None));
         assert_limits(&r);
     }
 
@@ -442,7 +537,7 @@ mod tests {
             restart(NOW_MS - 10 * DAY_MS),
         ]);
         assert_eq!(r.status, Status::Ok);
-        assert!(r.observation.starts_with("No crashes recorded"));
+        assert_eq!(r.observation, "None in 7 days");
     }
 
     #[test]

@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use crate::pressure::{Assessment, Verdict};
-use toolboks_addon_sdk::{Finding, Severity as SdkSeverity};
+use toolboks_addon_sdk::{Evidence, Finding, Severity as SdkSeverity};
 
 /// The add-on's own name for this check.
 pub const ID: &str = "memory-pressure";
@@ -22,6 +22,32 @@ pub const TAIL_SECS: u64 = 30 * 60;
 pub const MAX_TITLE: usize = 80;
 pub const MAX_OBSERVATION: usize = 240;
 pub const MAX_ACTION_LABEL: usize = 40;
+/// Protocol 5 limits: `why` and each evidence label.
+pub const MAX_WHY: usize = 200;
+pub const MAX_EVIDENCE_LABEL: usize = 40;
+
+/// Why memory pressure matters, in plain words. Shown on Home with a finding that needs attention.
+pub const WHY: &str = "When memory runs short, Windows moves data out to the disk and reads it back, so apps and games can stutter or slow down.";
+
+/// The memory numbers of the latest reading: how much is ready to use ("Available" in Task
+/// Manager) out of the installed memory, in bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    pub available: u64,
+    pub total: u64,
+}
+
+impl Usage {
+    /// The share in use, 0 to 1; `None` when the numbers cannot be right.
+    fn in_use(self) -> Option<f32> {
+        (self.total > 0 && self.available <= self.total)
+            .then(|| ((self.total - self.available) as f64 / self.total as f64) as f32)
+    }
+}
+
+fn gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -54,6 +80,10 @@ pub struct Reading {
     pub measured_at: u64,
     pub stale_after_secs: u32,
     pub action: Option<Action>,
+    /// Protocol 5: why it matters. Set when the finding needs attention.
+    pub why: Option<String>,
+    /// Protocol 5: memory in use at the latest reading, when it was read.
+    pub evidence: Option<Evidence>,
 }
 
 impl From<&Reading> for Finding {
@@ -80,6 +110,9 @@ impl From<&Reading> for Finding {
         // unchanged reading stays equal between calls and the runtime sends nothing new.
         .measured_at(r.measured_at)
         .stale_after(r.stale_after_secs);
+        let mut finding = finding;
+        finding.why = r.why.clone();
+        finding.evidence = r.evidence.clone();
         match &r.action {
             Some(Action::OpenPage { label, route }) => {
                 finding.open_page(label.as_str(), route.as_str())
@@ -112,6 +145,8 @@ pub struct Input<'a> {
     /// When the first successful reading was taken.
     pub watching_since: Option<u64>,
     pub last_pressure: Option<&'a PastPressure>,
+    /// The memory numbers of the latest reading, when there was one.
+    pub usage: Option<Usage>,
 }
 
 /// True when the reading should be recomputed (never read, or a minute has passed; a clock
@@ -135,12 +170,33 @@ pub fn check(input: &Input) -> Reading {
         measured_at: now,
         stale_after_secs: STALE_AFTER_SECS,
         action,
+        why: None,
+        evidence: None,
     };
     let open_page = || {
         Some(Action::OpenPage {
             label: clip("Open Memory Cleaner", MAX_ACTION_LABEL),
             route: "Home".to_string(),
         })
+    };
+    // Attention: why it matters, and the memory in use at the latest reading when it was read.
+    let attention = |title: &str, observation: String| Reading {
+        why: Some(clip(WHY, MAX_WHY)),
+        evidence: input.usage.and_then(|u| {
+            let fraction = u.in_use()?;
+            Some(Evidence::bar(
+                fraction,
+                clip(
+                    &format!("{} in use now", gb(u.total - u.available)),
+                    MAX_EVIDENCE_LABEL,
+                ),
+                clip(
+                    &format!("{} available", gb(u.available)),
+                    MAX_EVIDENCE_LABEL,
+                ),
+            ))
+        }),
+        ..reading(Status::Attention, title, observation, open_page())
     };
 
     let assessment = match input.source {
@@ -164,31 +220,38 @@ pub fn check(input: &Input) -> Reading {
     };
 
     if assessment.verdict == Verdict::UnderPressure {
-        return reading(
-            Status::Attention,
+        return attention(
             "Memory is under pressure",
             format!(
                 "Memory is under pressure now. {}",
                 reasons_text(&assessment.reasons)
             ),
-            open_page(),
         );
     }
 
     if let Some(past) = input.last_pressure {
         let ago = now.saturating_sub(past.at_secs);
         if ago < TAIL_SECS {
-            return reading(
-                Status::Attention,
+            return attention(
                 "Memory was under pressure a short while ago",
                 format!(
                     "Memory was under pressure {}. {}",
                     ago_text(ago),
                     reasons_text(&past.reasons)
                 ),
-                open_page(),
             );
         }
+    }
+
+    // Home shows a short OK observation as the row's value: the share in use, when measured.
+    if let Some(percent) = input.usage.and_then(Usage::in_use) {
+        let percent = (percent * 100.0).round() as u32;
+        return reading(
+            Status::Ok,
+            "Memory is not under pressure",
+            format!("{percent}% in use"),
+            None,
+        );
     }
 
     let watched = input.watching_since.map_or(0, |s| now.saturating_sub(s));
@@ -217,6 +280,7 @@ pub struct Tracker {
     last_pressure: Option<PastPressure>,
     last_refresh: Option<u64>,
     last: Option<Reading>,
+    usage: Option<Usage>,
 }
 
 impl Tracker {
@@ -253,6 +317,11 @@ impl Tracker {
         }
     }
 
+    /// Notes the memory numbers of the latest reading, for the picture and the OK value.
+    pub fn note_usage(&mut self, usage: Usage) {
+        self.usage = Some(usage);
+    }
+
     /// Recomputes the reading if one is due; otherwise returns the previous one. `None` only
     /// before the first call.
     pub fn refresh(&mut self, now_secs: u64, source: Source) -> Option<&Reading> {
@@ -276,6 +345,7 @@ impl Tracker {
             source,
             watching_since: self.watching_since,
             last_pressure: self.last_pressure.as_ref(),
+            usage: self.usage,
         });
         self.last_refresh = Some(now_secs);
         self.last.insert(reading)
@@ -357,6 +427,7 @@ mod tests {
             source,
             watching_since: since,
             last_pressure: past,
+            usage: None,
         })
     }
 
@@ -510,6 +581,62 @@ mod tests {
         let r = check_at(5000, &src, None, None);
         assert_eq!(r.observation.chars().count(), MAX_OBSERVATION);
         assert_limits(&r);
+    }
+
+    #[test]
+    fn why_and_the_bar_come_only_from_what_was_read() {
+        const G: u64 = 1 << 30;
+        let with = |source: &Source, past: Option<&PastPressure>, usage| {
+            check(&Input {
+                now_secs: 5000,
+                source,
+                watching_since: Some(0),
+                last_pressure: past,
+                usage,
+            })
+        };
+        let usage = Usage {
+            available: 9 * G + G / 2,
+            total: 16 * G,
+        };
+        // OK: the share in use as Home's short value, nothing else.
+        let ok = with(&healthy(), None, Some(usage));
+        assert_eq!(ok.status, Status::Ok);
+        assert_eq!(ok.observation, "41% in use");
+        assert_eq!((ok.why, ok.evidence), (None, None));
+        // Attention: why, and the bar of what is in use with both numbers.
+        let r = with(&pressure(), None, Some(usage));
+        assert_eq!(r.why.as_deref(), Some(WHY));
+        assert!(WHY.chars().count() <= MAX_WHY);
+        assert_eq!(
+            r.evidence,
+            Some(Evidence::bar(
+                (6.5f64 / 16.0) as f32,
+                "6.5 GB in use now",
+                "9.5 GB available"
+            ))
+        );
+        assert_limits(&r);
+        // No numbers read: why, but no picture; numbers that cannot be right: no picture.
+        let r = with(&pressure(), None, None);
+        assert!(r.why.is_some());
+        assert_eq!(r.evidence, None);
+        let wrong = Usage {
+            available: 2,
+            total: 1,
+        };
+        assert_eq!(with(&pressure(), None, Some(wrong)).evidence, None);
+        let ok = with(&healthy(), None, Some(wrong));
+        assert!(ok.observation.contains("not been under pressure"));
+        // Not checked and unavailable carry neither.
+        for source in [Source::NotRead, Source::Unreadable("no".into())] {
+            let r = with(&source, None, Some(usage));
+            assert_eq!((r.why, r.evidence), (None, None));
+        }
+        // The finding carries both.
+        let f = Finding::from(&with(&pressure(), None, Some(usage)));
+        assert_eq!(f.why.as_deref(), Some(WHY));
+        assert!(f.evidence.is_some());
     }
 
     #[test]

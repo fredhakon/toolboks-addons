@@ -13,7 +13,7 @@ use std::time::Instant;
 use toolboks_addon_sdk::Finding;
 
 use super::engine::eval_interval;
-use super::health::Source;
+use super::health::{Source, Usage};
 use super::pressure::{Assessment, Signals};
 use super::Memory;
 
@@ -44,6 +44,10 @@ impl Memory {
         };
         let assessment = self.pressure.evaluate(now_ms, &signals);
         self.health.observe(now_secs, &assessment);
+        self.health.note_usage(Usage {
+            available: signals.available,
+            total: signals.total_ram,
+        });
         self.health_source = Source::Read(assessment.clone());
         Some((signals, assessment))
     }
@@ -165,8 +169,10 @@ mod tests {
         assert_eq!(f.id, "memory-pressure");
         assert_eq!(f.stale_after_secs, 300);
         assert_eq!(f.measured_at, 1_000_000);
-        assert!(f.observation.contains("not been under pressure"));
+        // A short value for Home's row: the share in use, measured (8 GB ready of 16 GB).
+        assert_eq!(f.observation, "50% in use");
         assert_eq!(f.action, None);
+        assert_eq!((f.why, f.evidence), (None, None));
     }
 
     #[test]
@@ -184,6 +190,16 @@ mod tests {
         assert_eq!(f.title, "Memory is under pressure");
         assert!(f.observation.contains("Only 1.0 GB is ready to use"));
         assert!(f.observation.contains("reading memory back from disk"));
+        // Why it matters, and the memory in use at the latest reading (1 GB ready of 16 GB).
+        assert_eq!(f.why.as_deref(), Some(crate::health::WHY));
+        assert_eq!(
+            f.evidence,
+            Some(toolboks_addon_sdk::Evidence::bar(
+                0.9375,
+                "15.0 GB in use now",
+                "1.0 GB available"
+            ))
+        );
         assert_eq!(
             f.action,
             Some(FindingAction::OpenPage {
@@ -222,6 +238,14 @@ mod tests {
         let tail = only(&m);
         assert_eq!(tail.status, FindingStatus::Attention);
         assert!(tail.title.contains("a short while ago"));
+        // The picture shows memory now (calm again), labelled as now.
+        assert!(tail.why.is_some());
+        assert_eq!(
+            tail.evidence
+                .as_ref()
+                .map(toolboks_addon_sdk::Evidence::labels),
+            Some(("8.0 GB in use now", "8.0 GB available"))
+        );
 
         // 29 minutes on: still the tail. 31 minutes on: Ok again.
         step(&mut m, cleared + 29 * 60);
@@ -229,7 +253,8 @@ mod tests {
         step(&mut m, cleared + 31 * 60);
         let f = only(&m);
         assert_eq!(f.status, FindingStatus::Ok);
-        assert!(f.observation.contains("in the last 30 minutes"));
+        assert_eq!(f.observation, "50% in use");
+        assert_eq!(f.why, None);
     }
 
     #[test]
@@ -358,6 +383,9 @@ mod tests {
         assert!(f.title.chars().count() <= 80);
         assert!(f.observation.chars().count() <= 240);
         assert!((60..=604_800).contains(&f.stale_after_secs));
+        assert!(f.why.as_ref().is_some_and(|w| w.chars().count() <= 200));
+        let (left, right) = f.evidence.as_ref().expect("a bar").labels();
+        assert!(left.chars().count() <= 40 && right.chars().count() <= 40);
         if let Some(FindingAction::OpenPage { label, route }) = &f.action {
             assert!(label.chars().count() <= 40);
             assert!(crate::PAGES.contains(&route.as_str()));

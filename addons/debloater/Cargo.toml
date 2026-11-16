@@ -6,6 +6,7 @@ license = "MIT"
 description = "Debloater - native Toolboks add-on that explains and undoes optional Windows changes"
 
 [dependencies]
+boot-perf.workspace = true
 egui = { version = "0.37", default-features = false }
 serde_json.workspace = true
 toolboks-addon-sdk.workspace = true

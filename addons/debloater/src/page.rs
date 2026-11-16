@@ -11,7 +11,10 @@ use super::services::{self, ServiceDef, ServiceState};
 use super::startup::{self, Class, Entry, Source};
 use super::style::{self, Chip};
 use super::tasks::{self, TaskDef, TaskState};
-use super::{admin, backend, catalog, plan, AdminKind, Debloater, ServiceJob, TaskJob};
+use super::{
+    admin, backend, catalog, plan, AdminKind, Debloater, ServiceJob, StartupCost, StartupLoad,
+    TaskJob,
+};
 use toolboks_addon_sdk::{AdminOutcome, AdminRequest, HostRequest};
 use toolboks_shared::elevation;
 use toolboks_shared::ui::{self, AMBER, GAP, GREEN, MUTED, SPACE_M};
@@ -432,7 +435,9 @@ impl Debloater {
         if page == 2 {
             self.startup_poll();
             if !self.startup.started {
-                self.startup_refresh(ui.ctx());
+                // Toggling an entry reloads the list; the boot log is only read again on Refresh.
+                let read_cost = self.startup.cost.is_none();
+                self.startup_refresh(ui.ctx(), read_cost);
             }
         }
 
@@ -1149,6 +1154,64 @@ fn run_undo<T, K: Eq + std::hash::Hash>(
     (done, failed)
 }
 
+/// How far back the boot log is read for the Startup page.
+const COST_LOOKBACK_MS: i64 = 30 * 86_400_000;
+
+/// The short chip on a row: what Windows measured, from the worst case it logged.
+fn startup_cost_chip(s: &boot_perf::SlowSummary) -> String {
+    match (s.worst_delay_ms, s.worst_total_ms) {
+        (Some(delay), _) => format!("Slows start by {}", boot_perf::duration_text(delay)),
+        (None, Some(total)) => format!("Took {} to start", boot_perf::duration_text(total)),
+        (None, None) => "Named slow by Windows".to_string(),
+    }
+}
+
+/// The inspector sentence: the measurement, or why there is none. An unreadable log is never
+/// described as "not slow".
+fn startup_cost_sentence(
+    cost: Option<&StartupCost>,
+    matched: Option<&boot_perf::SlowSummary>,
+) -> String {
+    let Some(cost) = cost else {
+        return "Not read yet.".to_string();
+    };
+    match (&cost.access, matched) {
+        (boot_perf::Access::Readable, Some(s)) => {
+            let time = match (s.worst_delay_ms, s.worst_total_ms) {
+                (Some(d), Some(t)) => format!(
+                    "up to {} longer than Windows expected (took {})",
+                    boot_perf::duration_text(d),
+                    boot_perf::duration_text(t)
+                ),
+                (Some(d), None) => format!(
+                    "up to {} longer than Windows expected",
+                    boot_perf::duration_text(d)
+                ),
+                (None, Some(t)) => format!("took up to {}", boot_perf::duration_text(t)),
+                (None, None) => "no time was recorded".to_string(),
+            };
+            format!(
+                "Windows measured this as slow to start: {time}. Named {} in the last 30 days.",
+                if s.times == 1 {
+                    "once".to_string()
+                } else {
+                    format!("{} times", s.times)
+                }
+            )
+        }
+        (boot_perf::Access::Readable, None) => {
+            "Windows has not named this item as slow in its boot log.".to_string()
+        }
+        (boot_perf::Access::Denied, _) => "Not available: Windows lets only administrators read its boot timing log, and add-ons do not run as administrator.".to_string(),
+        (boot_perf::Access::Missing, _) => {
+            "Not available: this PC has no boot timing log.".to_string()
+        }
+        (boot_perf::Access::Failed(why), _) => {
+            format!("Not available: {}.", why.trim_end_matches('.'))
+        }
+    }
+}
+
 fn startup_undo_summary(done: usize, failed: usize) -> String {
     if failed == 0 {
         format!("Undid {}.", plural(done, "change", "changes"))
@@ -1158,7 +1221,7 @@ fn startup_undo_summary(done: usize, failed: usize) -> String {
 }
 
 impl Debloater {
-    fn startup_refresh(&mut self, ctx: &egui::Context) {
+    fn startup_refresh(&mut self, ctx: &egui::Context, read_cost: bool) {
         self.startup.started = true;
         if self.startup.loading.is_some() {
             return;
@@ -1174,7 +1237,14 @@ impl Debloater {
                     }
                     entries
                 });
-            let _ = tx.send(entries);
+            let cost = read_cost.then(|| {
+                let read = boot_perf::load(&boot_perf::WinBootSource, COST_LOOKBACK_MS);
+                StartupCost {
+                    access: read.access,
+                    slow: boot_perf::summarize(&read.log.slow),
+                }
+            });
+            let _ = tx.send(StartupLoad { entries, cost });
             ctx.request_repaint();
         });
         self.startup.loading = Some(rx);
@@ -1185,9 +1255,12 @@ impl Debloater {
             return;
         };
         match rx.try_recv() {
-            Ok(result) => {
+            Ok(load) => {
                 self.startup.loading = None;
-                match result {
+                if load.cost.is_some() {
+                    self.startup.cost = load.cost;
+                }
+                match load.entries {
                     Ok(entries) => {
                         self.startup.entries = entries;
                         self.startup.error = None;
@@ -1201,6 +1274,15 @@ impl Debloater {
                 self.startup.error = Some("Reading the startup items stopped unexpectedly.".into());
             }
         }
+    }
+
+    /// What Windows measured for this entry, if the log was read and names exactly this program.
+    fn startup_cost(&self, entry: &Entry) -> Option<&boot_perf::SlowSummary> {
+        let cost = self.startup.cost.as_ref()?;
+        if cost.access != boot_perf::Access::Readable {
+            return None;
+        }
+        boot_perf::find_match(&cost.slow, &entry.name, &entry.command)
     }
 
     fn startup_find(&self, key: &(Source, String)) -> Option<&Entry> {
@@ -1290,7 +1372,7 @@ impl Debloater {
         let status = format!("{} \u{b7} {admin}", edition_label(self.env.edition));
         let busy = self.startup.loading.is_some();
         if style::page_head(ui, &status, !busy) {
-            self.startup_refresh(ui.ctx());
+            self.startup_refresh(ui.ctx(), true);
         }
         if let Some(message) = &self.startup.message {
             style::note(ui, message);
@@ -1367,6 +1449,11 @@ impl Debloater {
         if blocked {
             chips.push(Chip::new("Needs admin", AMBER));
         }
+        // The measured cost, only when Windows named this exact program as slow. No match: nothing.
+        let cost = self.startup_cost(entry).map(startup_cost_chip);
+        if let Some(text) = cost {
+            chips.push(Chip::new(text, AMBER));
+        }
         chips.push(Chip::new(class_text(entry.class), class_color(entry.class)));
         let (response, body) = style::row(ui, focused, &chips);
         if response.clicked() {
@@ -1434,6 +1521,12 @@ impl Debloater {
                 ui.label(publisher_text(&e));
                 style::field_label(ui, "Source");
                 ui.label(e.source.label());
+                style::field_label(ui, "Startup cost");
+                let cost = self.startup_cost(&e);
+                ui.add(
+                    egui::Label::new(startup_cost_sentence(self.startup.cost.as_ref(), cost))
+                        .wrap(),
+                );
                 ui.add_space(4.0);
                 ui.label(class_sentence(e.class));
             }
@@ -2352,6 +2445,95 @@ mod tests {
             publisher: Some("Acme".into()),
             class,
         }
+    }
+
+    fn slow(
+        kind: boot_perf::SlowKind,
+        name: &str,
+        delay: Option<u64>,
+        total: Option<u64>,
+    ) -> boot_perf::SlowItem {
+        boot_perf::SlowItem {
+            kind,
+            logged_ms: 1_762_761_600_000,
+            name: name.into(),
+            friendly_name: None,
+            path: None,
+            company: None,
+            total_ms: total,
+            delay_ms: delay,
+        }
+    }
+
+    fn cost(access: boot_perf::Access, items: &[boot_perf::SlowItem]) -> StartupCost {
+        StartupCost {
+            access,
+            slow: boot_perf::summarize(items),
+        }
+    }
+
+    #[test]
+    fn startup_cost_shows_only_for_an_exact_match() {
+        let c = cost(
+            boot_perf::Access::Readable,
+            &[
+                slow(
+                    boot_perf::SlowKind::App,
+                    "Spotify.exe",
+                    Some(14_000),
+                    Some(21_000),
+                ),
+                slow(
+                    boot_perf::SlowKind::App,
+                    "Spotify.exe",
+                    Some(9_000),
+                    Some(12_000),
+                ),
+            ],
+        );
+        let mut hit = entry("Spotify", Class::Suggest, Source::UserRun);
+        hit.command = r#""C:\Users\me\Spotify.exe" --autostart"#.into();
+        let found = boot_perf::find_match(&c.slow, &hit.name, &hit.command).unwrap();
+        assert_eq!(startup_cost_chip(found), "Slows start by 14 s");
+        let sentence = startup_cost_sentence(Some(&c), Some(found));
+        assert!(
+            sentence.contains("up to 14 s longer than Windows expected (took 21 s)"),
+            "{sentence}"
+        );
+        assert!(sentence.contains("Named 2 times"), "{sentence}");
+
+        // A different program: nothing, never a guess.
+        let mut other = entry("Spotify Helper", Class::Suggest, Source::UserRun);
+        other.command = r"C:\x\SpotifyHelper.exe".into();
+        assert!(boot_perf::find_match(&c.slow, &other.name, &other.command).is_none());
+        assert_eq!(
+            startup_cost_sentence(Some(&c), None),
+            "Windows has not named this item as slow in its boot log."
+        );
+    }
+
+    #[test]
+    fn startup_cost_chip_without_a_delay() {
+        let s =
+            boot_perf::summarize(&[slow(boot_perf::SlowKind::Service, "svc", None, Some(9_000))]);
+        assert_eq!(startup_cost_chip(&s[0]), "Took 9.0 s to start");
+        let s = boot_perf::summarize(&[slow(boot_perf::SlowKind::Service, "svc", None, None)]);
+        assert_eq!(startup_cost_chip(&s[0]), "Named slow by Windows");
+    }
+
+    #[test]
+    fn an_unreadable_boot_log_is_never_described_as_not_slow() {
+        for access in [
+            boot_perf::Access::Denied,
+            boot_perf::Access::Missing,
+            boot_perf::Access::Failed("Windows could not read the log (error 87)".into()),
+        ] {
+            let c = cost(access, &[]);
+            let text = startup_cost_sentence(Some(&c), None);
+            assert!(text.starts_with("Not available"), "{text}");
+            assert!(!text.contains("not named"), "{text}");
+        }
+        assert_eq!(startup_cost_sentence(None, None), "Not read yet.");
     }
 
     #[test]

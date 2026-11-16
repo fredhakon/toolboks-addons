@@ -8,6 +8,7 @@ description = "Event Watch - native Toolboks add-on that explains Windows events
 [dependencies]
 egui = { version = "0.37", default-features = false }
 egui_extras = { version = "0.37", default-features = false }
+boot-perf.workspace = true
 toolboks-addon-sdk.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true

@@ -1,4 +1,6 @@
-//! The Event Watch pages (Live, Crashes, Summary) and the pure helpers behind them.
+//! The Event Watch pages (Live, Crashes, Summary, Boot) and the pure helpers behind them.
+
+mod boot_view;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -674,6 +676,8 @@ pub struct Page {
     dump_exists: HashMap<i64, bool>,
     dump_headers: HashMap<i64, Result<DumpHeader, String>>,
     dump_pending: HashSet<i64>,
+
+    boot: boot_view::BootView,
 }
 
 impl Page {
@@ -705,6 +709,7 @@ impl Page {
             dump_exists: HashMap::new(),
             dump_headers: HashMap::new(),
             dump_pending: HashSet::new(),
+            boot: boot_view::BootView::new(),
         }
     }
 
@@ -906,13 +911,20 @@ impl Page {
         let side = egui::Frame::NONE.inner_margin(look::CARD_PAD);
         egui::CentralPanel::default().frame(side).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
-            toolboks_addon_sdk::tutorial::region(ui, "toolbar", |ui| self.header(ui, &ctx));
+            if page == crate::BOOT_PAGE {
+                toolboks_addon_sdk::tutorial::region(ui, "toolbar", |ui| {
+                    self.boot.header(ui, &ctx)
+                });
+            } else {
+                toolboks_addon_sdk::tutorial::region(ui, "toolbar", |ui| self.header(ui, &ctx));
+            }
             match page {
                 0 => toolboks_addon_sdk::tutorial::region(ui, "table", |ui| self.live_page(ui)),
                 1 => toolboks_addon_sdk::tutorial::region(ui, "table", |ui| {
                     self.crashes_page(ui, &ctx)
                 }),
-                _ => toolboks_addon_sdk::tutorial::region(ui, "table", |ui| self.summary_page(ui)),
+                2 => toolboks_addon_sdk::tutorial::region(ui, "table", |ui| self.summary_page(ui)),
+                _ => toolboks_addon_sdk::tutorial::region(ui, "table", |ui| self.boot.ui(ui)),
             }
         });
     }
@@ -1395,11 +1407,13 @@ pub(crate) fn outline_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 /// A small rounded label tinted with the severity color; `width` 0 means as wide as the text.
 fn sev_pill(ui: &mut egui::Ui, s: Severity, width: f32) {
-    let color = sev_color(s);
+    tag_pill(ui, sev_label(s), sev_color(s), width);
+}
+
+/// A small rounded label with `text` tinted `color`; `width` 0 means as wide as the text.
+fn tag_pill(ui: &mut egui::Ui, text: &str, color: Color32, width: f32) {
     let font = egui::FontId::proportional(TEXT_CAPTION);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(sev_label(s).to_owned(), font, color);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
     let w = if width > 0.0 {
         width
     } else {
@@ -1412,7 +1426,7 @@ fn sev_pill(ui: &mut egui::Ui, s: Severity, width: f32) {
         ui.painter()
             .galley(rect.center() - galley.size() / 2.0, galley, color);
     }
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, sev_label(s)));
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, text));
 }
 
 #[cfg(test)]

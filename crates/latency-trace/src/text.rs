@@ -51,18 +51,37 @@ pub(crate) fn render(r: &Report) -> String {
     let _ = writeln!(
         out,
         "Drivers are ranked by their longest single run of their own code (time spent in \
-         interrupts that arrived during the run is not counted). The full elapsed time is \
-         shown in brackets."
+         interrupts that arrived during the run is not counted). The full elapsed time of \
+         that same run is shown in brackets."
     );
     if let Some(share) = r.coverage.share() {
         let pct = share * 100.0;
         if pct >= 99.95 {
             let _ = writeln!(out, "All measured time was matched to a driver.");
         } else {
+            let c = &r.coverage;
+            let total = c.total_exclusive.as_secs_f64().max(f64::MIN_POSITIVE);
+            let mut rest = Vec::new();
+            if c.unresolved_exclusive > Duration::ZERO {
+                rest.push(format!(
+                    "{:.1}% is unknown code",
+                    c.unresolved_exclusive.as_secs_f64() / total * 100.0
+                ));
+            }
+            if c.untracked_exclusive > Duration::ZERO {
+                rest.push(format!(
+                    "{:.1}% is other code that was not told apart",
+                    c.untracked_exclusive.as_secs_f64() / total * 100.0
+                ));
+            }
             let _ = writeln!(
                 out,
-                "{pct:.1}% of the measured time was matched to a driver; the rest is listed as \
-                 unknown code."
+                "{pct:.1}% of the measured time was matched to a driver; {}.",
+                if rest.is_empty() {
+                    "the rest could not be matched".to_string()
+                } else {
+                    rest.join(" and ")
+                }
             );
         }
     }
@@ -74,13 +93,18 @@ pub(crate) fn render(r: &Report) -> String {
         } else {
             ""
         };
+        // The elapsed time shown is that of the same run, not a separate maximum.
+        let elapsed = d
+            .longest_run()
+            .map(|w| format!(" (elapsed {})", fmt_duration(w.inclusive)))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "{}. {}: longest run {} (elapsed {}){}.",
+            "{}. {}: longest run {}{}{}.",
             i + 1,
             d.module,
             fmt_duration(d.max_exclusive()),
-            fmt_duration(d.max_inclusive()),
+            elapsed,
             guideline
         );
         let runs = d.count().max(1);
@@ -166,6 +190,39 @@ fn notes(r: &Report, out: &mut String) {
         let _ = writeln!(
             out,
             "Unknown code means the address was not inside any driver listed in the recording."
+        );
+    }
+    if i.routines_over_cap > 0 {
+        let _ = writeln!(
+            out,
+            "Other code means the recording had more different routines than this check tells \
+             apart; {} counted but not split by driver.",
+            count(i.routines_over_cap, "run is", "runs are")
+        );
+    }
+    if i.nesting_approximate > 0 {
+        let _ = writeln!(
+            out,
+            "The CPUs were very busy: for {} the time spent in interrupts could not be fully \
+             subtracted, so their own time may be a little too high.",
+            count(i.nesting_approximate, "run", "runs")
+        );
+    }
+    if i.undocumented_perfinfo > 0 {
+        let _ = writeln!(
+            out,
+            "{} of a type Microsoft does not document {} not read. If they are interrupts, \
+             those are missing from this list.",
+            count(
+                i.undocumented_perfinfo,
+                "kernel timing event",
+                "kernel timing events"
+            ),
+            if i.undocumented_perfinfo == 1 {
+                "was"
+            } else {
+                "were"
+            }
         );
     }
     let _ = writeln!(

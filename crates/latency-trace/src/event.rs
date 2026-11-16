@@ -40,6 +40,10 @@ pub(crate) enum Parsed {
     },
     /// A well-formed event this crate does not use.
     Other,
+    /// A `PerfInfo` event whose type Microsoft's PerfInfo page does not list. Counted
+    /// separately: a real kernel might log some interrupts this way, and a check must not miss
+    /// that silently.
+    UndocumentedPerfInfo,
     /// An event this crate should understand but whose fields are missing or unreadable.
     Malformed,
 }
@@ -223,6 +227,10 @@ pub(crate) fn parse_block(block: &str) -> Parsed {
                 _ => Parsed::Malformed,
             }
         }
+        // Documented PerfInfo types this crate does not use: 46 SampledProfile,
+        // 51 SysCallEnter, 52 SysCallExit (https://learn.microsoft.com/windows/win32/etw/perfinfo).
+        (Class::PerfInfo, 46 | 51 | 52) => Parsed::Other,
+        (Class::PerfInfo, _) => Parsed::UndocumentedPerfInfo,
         _ => Parsed::Other,
     }
 }
@@ -288,6 +296,10 @@ mod tests {
         assert_eq!(
             parse_block(&DPC.replace("<Opcode>68<", "<Opcode>46<")),
             Parsed::Other
+        );
+        assert_eq!(
+            parse_block(&DPC.replace("<Opcode>68<", "<Opcode>50<")),
+            Parsed::UndocumentedPerfInfo
         );
         assert_eq!(
             parse_block(&DPC.replace("ProcessorID=\"3\"", "ProcessorID=\"99999999999\"")),

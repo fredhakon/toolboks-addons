@@ -129,12 +129,47 @@ fn push_worst(list: &mut Vec<Worst>, w: Worst, keep: usize) {
     list.truncate(keep);
 }
 
-/// A finished DPC/ISR on one CPU that a later, longer one may turn out to contain.
+/// A finished DPC/ISR on one CPU that a later, longer one may turn out to contain, or several
+/// neighbouring ones merged into one span (`merged`).
 #[derive(Clone, Copy)]
 struct Pending {
     start: u64,
     end: u64,
     incl: u64,
+    merged: bool,
+}
+
+/// Shrinks `p` (finished runs in time order) to `target` entries by merging neighbours across
+/// the smallest gaps between them. A later run that contains runs from this list must have
+/// started in a gap (runs on one CPU nest properly), and the gap in which an outer run starts
+/// is usually far wider than the gaps between the interrupts inside it. Merging two neighbours
+/// does not change any other gap, so all merges are chosen in one pass.
+fn compact(p: &mut VecDeque<Pending>, target: usize) {
+    let n = p.len();
+    let target = target.max(1);
+    if n <= target {
+        return;
+    }
+    let mut gaps: Vec<(u64, usize)> = (0..n - 1)
+        .map(|i| (p[i + 1].start.saturating_sub(p[i].end), i))
+        .collect();
+    gaps.sort_unstable();
+    let mut join_after = vec![false; n];
+    for &(_, i) in gaps.iter().take(n - target) {
+        join_after[i] = true;
+    }
+    let mut out: VecDeque<Pending> = VecDeque::with_capacity(n);
+    for (i, e) in p.drain(..).enumerate() {
+        match out.back_mut() {
+            Some(last) if join_after[i - 1] => {
+                last.end = last.end.max(e.end);
+                last.incl = last.incl.saturating_add(e.incl);
+                last.merged = true;
+            }
+            _ => out.push_back(e),
+        }
+    }
+    *p = out;
 }
 
 #[derive(Default)]
@@ -197,6 +232,10 @@ impl State<'_> {
                 file_name,
             } => self.on_image(base, size, pid, &file_name),
             Parsed::Other => self.stats.other_events = self.stats.other_events.saturating_add(1),
+            Parsed::UndocumentedPerfInfo => {
+                self.stats.undocumented_perfinfo =
+                    self.stats.undocumented_perfinfo.saturating_add(1)
+            }
             Parsed::Malformed => self.stats.malformed = self.stats.malformed.saturating_add(1),
         }
     }
@@ -287,6 +326,7 @@ impl State<'_> {
         } else if self.routines.len() < self.limits.max_routines {
             self.routines.entry(routine).or_default().add(w, keep);
         } else {
+            // Too many distinct routines to keep apart: counted in their own bucket.
             self.stats.routines_over_cap = self.stats.routines_over_cap.saturating_add(1);
             self.overflow.add(w, keep);
         }
@@ -299,7 +339,7 @@ impl State<'_> {
             self.stats.nesting_untracked = self.stats.nesting_untracked.saturating_add(1);
             return incl;
         }
-        let max_pending = self.limits.max_pending_per_cpu.max(2);
+        let max_pending = self.limits.max_pending_per_cpu.max(4);
         let max_plausible = self.max_plausible;
         let state = self.cpus.entry(cpu).or_default();
         if end < state.last_end {
@@ -307,12 +347,21 @@ impl State<'_> {
         }
         state.last_end = state.last_end.max(end);
 
+        // Runs nested in this one finished after it started, so they are the newest entries.
+        // Older entries ended before this run started and stay: a later, longer run (a
+        // threaded DPC) may still contain them.
         let mut nested: u64 = 0;
         while let Some(top) = state.pending.back() {
             if top.start >= start && top.end <= end {
                 nested = nested.saturating_add(top.incl);
                 state.pending.pop_back();
             } else {
+                if top.merged && top.start < start && start < top.end && top.end <= end {
+                    // This run started inside a merged span: part of the span is nested in it
+                    // and part is not, and the split is no longer known.
+                    self.stats.nesting_approximate =
+                        self.stats.nesting_approximate.saturating_add(1);
+                }
                 break;
             }
         }
@@ -321,17 +370,15 @@ impl State<'_> {
         while state.pending.front().is_some_and(|p| p.start < horizon) {
             state.pending.pop_front();
         }
-        state.pending.push_back(Pending { start, end, incl });
+        state.pending.push_back(Pending {
+            start,
+            end,
+            incl,
+            merged: false,
+        });
         if state.pending.len() > max_pending {
-            // Merge the two oldest so the list stays bounded; their sum is still subtracted
-            // from any run that contains both.
-            if let (Some(a), Some(b)) = (state.pending.pop_front(), state.pending.pop_front()) {
-                state.pending.push_front(Pending {
-                    start: a.start,
-                    end: b.end,
-                    incl: a.incl.saturating_add(b.incl),
-                });
-            }
+            // Compact to three quarters so this happens once per many runs, not every run.
+            compact(&mut state.pending, max_pending * 3 / 4);
         }
         incl - nested.min(incl)
     }
@@ -375,7 +422,6 @@ impl State<'_> {
         // Resolve each routine to a module, then merge per module (case-insensitive name).
         let mut by_module: HashMap<String, (String, Agg)> = HashMap::new();
         let mut unresolved = Agg::default();
-        unresolved.merge(&self.overflow, keep);
         for (addr, agg) in &self.routines {
             match resolve(&self.images, *addr) {
                 Some(name) => {
@@ -394,8 +440,12 @@ impl State<'_> {
         let resolved_events = by_module
             .values()
             .fold(0u64, |a, (_, g)| a.saturating_add(g.count()));
-        let total_excl = resolved_excl.saturating_add(unresolved.excl_total());
-        let total_events = resolved_events.saturating_add(unresolved.count());
+        let total_excl = resolved_excl
+            .saturating_add(unresolved.excl_total())
+            .saturating_add(self.overflow.excl_total());
+        let total_events = resolved_events
+            .saturating_add(unresolved.count())
+            .saturating_add(self.overflow.count());
 
         let window = self.header_window.or(self.seen_window);
         let trace_start = window.map(|w| w.0);
@@ -405,8 +455,13 @@ impl State<'_> {
             .into_values()
             .map(|(name, agg)| (ModuleName::Driver(name), agg))
             .collect();
+        let unresolved_excl = unresolved.excl_total();
+        let untracked_excl = self.overflow.excl_total();
         if unresolved.count() > 0 {
             all.push((ModuleName::Unresolved, unresolved));
+        }
+        if self.overflow.count() > 0 {
+            all.push((ModuleName::Untracked, std::mem::take(&mut self.overflow)));
         }
         let dpc_runs = all
             .iter()
@@ -456,6 +511,8 @@ impl State<'_> {
             isr_runs,
             coverage: Coverage {
                 resolved_exclusive: dur(resolved_excl),
+                unresolved_exclusive: dur(unresolved_excl),
+                untracked_exclusive: dur(untracked_excl),
                 total_exclusive: dur(total_excl),
                 resolved_events,
                 total_events,
@@ -547,6 +604,42 @@ mod tests {
         }
         let v: Vec<u64> = l.iter().map(|w| w.excl).collect();
         assert_eq!(v, vec![9, 9, 7]);
+    }
+
+    fn pend(start: u64, end: u64) -> Pending {
+        Pending {
+            start,
+            end,
+            incl: end - start,
+            merged: false,
+        }
+    }
+
+    #[test]
+    fn compact_merges_across_the_smallest_gaps_only() {
+        // Gaps: 100, 5, 5, 50.
+        let mut l: VecDeque<Pending> = [
+            pend(0, 10),
+            pend(110, 120),
+            pend(125, 130),
+            pend(135, 140),
+            pend(190, 200),
+        ]
+        .into_iter()
+        .collect();
+        compact(&mut l, 3);
+        let spans: Vec<(u64, u64, u64, bool)> = l
+            .iter()
+            .map(|e| (e.start, e.end, e.incl, e.merged))
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                (0, 10, 10, false),
+                (110, 140, 20, true),
+                (190, 200, 10, false)
+            ]
+        );
     }
 
     #[test]

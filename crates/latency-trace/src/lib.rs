@@ -59,7 +59,12 @@
 //! - **Exclusive** (own execution): the inclusive time minus every DPC/ISR run that started and
 //!   finished inside it on the same CPU (for example an ISR that interrupted a DPC). Exclusive
 //!   times never overlap, so they can be added up into a CPU-time total without counting a
-//!   nested interval twice. Microsoft's
+//!   nested interval twice. Each CPU keeps a short time-ordered list of finished runs that a
+//!   later, longer run may still contain ([`Limits::max_pending_per_cpu`]). When the list is
+//!   full, neighbours are merged across the smallest time gaps, which keeps the result exact in
+//!   the usual case (many interrupts inside one long DPC). If a run starts inside a merged span
+//!   the split is no longer known; that is counted in [`InputStats::nesting_approximate`] and
+//!   said in the summary. Microsoft's
 //!   [WPA CPU analysis guide](https://learn.microsoft.com/windows-hardware/test/wpt/cpu-analysis)
 //!   makes the same inclusive/exclusive distinction.
 //!
@@ -69,7 +74,14 @@
 //!
 //! Routine addresses are matched to the kernel-mode images in the same trace. Runs whose
 //! address is in no known image are kept in an explicit [`ModuleName::Unresolved`] bucket that
-//! is ranked like any driver, and [`Coverage`] says what share of the time was matched.
+//! is ranked like any driver, and [`Coverage`] says what share of the time was matched. Runs of
+//! routines beyond [`Limits::max_routines`] are kept in their own [`ModuleName::Untracked`]
+//! bucket (they may well be inside a driver; they were just not told apart).
+//!
+//! `PerfInfo` events of a type that Microsoft's
+//! [PerfInfo page](https://learn.microsoft.com/windows/win32/etw/perfinfo) does not list are
+//! counted in [`InputStats::undocumented_perfinfo`] and named in the summary, so a real trace in
+//! which the kernel logs some interrupts under another type is not silently under-reported.
 //!
 //! The worst runs keep their CPU and time from the trace start, so a UI can say "a 2 ms spike
 //! at 14.2 s on CPU 3". That is a fact about the recording, not proof the driver caused a
@@ -133,7 +145,7 @@ impl Default for Limits {
             max_routines: 16 * 1024,
             max_images: 8 * 1024,
             max_cpus: 1024,
-            max_pending_per_cpu: 128,
+            max_pending_per_cpu: 512,
             worst_per_driver: 5,
             max_drivers: 25,
             max_plausible_duration: Duration::from_secs(1),
@@ -173,6 +185,8 @@ pub enum ModuleName {
     Driver(String),
     /// Runs whose routine address matched no image in the trace.
     Unresolved,
+    /// Runs of routines beyond [`Limits::max_routines`], not told apart by driver.
+    Untracked,
 }
 
 impl fmt::Display for ModuleName {
@@ -180,6 +194,7 @@ impl fmt::Display for ModuleName {
         match self {
             ModuleName::Driver(n) => f.write_str(n),
             ModuleName::Unresolved => f.write_str("Unknown code (address not in any driver)"),
+            ModuleName::Untracked => f.write_str("Other code (too many routines to tell apart)"),
         }
     }
 }
@@ -213,7 +228,8 @@ pub struct WorstEvent {
     pub start_filetime_utc: u64,
     pub exclusive: Duration,
     pub inclusive: Duration,
-    /// Address of the routine.
+    /// Raw kernel address of the routine, for matching runs of the same routine only. A kernel
+    /// address helps defeat address-space randomisation, so a UI or export must not show it.
     pub routine: u64,
 }
 
@@ -234,7 +250,13 @@ impl DriverLatency {
         self.dpc.exclusive.max.max(self.isr.exclusive.max)
     }
 
-    /// The longest single inclusive run.
+    /// The longest run by exclusive time (the one [`Self::max_exclusive`] measures), when the
+    /// report keeps worst runs. Its `inclusive` is the elapsed time of that same run.
+    pub fn longest_run(&self) -> Option<&WorstEvent> {
+        self.worst.first()
+    }
+
+    /// The longest single inclusive run (possibly a different run than the longest exclusive).
     pub fn max_inclusive(&self) -> Duration {
         self.dpc.inclusive.max.max(self.isr.inclusive.max)
     }
@@ -257,8 +279,10 @@ impl DriverLatency {
         self.dpc.count.saturating_add(self.isr.count)
     }
 
-    /// Whether a run was longer than Microsoft's guidance: DPCs at most 100 µs, ISRs at most
-    /// 25 µs ([source](https://learn.microsoft.com/windows-hardware/drivers/devtest/example-15--measuring-dpc-isr-time)).
+    /// Whether a run was longer than Microsoft's guidance. Source: "Microsoft recommends that
+    /// DPCs should not run longer than 100 microseconds and ISRs should not run longer than 25
+    /// microseconds", in [Example 15: Measuring DPC/ISR Time](https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/example-15--measuring-dpc-isr-time)
+    /// (Windows driver docs; the page points to the Hardware Lab Kit for current requirements).
     pub fn above_guideline(&self) -> bool {
         self.dpc.exclusive.max > Duration::from_micros(100)
             || self.isr.exclusive.max > Duration::from_micros(25)
@@ -268,7 +292,13 @@ impl DriverLatency {
 /// How much of the measured time could be tied to a driver.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Coverage {
+    /// Matched to a named driver.
     pub resolved_exclusive: Duration,
+    /// In [`ModuleName::Unresolved`]: the address was in no image of the trace.
+    pub unresolved_exclusive: Duration,
+    /// In [`ModuleName::Untracked`]: beyond the routine cap, never looked up.
+    pub untracked_exclusive: Duration,
+    /// All three together.
     pub total_exclusive: Duration,
     pub resolved_events: u64,
     pub total_events: u64,
@@ -318,7 +348,12 @@ pub struct InputStats {
     pub out_of_order: u64,
     /// Runs on CPUs beyond [`Limits::max_cpus`] (nesting not tracked).
     pub nesting_untracked: u64,
-    /// Runs of routines beyond [`Limits::max_routines`] (counted as unresolved).
+    /// Runs whose start fell inside a merged span of the per-CPU nesting list, so their
+    /// exclusive time may be somewhat too high (see the crate docs).
+    pub nesting_approximate: u64,
+    /// `PerfInfo` events of an undocumented type (not read; could include interrupts).
+    pub undocumented_perfinfo: u64,
+    /// Runs of routines beyond [`Limits::max_routines`] (counted in [`ModuleName::Untracked`]).
     pub routines_over_cap: u64,
     pub images_over_cap: u64,
     /// Events that were not valid UTF-8 (read with replacement characters).

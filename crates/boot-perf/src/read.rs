@@ -69,6 +69,17 @@ pub fn load(src: &dyn BootSource, lookback_ms: i64) -> BootRead {
             }
         }
     };
+    // The read broke off before it returned a single record: say so instead of showing an empty log
+    // as if it had been read.
+    if fetched.interrupted && fetched.xml.is_empty() && fetched.unreadable == 0 {
+        return BootRead {
+            log: BootLog::default(),
+            access: Access::Failed(
+                "Windows stopped reading the boot performance log before it returned anything"
+                    .into(),
+            ),
+        };
+    }
     let mut log = BootLog {
         skipped: fetched.unreadable,
         incomplete: fetched.interrupted || fetched.xml.len() >= MAX_RECORDS,
@@ -373,12 +384,32 @@ mod tests {
     fn an_interrupted_read_is_marked_incomplete() {
         let r = load(
             &Fake(Ok(Fetched {
+                xml: vec![event(
+                    100,
+                    "2026-11-01T08:00:00Z",
+                    "<Data Name='BootTime'>60000</Data>",
+                )],
                 interrupted: true,
                 ..Default::default()
             })),
             1000,
         );
+        assert_eq!(r.access, Access::Readable);
         assert!(r.log.incomplete);
+        assert_eq!(r.log.boots.len(), 1);
+    }
+
+    #[test]
+    fn a_read_that_broke_off_before_any_record_is_a_failure_not_an_empty_log() {
+        let r = load(
+            &Fake(Ok(Fetched {
+                interrupted: true,
+                ..Default::default()
+            })),
+            1000,
+        );
+        assert!(matches!(r.access, Access::Failed(_)), "{:?}", r.access);
+        assert!(r.log.is_empty());
     }
 
     #[test]

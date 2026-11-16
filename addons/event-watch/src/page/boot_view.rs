@@ -11,7 +11,7 @@ use boot_perf::{
     duration_text, median_boot_ms, summarize, Access, Boot, BootRead, SlowSummary, WinBootSource,
 };
 use egui::{self, Align, Layout, RichText, Sense, Vec2};
-use toolboks_shared::ui::{self as look, AMBER, GAP, TEXT_CAPTION, TEXT_SECTION};
+use toolboks_shared::ui::{self as look, AMBER, GAP, TEXT_BODY, TEXT_SECTION};
 
 use super::{ms_to_text, muted, outline_button, tag_pill, DAY_MS, LOOKBACK_MS, ROW_H};
 
@@ -168,7 +168,7 @@ fn boot_row(ui: &mut egui::Ui, b: &Boot, max: u64) {
             Vec2::new(VALUE_W, ROW_H),
             Layout::right_to_left(Align::Center),
             |ui| {
-                ui.label(RichText::new(duration_text(b.boot_ms)).size(TEXT_CAPTION + 1.0));
+                ui.label(RichText::new(duration_text(b.boot_ms)).size(TEXT_BODY));
             },
         );
         if b.slower_than_usual == Some(true) {
@@ -233,8 +233,8 @@ fn problem_text(read: &BootRead) -> Option<(String, String)> {
     const NOT_A_RESULT: &str = "This says nothing about how fast your PC starts.";
     match &read.access {
         Access::Denied => Some((
-            "Windows does not let Event Watch read the boot timings".into(),
-            format!("Windows keeps boot times in a log that only administrators can read, and Toolboks add-ons do not run as administrator. Event Watch changes no Windows setting to get around that. No boot time is shown because none could be read. {NOT_A_RESULT}"),
+            boot_perf::ADMIN_ONLY.into(),
+            format!("Toolboks add-ons do not run as administrator, so Event Watch cannot show boot times here, and it changes no Windows setting to get around that. No boot time is shown because none could be read. {NOT_A_RESULT} {}", boot_perf::ALLOW_HOW),
         )),
         Access::Missing => Some((
             "This PC has no boot timing log".into(),
@@ -372,8 +372,16 @@ mod tests {
             assert!(!title.to_lowercase().contains("fast"), "{title}");
             assert!(body.contains("nothing about how fast"), "{body}");
         }
-        let (_, body) = problem_text(&read(Access::Denied, BootLog::default())).unwrap();
-        assert!(body.contains("administrators"));
+        let (title, body) = problem_text(&read(Access::Denied, BootLog::default())).unwrap();
+        assert_eq!(
+            title,
+            "Windows only lets administrators read the boot log on this PC"
+        );
+        assert!(body.contains(boot_perf::ALLOW_HOW), "{body}");
+        assert!(
+            body.contains("never changes that Windows setting"),
+            "{body}"
+        );
     }
 
     #[test]

@@ -1199,10 +1199,17 @@ fn startup_cost_sentence(
                 }
             )
         }
+        (boot_perf::Access::Readable, None) if cost.incomplete => {
+            "Windows has not named this item as slow in the part of its boot log that could be read. The log may be incomplete.".to_string()
+        }
         (boot_perf::Access::Readable, None) => {
             "Windows has not named this item as slow in its boot log.".to_string()
         }
-        (boot_perf::Access::Denied, _) => "Not available: Windows lets only administrators read its boot timing log, and add-ons do not run as administrator.".to_string(),
+        (boot_perf::Access::Denied, _) => format!(
+            "Not available: {}. Add-ons do not run as administrator. {}",
+            boot_perf::ADMIN_ONLY,
+            boot_perf::ALLOW_HOW
+        ),
         (boot_perf::Access::Missing, _) => {
             "Not available: this PC has no boot timing log.".to_string()
         }
@@ -1241,6 +1248,7 @@ impl Debloater {
                 let read = boot_perf::load(&boot_perf::WinBootSource, COST_LOOKBACK_MS);
                 StartupCost {
                     access: read.access,
+                    incomplete: read.log.incomplete,
                     slow: boot_perf::summarize(&read.log.slow),
                 }
             });
@@ -2468,6 +2476,7 @@ mod tests {
     fn cost(access: boot_perf::Access, items: &[boot_perf::SlowItem]) -> StartupCost {
         StartupCost {
             access,
+            incomplete: false,
             slow: boot_perf::summarize(items),
         }
     }
@@ -2534,6 +2543,28 @@ mod tests {
             assert!(!text.contains("not named"), "{text}");
         }
         assert_eq!(startup_cost_sentence(None, None), "Not read yet.");
+    }
+
+    #[test]
+    fn a_denied_boot_log_says_administrators_only_and_how_to_allow_it() {
+        let c = cost(boot_perf::Access::Denied, &[]);
+        let text = startup_cost_sentence(Some(&c), None);
+        assert!(
+            text.starts_with(
+                "Not available: Windows only lets administrators read the boot log on this PC."
+            ),
+            "{text}"
+        );
+        assert!(text.contains(boot_perf::ALLOW_HOW), "{text}");
+    }
+
+    #[test]
+    fn an_incomplete_boot_log_says_it_may_be_incomplete() {
+        let mut c = cost(boot_perf::Access::Readable, &[]);
+        c.incomplete = true;
+        let text = startup_cost_sentence(Some(&c), None);
+        assert!(text.contains("may be incomplete"), "{text}");
+        assert!(!text.starts_with("Windows has not named this item as slow in its boot log"));
     }
 
     #[test]

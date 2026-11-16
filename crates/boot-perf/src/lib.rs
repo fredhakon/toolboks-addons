@@ -20,18 +20,23 @@
 //! | 109 | a device took longer to initialize                          |
 //! | 110 | session manager initialization slowed startup               |
 //!
-//! Microsoft's page names the ids and, for event 100, says `BootTime` = `MainPathBootTime` +
-//! `BootPostBootTime`, both in milliseconds. It does not publish the field list of 101 to 110.
-//! The field names used below (event 100: `BootTime`, `MainPathBootTime`, `BootPostBootTime`,
-//! `BootNumStartupApps`, `BootIsDegradation`; events 101 to 103 and 109: `Name`, `FriendlyName`,
-//! `Path`, `CompanyName`, `TotalTime`, `DegradationTime`; event 110: `Name`, `TotalTime`,
-//! `DegradationTime`) come from the provider's event manifest as mirrored by
-//! <https://detection-wiki-dev.pages.dev/microsoft-windows-diagnostics-performance/100> (and
-//! `/101`, `/103`, `/109`, `/110`), and the example on the Microsoft Learn page for event 102
-//! ("Total Time: 1027ms", "Degradation Time: 1026ms") confirms they are milliseconds. They were NOT
-//! checked against a real log on the PC this was written on, because that log can only be read by
-//! administrators (see [`Access::Denied`]). Every field is therefore read defensively: a missing or
-//! damaged optional field becomes `None`, never a made-up number.
+//! Microsoft's page names the ids and says nothing more about the fields. Everything else comes
+//! from two other pages, neither of them Microsoft's:
+//! * The Event Log Explorer blog, "Windows boot performance diagnostics. Part 1" (Michael
+//!   Karsyan, 2016-04-25), <https://eventlogxp.com/blog/windows-boot-performance-diagnostics-1/>:
+//!   the event 100 field list, "BootTime= MainPathBootTime + BootPostBootTime", the
+//!   `BootPostBootTime` unit (milliseconds), and an event 102 example with "Total Time: 1027ms"
+//!   and "Degradation Time: 1026ms" (so `TotalTime` and `DegradationTime` are milliseconds).
+//! * The provider's event manifest as mirrored by
+//!   <https://detection-wiki-dev.pages.dev/microsoft-windows-diagnostics-performance/100> (and
+//!   `/101`, `/103`, `/109`, `/110`): the field names and types (event 100: `BootTime`,
+//!   `MainPathBootTime`, `BootPostBootTime`, `BootNumStartupApps`, `BootIsDegradation`; events 101
+//!   to 103 and 109: `Name`, `FriendlyName`, `Path`, `CompanyName`, `TotalTime`,
+//!   `DegradationTime`; event 110: `Name`, `TotalTime`, `DegradationTime`).
+//!
+//! The fields were NOT checked against a real log on the PC this was written on, because that log
+//! can only be read by administrators (see [`Access::Denied`]). Every field is therefore read
+//! defensively: a missing or damaged optional field becomes `None`, never a made-up number.
 //!
 //! Two things the data cannot promise, and the views must say so:
 //! * Microsoft's page describes event 100 as logged when Windows "has started up and degradation
@@ -42,6 +47,14 @@
 mod read;
 
 pub use read::{load, Access, BootRead, BootSource, FetchError, Fetched, WinBootSource};
+
+/// The plain reason shown when Windows refuses the read. Both add-ons use these words, and a test
+/// in each pins them.
+pub const ADMIN_ONLY: &str = "Windows only lets administrators read the boot log on this PC";
+
+/// How an administrator can allow reading. Documentation only: Toolboks never changes this
+/// Windows setting and never asks for administrator rights to read the log.
+pub const ALLOW_HOW: &str = "An administrator can allow reading by adding read access for users to the log's access list (wevtutil sl Microsoft-Windows-Diagnostics-Performance/Operational /ca:<access list>). Toolboks never changes that Windows setting.";
 
 /// The channel the events are in.
 pub const CHANNEL: &str = "Microsoft-Windows-Diagnostics-Performance/Operational";
@@ -381,7 +394,12 @@ fn parse_iso_time(s: &str) -> Option<i64> {
     let y: i64 = dp.next()?.parse().ok()?;
     let m: i64 = dp.next()?.parse().ok()?;
     let d: i64 = dp.next()?.parse().ok()?;
-    if dp.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    // FILETIME starts in 1601; a year beyond four digits would overflow the arithmetic below.
+    if dp.next().is_some()
+        || !(1601..=9999).contains(&y)
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&d)
+    {
         return None;
     }
     let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
@@ -556,22 +574,72 @@ pub fn duration_text(ms: u64) -> String {
 // ---------------------------------------------------------------------------------------------
 // Matching a startup entry to what Windows measured
 
-/// The file name of the program in a command line, as written in the Run key, the startup
-/// folder or the log's `Path` value: `"C:\A B\x.exe" --y` and `C:\A B\x.exe /y` both give `x.exe`.
-/// Lower case. `None` when the command names no file.
-pub fn exe_name(command: &str) -> Option<String> {
+/// Splits a command line into the program and its arguments: `"C:\A B\x.exe" --y` and
+/// `C:\A B\x.exe /y` both give the program path and the arguments after it.
+fn split_command(command: &str) -> (&str, &str) {
     let command = command.trim();
-    let path = if let Some(rest) = command.strip_prefix('"') {
-        rest.split('"').next().unwrap_or("")
-    } else {
-        let lower = command.to_ascii_lowercase();
-        match lower.find(".exe") {
-            Some(p) => &command[..p + 4],
-            None => command.split_whitespace().next().unwrap_or(""),
-        }
-    };
-    let file = path.rsplit(['\\', '/']).next().unwrap_or("").trim();
+    if let Some(rest) = command.strip_prefix('"') {
+        return match rest.find('"') {
+            Some(end) => (&rest[..end], rest[end + 1..].trim()),
+            None => (rest, ""),
+        };
+    }
+    match command.to_ascii_lowercase().find(".exe") {
+        Some(p) => (&command[..p + 4], command[p + 4..].trim()),
+        None => match command.split_once(char::is_whitespace) {
+            Some((program, rest)) => (program, rest.trim()),
+            None => (command, ""),
+        },
+    }
+}
+
+/// The file name of the program in a command line, as written in the Run key, the startup
+/// folder or the log's `Path` value. Lower case. `None` when the command names no file.
+pub fn exe_name(command: &str) -> Option<String> {
+    let file = split_command(command)
+        .0
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .trim();
     (!file.is_empty()).then(|| file.to_ascii_lowercase())
+}
+
+/// The full path of the program, lower case with backslashes; `None` when the command gives no
+/// directory (a bare file name says nothing about which program it is).
+fn program_path(command: &str) -> Option<String> {
+    let program = split_command(command).0.trim().replace('/', "\\");
+    (program.contains('\\') && !program.ends_with('\\')).then(|| program.to_ascii_lowercase())
+}
+
+/// Programs that start other programs (or host many unrelated ones). Their file name says nothing
+/// about what an entry really runs: two entries `rundll32.exe a.dll,Run` and `rundll32.exe
+/// b.dll,Start`, or two Squirrel installers `...\Discord\Update.exe --processStart Discord.exe` and
+/// `...\slack\Update.exe --processStart slack.exe`, share one file name. Lower case, no extension.
+const LAUNCHERS: &[&str] = &[
+    "rundll32",
+    "cmd",
+    "powershell",
+    "powershell_ise",
+    "pwsh",
+    "wscript",
+    "cscript",
+    "mshta",
+    "explorer",
+    "regsvr32",
+    "msiexec",
+    "conhost",
+    "svchost",
+    "dllhost",
+    "java",
+    "javaw",
+    "javaws",
+    // Squirrel's per-app updater/launcher, named Update.exe in every app that uses it.
+    "update",
+];
+
+fn is_launcher(name: &str) -> bool {
+    LAUNCHERS.contains(&stem(&name.trim().to_ascii_lowercase()))
 }
 
 fn stem(name: &str) -> &str {
@@ -607,30 +675,43 @@ fn summary_names(s: &SlowSummary) -> Vec<String> {
 /// the entry's program file name, or its name, must equal the name, friendly name or program file
 /// of an app or service Windows named as slow, ignoring case and a trailing `.exe`. When both an
 /// app and a service match, the one with the larger delay is returned.
+///
+/// A launcher (see [`LAUNCHERS`]) never matches by its file name, and an entry name that is itself
+/// a launcher name is ignored. An entry whose program is a launcher matches only when it has no
+/// arguments and the log's `Path` equals its full program path; with arguments the log cannot tell
+/// the entries apart (Windows records the program, not its arguments), so nothing is shown.
 pub fn find_match<'a>(
     summaries: &'a [SlowSummary],
     entry_name: &str,
     command: &str,
 ) -> Option<&'a SlowSummary> {
+    let (program, arguments) = split_command(command);
+    let file = exe_name(program);
+    let launcher = file.as_deref().is_some_and(is_launcher);
     let mut keys = Vec::new();
-    for k in [
-        Some(entry_name.trim().to_ascii_lowercase()),
-        exe_name(command),
-    ]
-    .into_iter()
-    .flatten()
+    for k in [Some(entry_name.trim().to_ascii_lowercase()), file.clone()]
+        .into_iter()
+        .flatten()
     {
-        if !k.is_empty() {
+        if !k.is_empty() && !is_launcher(&k) {
             keys.push(stem(&k).to_string());
             keys.push(k);
         }
     }
+    let entry_path = if launcher && arguments.is_empty() {
+        program_path(program)
+    } else {
+        None
+    };
     summaries
         .iter()
         .filter(|s| matches!(s.kind, SlowKind::App | SlowKind::Service))
         .filter(|s| {
             let names = summary_names(s);
             keys.iter().any(|k| names.contains(k))
+                || entry_path
+                    .as_ref()
+                    .is_some_and(|p| s.path.as_deref().and_then(program_path).as_ref() == Some(p))
         })
         .max_by_key(|s| (s.worst_delay_ms, s.times))
 }
@@ -1105,6 +1186,129 @@ mod tests {
         assert!(find_match(&[], "Spotify", "spotify.exe").is_none());
         // Drivers are not startup entries.
         assert!(find_match(&s, "steam", r"C:\x\steam.exe").is_none());
+    }
+
+    fn launcher_sums() -> Vec<SlowSummary> {
+        summarize(&[
+            item(
+                SlowKind::App,
+                "Update.exe",
+                None,
+                Some(r#""C:\Users\me\AppData\Local\Discord\Update.exe""#),
+                Some(20_000),
+                Some(9_000),
+                1,
+            ),
+            item(
+                SlowKind::App,
+                "rundll32.exe",
+                None,
+                Some(r"C:\Windows\System32\rundll32.exe"),
+                Some(20_000),
+                Some(9_000),
+                1,
+            ),
+        ])
+    }
+
+    #[test]
+    fn two_squirrel_entries_sharing_update_exe_get_no_match() {
+        for s in [
+            launcher_sums(),
+            summarize(&[item(
+                SlowKind::App,
+                "Update.exe",
+                None,
+                None,
+                None,
+                Some(9_000),
+                1,
+            )]),
+        ] {
+            assert!(find_match(
+                &s,
+                "Discord",
+                r#""C:\Users\me\AppData\Local\Discord\Update.exe" --processStart Discord.exe"#
+            )
+            .is_none());
+            assert!(find_match(
+                &s,
+                "slack",
+                r#"C:\Users\me\AppData\Local\slack\Update.exe --processStart slack.exe"#
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn two_rundll32_entries_get_no_match() {
+        let s = launcher_sums();
+        assert!(find_match(&s, "A", r"C:\Windows\System32\rundll32.exe a.dll,Run").is_none());
+        assert!(find_match(&s, "B", "rundll32.exe b.dll,Start").is_none());
+        assert!(find_match(&s, "C", r#""C:\Windows\System32\rundll32.exe" c.dll,Go"#).is_none());
+    }
+
+    #[test]
+    fn a_launcher_without_arguments_matches_only_on_the_full_path() {
+        let s = launcher_sums();
+        let same = find_match(&s, "Tool", r"C:\Windows\System32\rundll32.exe");
+        assert_eq!(same.map(|m| m.name.as_str()), Some("rundll32.exe"));
+        assert!(find_match(&s, "Tool", r"C:\Other\rundll32.exe").is_none());
+        assert!(find_match(&s, "Tool", "rundll32.exe").is_none());
+    }
+
+    #[test]
+    fn an_entry_named_like_a_launcher_does_not_match_the_launcher() {
+        let s = launcher_sums();
+        assert!(find_match(&s, "Update", r"C:\x\myapp.exe").is_none());
+        assert!(find_match(&s, "rundll32", r"C:\x\myapp.exe").is_none());
+    }
+
+    #[test]
+    fn a_program_that_is_not_a_launcher_still_matches_by_name_when_started_through_one() {
+        // Windows names the app itself (Discord.exe) as slow: the entry name is exact.
+        let s = summarize(&[item(
+            SlowKind::App,
+            "Discord.exe",
+            None,
+            None,
+            None,
+            Some(7_000),
+            1,
+        )]);
+        let m = find_match(
+            &s,
+            "Discord",
+            r#""C:\Users\me\AppData\Local\Discord\Update.exe" --processStart Discord.exe"#,
+        );
+        assert_eq!(m.map(|m| m.name.as_str()), Some("Discord.exe"));
+    }
+
+    #[test]
+    fn years_outside_filetime_are_rejected_without_overflow() {
+        assert_eq!(parse_iso_time("999999999999-01-01T00:00:00Z"), None);
+        assert_eq!(parse_iso_time("10000-01-01T00:00:00Z"), None);
+        assert_eq!(parse_iso_time("1600-12-31T23:59:59Z"), None);
+        assert!(parse_iso_time("1601-01-01T00:00:00Z").is_some());
+        assert!(parse_iso_time("9999-12-31T23:59:59Z").is_some());
+        assert_eq!(
+            parse_xml(&xml(
+                100,
+                "999999999999-01-01T00:00:00Z",
+                &d("BootTime", "1000")
+            )),
+            Err(ParseError::DamagedHeader)
+        );
+    }
+
+    #[test]
+    fn the_shared_wording() {
+        assert_eq!(
+            ADMIN_ONLY,
+            "Windows only lets administrators read the boot log on this PC"
+        );
+        assert!(ALLOW_HOW.contains("access list"));
+        assert!(ALLOW_HOW.contains("never changes"));
     }
 
     #[test]

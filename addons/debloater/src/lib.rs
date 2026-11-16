@@ -81,6 +81,8 @@ struct StartupLoad {
 /// The measured startup cost: whether the log could be read, and what Windows named as slow.
 struct StartupCost {
     access: boot_perf::Access,
+    /// The log read stopped early or hit its limit, so a missing name proves nothing.
+    incomplete: bool,
     slow: Vec<boot_perf::SlowSummary>,
 }
 

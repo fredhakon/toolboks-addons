@@ -1802,7 +1802,7 @@ mod tests {
             "nothing before the first listing"
         );
         let p = toolboks_addon_sdk::Package::parse(PACKAGE.as_bytes(), "0.15.0").unwrap();
-        assert_eq!(p.manifest.checks, ["Drive health"]);
+        assert_eq!(p.manifest.checks, ["Drive health", "Free space"]);
         assert_eq!(p.manifest.min_toolboks_version, "0.15.0");
     }
 }

@@ -4,7 +4,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 use toolboks_addon_proto::{
-    host_handshake, AddonMessage, FrameReader, FrameWriter, Hello, HostMessage, InputBatch, Theme,
+    host_handshake, AddonMessage, Finding, FrameReader, FrameWriter, Hello, HostMessage,
+    InputBatch, Theme,
 };
 
 struct Guard(Child);
@@ -49,6 +50,26 @@ fn running_elevated() -> bool {
         .output()
         .map(|out| String::from_utf8_lossy(&out.stdout).contains("S-1-16-12288"))
         .unwrap_or(false)
+}
+
+/// The findings in `message`, if it carries them, checked against the agreed protocol: a
+/// protocol 5 host gets `FindingsV5` (with `why` and `evidence`), a protocol 4 host the old
+/// `Findings` layout without them, and never the other one.
+fn findings_of(message: AddonMessage, protocol: u32) -> Option<Vec<Finding>> {
+    match message {
+        AddonMessage::FindingsV5(list) => {
+            assert_eq!(protocol, 5, "FindingsV5 sent to a protocol {protocol} host");
+            Some(list)
+        }
+        AddonMessage::Findings(list) => {
+            assert_eq!(
+                protocol, 4,
+                "old Findings layout sent to a protocol {protocol} host"
+            );
+            Some(list.into_iter().map(Finding::from).collect())
+        }
+        _ => None,
+    }
 }
 
 #[test]
@@ -159,9 +180,21 @@ fn protocol_test_host_draws_pings_and_quits() {
 
 /// Event Watch runs in the background: suspended, with no page ever drawn, it reads the Windows
 /// event log once and reports `recent-crashes`, then stays quiet (no further findings, no
-/// repeated reads) until its next check, 30 minutes later.
+/// repeated reads) until its next check, 30 minutes later. A protocol 5 host gets the finding
+/// with `why` and the crashes per day when it needs attention.
 #[test]
 fn background_check_reports_a_finding_while_suspended_then_goes_quiet() {
+    background_check(5);
+}
+
+/// The same with a protocol 4 host (Toolboks 0.15): the old `Findings` layout, never
+/// `FindingsV5`.
+#[test]
+fn a_protocol_4_host_gets_the_old_findings_layout() {
+    background_check(4);
+}
+
+fn background_check(protocol: u32) {
     use toolboks_addon_proto::FindingStatus;
     if running_elevated() {
         eprintln!(
@@ -188,18 +221,19 @@ fn background_check_reports_a_finding_while_suspended_then_goes_quiet() {
     std::thread::spawn(move || {
         let mut reader = FrameReader::new(stdout);
         let mut writer = FrameWriter::new(stdin);
-        host_handshake(
+        let hello = host_handshake(
             &mut reader,
             &mut writer,
-            &Hello::new("toolboks.event-watch", "test"),
+            &Hello::with_version("toolboks.event-watch", "test", protocol),
         )
         .unwrap();
+        assert_eq!(hello.protocol_version, protocol);
         writer.write(&HostMessage::Suspend).unwrap();
         // Findings arrive from background ticks while suspended: first "not checked", then the
         // real reading once the read has finished.
         let mut sent = Vec::new();
         let finding = loop {
-            if let AddonMessage::Findings(list) = reader.read().unwrap() {
+            if let Some(list) = findings_of(reader.read().unwrap(), protocol) {
                 assert_eq!(list.len(), 1);
                 assert_eq!(list[0].id, "recent-crashes");
                 sent.push(list[0].status);
@@ -209,16 +243,20 @@ fn background_check_reports_a_finding_while_suspended_then_goes_quiet() {
             }
         };
         assert!(!finding.title.is_empty() && !finding.observation.is_empty());
+        // This PC's real log decides the status; the new fields follow it at protocol 5 only.
+        let attention = protocol >= 5 && finding.status == FindingStatus::Attention;
+        assert_eq!(finding.why.is_some(), attention, "{finding:?}");
+        assert_eq!(finding.evidence.is_some(), attention, "{finding:?}");
         // Quiet now: a ping is answered and no second finding message comes before the pong.
         writer.write(&HostMessage::Ping { nonce: 9 }).unwrap();
         loop {
-            match reader.read().unwrap() {
-                AddonMessage::Pong { nonce } => {
-                    assert_eq!(nonce, 9);
-                    break;
-                }
-                AddonMessage::Findings(_) => panic!("a second finding with no new check"),
-                _ => {}
+            let message = reader.read().unwrap();
+            if let AddonMessage::Pong { nonce } = message {
+                assert_eq!(nonce, 9);
+                break;
+            }
+            if findings_of(message, protocol).is_some() {
+                panic!("a second finding with no new check");
             }
         }
         // `CheckNow` reads again at once. The reading carries its time in seconds and the add-on
@@ -226,14 +264,16 @@ fn background_check_reports_a_finding_while_suspended_then_goes_quiet() {
         std::thread::sleep(Duration::from_millis(1100));
         writer.write(&HostMessage::CheckNow).unwrap();
         let again = loop {
-            if let AddonMessage::Findings(list) = reader.read().unwrap() {
+            if let Some(list) = findings_of(reader.read().unwrap(), protocol) {
                 break list;
             }
         };
         assert_eq!(again[0].id, "recent-crashes");
         assert!(again[0].measured_at >= finding.measured_at);
         writer.write(&HostMessage::Quit).unwrap();
-        while reader.read::<AddonMessage>().is_ok() {}
+        while let Ok(message) = reader.read::<AddonMessage>() {
+            let _ = findings_of(message, protocol);
+        }
         tx.send(()).unwrap();
     });
     rx.recv_timeout(Duration::from_secs(60))
@@ -276,7 +316,8 @@ fn hold_suspended_for_measuring() {
     writer.write(&HostMessage::Suspend).unwrap();
     let started = std::time::Instant::now();
     loop {
-        if let AddonMessage::Findings(list) = reader.read().unwrap() {
+        let message = reader.read().unwrap();
+        if let Some(list) = findings_of(message, toolboks_addon_proto::PROTOCOL_VERSION) {
             if list[0].status != toolboks_addon_proto::FindingStatus::NotChecked {
                 println!(
                     "first check done after {:?}: {:?} - {}",

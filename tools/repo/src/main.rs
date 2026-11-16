@@ -44,13 +44,13 @@ fn package(name: &str) -> Package {
 
 /// The host release the workspace is pinned to (README, "When to move the pin"). Manifests are
 /// checked as this host checks them, so an add-on may need this host but nothing newer.
-const PINNED_HOST: &str = "0.15.0";
+const PINNED_HOST: &str = "0.16.0";
 
 /// The first host release that speaks each protocol newer than 3. A catalog entry at one of these
 /// protocols needs at least that host, so no older host offers it. When the pin moves to a host
 /// with a new protocol, add its row (a test fails until then). Entries at protocol 3 predate this
 /// rule and keep the minimum they were released with.
-const PROTOCOL_HOSTS: [(u32, &str); 1] = [(4, "0.15.0")];
+const PROTOCOL_HOSTS: [(u32, &str); 2] = [(4, "0.15.0"), (5, "0.16.0")];
 
 fn first_host(protocol: u32) -> Option<&'static str> {
     PROTOCOL_HOSTS
@@ -360,16 +360,19 @@ mod tests {
 
     #[test]
     fn new_entries_speak_the_pinned_protocol_and_need_the_host_that_speaks_it() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
         let mut m = manifest("2.0.0", None);
         m.min_toolboks_version = "0.12.5".into();
         let e = entry(&m);
-        assert_eq!(e.protocol_version, 4);
-        assert_eq!(e.min_toolboks_version, "0.15.0");
+        assert_eq!(e.protocol_version, 5);
+        assert_eq!(e.min_toolboks_version, "0.16.0");
         assert_eq!(protocol_problem(&e), None);
         // A manifest that needs a newer host keeps its own minimum.
+        assert_eq!(entry_min_host("0.16.2", 5), "0.16.2");
+        assert_eq!(entry_min_host("0.15.0", 5), "0.16.0");
+        // Entries released at protocol 4 keep needing the first host that speaks 4.
+        assert_eq!(entry_min_host("0.12.5", 4), "0.15.0");
         assert_eq!(entry_min_host("0.16.2", 4), "0.16.2");
-        assert_eq!(entry_min_host("0.15.0", 4), "0.15.0");
         // Protocol 3 adds nothing: released entries keep the minimum they were released with.
         assert_eq!(entry_min_host("0.12.0", 3), "0.12.0");
     }
@@ -386,6 +389,13 @@ mod tests {
     #[test]
     fn protocol_problems_apply_to_every_entry() {
         let mut e = entry(&manifest("2.0.0", None));
+        e.min_toolboks_version = "0.15.0".into();
+        assert!(protocol_problem(&e)
+            .unwrap()
+            .contains("needs min_toolboks_version 0.16.0"));
+        // A protocol 4 entry (released with 0.15.0) still passes, and still may not go lower.
+        e.protocol_version = 4;
+        assert_eq!(protocol_problem(&e), None);
         e.min_toolboks_version = "0.14.0".into();
         assert!(protocol_problem(&e)
             .unwrap()
@@ -465,7 +475,7 @@ mod tests {
             .contains("checks"));
         assert!(problem(with(&|e| e.checks.push("Disk health".into()))).is_some());
         // And a minimum host other than the one catalog-update gives.
-        assert!(problem(with(&|e| e.min_toolboks_version = "0.16.0".into()))
+        assert!(problem(with(&|e| e.min_toolboks_version = "0.17.0".into()))
             .unwrap()
             .contains("min_toolboks_version"));
         // A note or checks the current manifest does not have fail too.

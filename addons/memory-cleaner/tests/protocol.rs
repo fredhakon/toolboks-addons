@@ -12,7 +12,7 @@ struct Guard(Child);
 #[test]
 fn manifest_matches_the_executable() {
     let package =
-        toolboks_addon_sdk::Package::parse(include_bytes!("../memory-cleaner.tbaddon"), "0.12.5")
+        toolboks_addon_sdk::Package::parse(include_bytes!("../memory-cleaner.tbaddon"), "0.15.0")
             .unwrap();
     assert_eq!(package.manifest.id, "toolboks.memory-cleaner");
     assert_eq!(package.manifest.id, memory_cleaner::ID);
@@ -98,6 +98,7 @@ fn protocol_test_host_draws_pings_and_quits() {
                 "system_tuning".into(),
             ]))
             .unwrap();
+        let mut saw_finding = false;
         for page in 0..memory_cleaner::PAGES.len() {
             writer
                 .write(&HostMessage::Navigate {
@@ -115,13 +116,24 @@ fn protocol_test_host_draws_pings_and_quits() {
                 }))
                 .unwrap();
             loop {
-                if let AddonMessage::Frame(frame) = reader.read().unwrap() {
-                    assert_eq!(frame.seq, page as u64 + 1);
-                    assert!(!frame.meshes.is_empty());
-                    break;
+                match reader.read().unwrap() {
+                    AddonMessage::Frame(frame) => {
+                        assert_eq!(frame.seq, page as u64 + 1);
+                        assert!(!frame.meshes.is_empty());
+                        break;
+                    }
+                    AddonMessage::Findings(list) => {
+                        assert_eq!(list.len(), 1);
+                        assert_eq!(list[0].id, "memory-pressure");
+                        assert!(toolboks_addon_proto::Finding::valid_id(&list[0].id));
+                        saw_finding = true;
+                    }
+                    _ => {}
                 }
             }
         }
+        // Reported to Home as soon as the add-on is up, before its first frame.
+        assert!(saw_finding, "no memory-pressure finding was sent");
         writer.write(&HostMessage::Suspend).unwrap();
         writer.write(&HostMessage::SavePreferences).unwrap();
         loop {

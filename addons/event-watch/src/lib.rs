@@ -7,6 +7,7 @@ pub mod admin;
 pub mod analysis;
 pub mod bugchecks;
 pub mod catalog;
+mod crash_check;
 mod latency;
 pub mod model;
 mod page;

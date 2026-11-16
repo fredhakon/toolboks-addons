@@ -418,6 +418,43 @@
       "release_notes": "Release disk-manager-v0.4.0.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.event-watch",
+      "title": "Event Watch",
+      "short_description": "Understand Windows events, crashes and slow drivers.",
+      "long_description": "Event Watch reads the Windows event logs and explains what is going on, with a closer look at crashes and restarts. It reads crash dump headers to name the stop code. It never clears your logs and changes nothing on your PC. The optional latency check names the drivers with the longest interrupt (DPC and ISR) runs. It needs administrator rights, which Windows asks you to confirm each time you start it; it records for 10 to 30 seconds, deletes the recording as soon as it has been read, and keeps the result only until you close Event Watch. The Boot page shows boot times and slow-startup items from Windows' boot performance log; it is read in memory only and nothing is saved. Windows only lets administrators read that log on a default PC, and an administrator can allow reading in the log's access list (Toolboks never changes it). Event Watch also checks the last 7 days of crashes in the background and reports the result to Home; it is kept in memory only, read from the Windows event log, and nothing is saved.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "shield",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "filesystem_read",
+        "local_preferences",
+        "administrator"
+      ],
+      "pages": [
+        "Live",
+        "Crashes",
+        "Summary",
+        "Latency check",
+        "Boot"
+      ],
+      "background": true,
+      "checks": [
+        "Recent crashes"
+      ],
+      "kind": "native",
+      "version": "0.2.0",
+      "min_toolboks_version": "0.15.0",
+      "protocol_version": 4,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/event-watch-v0.2.0/event-watch.exe",
+      "size": 3684352,
+      "sha256": "bc622adde18c2cc3ff79b54ce34a2d9c2e155a496f15eb1903c22db3168f762c",
+      "release_notes": "Release event-watch-v0.2.0.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

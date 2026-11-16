@@ -12,7 +12,7 @@ struct Guard(Child, std::path::PathBuf);
 #[test]
 fn manifest_matches_the_executable() {
     let package =
-        toolboks_addon_sdk::Package::parse(include_bytes!("../disk-manager.tbaddon"), "0.14.0")
+        toolboks_addon_sdk::Package::parse(include_bytes!("../disk-manager.tbaddon"), "0.15.0")
             .unwrap();
     assert_eq!(package.manifest.id, "toolboks.disk-manager");
     assert_eq!(package.manifest.version, env!("CARGO_PKG_VERSION"));

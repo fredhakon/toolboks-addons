@@ -2,12 +2,13 @@
 //! in as Unix seconds and the memory readings come from `pressure::Assessment`, so tests use
 //! made-up sequences and never sleep.
 //!
-//! `Reading` carries exactly the fields of the host protocol's `Finding`, so mapping it to the
-//! SDK type once the protocol is available is a one-line conversion. Until that hookup nothing
-//! outside the tests calls this module.
+//! `Reading` carries exactly the fields of the host protocol's `Finding`, so handing it to the
+//! SDK is a one-line conversion (`Finding::from(&reading)`). `health_feed` feeds the `Tracker`
+//! from the pressure model and returns its reading from `NativeAddon::findings`.
 #![allow(dead_code)]
 
 use crate::pressure::{Assessment, Verdict};
+use toolboks_addon_sdk::{Finding, Severity as SdkSeverity};
 
 /// The add-on's own name for this check.
 pub const ID: &str = "memory-pressure";
@@ -53,6 +54,39 @@ pub struct Reading {
     pub measured_at: u64,
     pub stale_after_secs: u32,
     pub action: Option<Action>,
+}
+
+impl From<&Reading> for Finding {
+    fn from(r: &Reading) -> Finding {
+        let finding = match r.status {
+            Status::Ok => Finding::ok(r.id, r.title.as_str(), r.observation.as_str()),
+            Status::Attention => Finding::attention(
+                r.id,
+                r.title.as_str(),
+                r.observation.as_str(),
+                match r.severity {
+                    Severity::Watch => SdkSeverity::Watch,
+                    Severity::Problem => SdkSeverity::Problem,
+                },
+            ),
+            Status::NotChecked => {
+                Finding::not_checked(r.id, r.title.as_str(), r.observation.as_str())
+            }
+            Status::Unavailable => {
+                Finding::unavailable(r.id, r.title.as_str(), r.observation.as_str())
+            }
+        }
+        // The builders stamp "now"; the finding keeps the time the reading was taken, so an
+        // unchanged reading stays equal between calls and the runtime sends nothing new.
+        .measured_at(r.measured_at)
+        .stale_after(r.stale_after_secs);
+        match &r.action {
+            Some(Action::OpenPage { label, route }) => {
+                finding.open_page(label.as_str(), route.as_str())
+            }
+            None => finding,
+        }
+    }
 }
 
 /// What the memory source gave at this refresh.
@@ -190,29 +224,61 @@ impl Tracker {
         Self::default()
     }
 
+    /// The reading kept from the last refresh. `None` only before the first one.
+    pub fn reading(&self) -> Option<&Reading> {
+        self.last.as_ref()
+    }
+
+    /// True when `refresh` would recompute: never refreshed, a minute has passed, or the last
+    /// reading says "not checked" and a first real answer is now there.
+    pub fn is_due(&self, now_secs: u64, source: &Source) -> bool {
+        match &self.last {
+            None => true,
+            Some(last) => {
+                should_refresh(now_secs, self.last_refresh)
+                    || (last.status == Status::NotChecked && !matches!(source, Source::NotRead))
+            }
+        }
+    }
+
+    /// Notes one assessment taken at `now_secs`, so a short spell of pressure between two
+    /// refreshes is still remembered for the 30-minute tail.
+    pub fn observe(&mut self, now_secs: u64, assessment: &Assessment) {
+        self.watching_since.get_or_insert(now_secs);
+        if assessment.verdict == Verdict::UnderPressure {
+            self.last_pressure = Some(PastPressure {
+                at_secs: now_secs,
+                reasons: assessment.reasons.clone(),
+            });
+        }
+    }
+
     /// Recomputes the reading if one is due; otherwise returns the previous one. `None` only
     /// before the first call.
     pub fn refresh(&mut self, now_secs: u64, source: Source) -> Option<&Reading> {
-        if self.last.is_none() || should_refresh(now_secs, self.last_refresh) {
-            if let Source::Read(a) = &source {
-                self.watching_since.get_or_insert(now_secs);
-                if a.verdict == Verdict::UnderPressure {
-                    self.last_pressure = Some(PastPressure {
-                        at_secs: now_secs,
-                        reasons: a.reasons.clone(),
-                    });
-                }
-            }
-            let reading = check(&Input {
-                now_secs,
-                source: &source,
-                watching_since: self.watching_since,
-                last_pressure: self.last_pressure.as_ref(),
-            });
-            self.last_refresh = Some(now_secs);
-            self.last = Some(reading);
+        if self.is_due(now_secs, &source) {
+            self.compute(now_secs, &source);
         }
         self.last.as_ref()
+    }
+
+    /// Recomputes the reading now, due or not ("Check again").
+    pub fn refresh_now(&mut self, now_secs: u64, source: Source) -> &Reading {
+        self.compute(now_secs, &source)
+    }
+
+    fn compute(&mut self, now_secs: u64, source: &Source) -> &Reading {
+        if let Source::Read(a) = source {
+            self.observe(now_secs, a);
+        }
+        let reading = check(&Input {
+            now_secs,
+            source,
+            watching_since: self.watching_since,
+            last_pressure: self.last_pressure.as_ref(),
+        });
+        self.last_refresh = Some(now_secs);
+        self.last.insert(reading)
     }
 }
 
@@ -461,15 +527,17 @@ mod tests {
         let r = t.refresh(0, Source::NotRead).unwrap();
         assert_eq!(r.status, Status::NotChecked);
 
-        // Not due yet: the old reading is kept, the new source is not looked at.
+        // The first real answer replaces "not checked" at once, not a minute later.
         let r = t.refresh(30, healthy()).unwrap();
-        assert_eq!(r.status, Status::NotChecked);
-
-        let r = t.refresh(60, healthy()).unwrap();
         assert_eq!(r.status, Status::Ok);
         assert!(r.observation.contains("since Memory Cleaner started"));
 
-        let r = t.refresh(120, pressure()).unwrap();
+        // Not due yet: the old reading is kept, the new source is not looked at.
+        let r = t.refresh(60, pressure()).unwrap();
+        assert_eq!(r.status, Status::Ok);
+        assert_eq!(r.measured_at, 30);
+
+        let r = t.refresh(90, pressure()).unwrap();
         assert_eq!(r.status, Status::Attention);
 
         // Pressure cleared: still Attention for the tail, with the old reasons.
@@ -477,15 +545,15 @@ mod tests {
         assert_eq!(r.status, Status::Attention);
         assert!(r.observation.contains("Only 1.1 GB"));
 
-        let r = t.refresh(120 + TAIL_SECS - 60, healthy()).unwrap();
+        let r = t.refresh(90 + TAIL_SECS - 60, healthy()).unwrap();
         assert_eq!(r.status, Status::Attention);
 
-        let r = t.refresh(120 + TAIL_SECS, healthy()).unwrap();
+        let r = t.refresh(90 + TAIL_SECS, healthy()).unwrap();
         assert_eq!(r.status, Status::Ok);
         assert!(r.observation.contains("in the last 30 minutes"));
 
         let r = t
-            .refresh(120 + TAIL_SECS + 60, Source::Unreadable("denied".into()))
+            .refresh(90 + TAIL_SECS + 60, Source::Unreadable("denied".into()))
             .unwrap();
         assert_eq!(r.status, Status::Unavailable);
     }

@@ -204,7 +204,7 @@ fn notes(r: &Report, out: &mut String) {
         let _ = writeln!(
             out,
             "The CPUs were very busy: for {} the time spent in interrupts could not be fully \
-             subtracted, so their own time may be a little too high.",
+             subtracted, so their own time may be too high.",
             count(i.nesting_approximate, "run", "runs")
         );
     }

@@ -1360,7 +1360,7 @@ impl Page {
 }
 
 /// Muted caption text (11 px).
-fn muted(text: impl Into<String>) -> RichText {
+pub(crate) fn muted(text: impl Into<String>) -> RichText {
     RichText::new(text.into()).size(TEXT_CAPTION).color(MUTED)
 }
 
@@ -1376,7 +1376,7 @@ fn hairline(ui: &egui::Ui) {
 }
 
 /// The one primary action of a view: accent fill.
-fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+pub(crate) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(RichText::new(text).color(Color32::WHITE))
             .fill(look::HOST_ACCENT_FILL)
@@ -1385,7 +1385,7 @@ fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 }
 
 /// A secondary action: outlined, no fill.
-fn outline_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+pub(crate) fn outline_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.add(
         egui::Button::new(text)
             .fill(Color32::TRANSPARENT)

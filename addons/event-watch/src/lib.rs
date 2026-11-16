@@ -1,10 +1,13 @@
 //! Event Watch: reads the Windows event logs and shows live errors and what happened before a
 //! bluescreen, a hard reset or a hardware fault. All Event Log work runs on worker threads.
-//! It only reads: it never clears a log and needs no administrator rights.
+//! It only reads: it never clears a log. The opt-in latency check (`latency`, `admin`) is the
+//! one part that asks for administrator rights, each time, through the SDK's separate helper.
 
+pub mod admin;
 pub mod analysis;
 pub mod bugchecks;
 pub mod catalog;
+mod latency;
 pub mod model;
 mod page;
 pub mod source;
@@ -14,10 +17,42 @@ use toolboks_addon_sdk::{NativeAddon, TutorialStep};
 
 pub const ID: &str = "toolboks.event-watch";
 /// Page names, in order. They match `host-services.json`.
-pub const PAGES: [&str; 3] = ["Live", "Crashes", "Summary"];
+pub const PAGES: [&str; 4] = ["Live", "Crashes", "Summary", "Latency check"];
+/// Index of the Latency check page in [`PAGES`], looked up by name when compiling, so a page
+/// added or moved elsewhere in the list cannot make it open the wrong page.
+const LATENCY_PAGE: usize = page_index("Latency check");
+
+/// Position of `name` in [`PAGES`]; the build fails if it is missing.
+const fn page_index(name: &str) -> usize {
+    let mut i = 0;
+    while i < PAGES.len() {
+        let (a, b) = (PAGES[i].as_bytes(), name.as_bytes());
+        if a.len() == b.len() {
+            let mut j = 0;
+            while j < a.len() && a[j] == b[j] {
+                j += 1;
+            }
+            if j == a.len() {
+                return i;
+            }
+        }
+        i += 1;
+    }
+    panic!("page missing from PAGES")
+}
+
+/// Validates the one administrator action (the latency check) inside the separate helper. It
+/// runs nothing; the SDK's confirmation window decides whether `apply` runs.
+pub fn prepare_admin(
+    request: &toolboks_addon_sdk::AdminRequest,
+) -> Result<Box<dyn toolboks_addon_sdk::admin::AdminChange>, String> {
+    admin::prepare_admin(request)
+}
 
 pub struct EventWatch {
     page: page::Page,
+    /// Kept across `suspend`, so an answer from the helper still lands. Memory only.
+    latency: latency::Latency,
     index: usize,
 }
 
@@ -25,6 +60,7 @@ impl Default for EventWatch {
     fn default() -> Self {
         Self {
             page: page::Page::new(),
+            latency: latency::Latency::default(),
             index: 0,
         }
     }
@@ -47,8 +83,27 @@ impl NativeAddon for EventWatch {
         _preferences: &mut BTreeMap<String, serde_json::Value>,
     ) -> bool {
         style_once(ui.ctx());
-        self.page.ui(ui, self.index);
+        if self.index == LATENCY_PAGE {
+            self.latency.ui(ui);
+        } else {
+            self.page.ui(ui, self.index);
+        }
         false
+    }
+    fn set_capabilities(&mut self, capabilities: &[toolboks_addon_sdk::Capability]) {
+        self.latency.set_capabilities(capabilities);
+    }
+    fn prepare_admin(
+        &mut self,
+        request: &toolboks_addon_sdk::AdminRequest,
+    ) -> Result<Box<dyn toolboks_addon_sdk::admin::AdminChange>, String> {
+        admin::prepare_admin(request)
+    }
+    fn admin_result(&mut self, id: u64, outcome: toolboks_addon_sdk::AdminOutcome) {
+        self.latency.admin_result(id, outcome);
+    }
+    fn take_host_request(&mut self) -> Option<toolboks_addon_sdk::HostRequest> {
+        self.latency.take_request()
     }
     fn navigate(&mut self, page: &str) {
         self.index = page.parse::<usize>().unwrap_or(0).min(PAGES.len() - 1);
@@ -71,6 +126,12 @@ impl NativeAddon for EventWatch {
         ]
         .into_iter()
         .map(|(p, t, h, d)| TutorialStep::new(p, t, h, d))
+        .chain(std::iter::once(TutorialStep::new(
+            &LATENCY_PAGE.to_string(),
+            "table",
+            "Latency check · slow drivers",
+            "Run a short Windows recording while stutter or audio crackle happens, and see which drivers held the processor the longest. It asks for administrator rights each time and never runs on its own. The recording is deleted after it is read. A long run is a clue, not proof of the cause.",
+        )))
         .collect()
     }
     fn tutorial_location(&self) -> String {
@@ -78,6 +139,26 @@ impl NativeAddon for EventWatch {
     }
     fn tutorial_navigate(&mut self, page: &str) {
         self.navigate(page);
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+
+    #[test]
+    fn the_latency_page_index_follows_the_page_list() {
+        assert_eq!(PAGES[LATENCY_PAGE], "Latency check");
+        assert_eq!(page_index("Live"), 0);
+        let mut watch = EventWatch::default();
+        watch.navigate(&LATENCY_PAGE.to_string());
+        assert_eq!(watch.page_index(), LATENCY_PAGE);
+        let steps = watch.tutorial_steps();
+        let step = steps
+            .iter()
+            .find(|s| s.title.starts_with("Latency check"))
+            .unwrap();
+        assert_eq!(step.page, LATENCY_PAGE.to_string());
     }
 }
 

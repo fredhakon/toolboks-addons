@@ -9,7 +9,7 @@ use super::model::{Applicable, Edition, Group, Hive, Item, RegValue, Risk, State
 use super::restore::{self, RestoreStatus};
 use super::saved_undo::{self, Loaded, RegStep, ServiceStep, StepResult, UndoList};
 use super::services::{self, ServiceDef, ServiceState};
-use super::startup::{self, Class, Entry, Source};
+use super::startup::{self, Class, Entry, Source, StartupStore};
 use super::style::{self, Chip};
 use super::tasks::{self, TaskDef, TaskState};
 use super::{
@@ -326,10 +326,13 @@ impl Debloater {
                 // Changes made on this page while the helper was open come after the rest.
                 remaining.append(&mut self.startup.steps);
                 self.startup.steps = remaining;
+                // Steps whose entry was already gone were taken out before the request.
+                let mut refused = std::mem::take(&mut self.startup_dropped);
                 self.startup.message = Some(if value.is_none() {
-                    stopped
+                    with_refused(stopped, &refused)
                 } else {
-                    startup_undo_summary(tally.done, failed, &tally.refused)
+                    refused.extend(tally.refused);
+                    startup_undo_summary(tally.done, failed, &refused)
                 });
             }
             _ => {}
@@ -763,9 +766,10 @@ fn unreadable_note(count: usize) -> String {
 
 fn damaged_note(reason: &str, kept: bool) -> String {
     let copy = if kept {
-        " A copy was kept as undo-damaged.jsonl in the folder below."
+        " A copy was kept as undo-damaged-1.jsonl in the folder below."
     } else {
-        ""
+        " It could not be moved aside, so it is left as it is and new changes are not saved \
+         until you use \"Delete saved undo\"; until then they can be undone until Toolboks closes."
     };
     format!(
         "The saved undo list is damaged ({reason}), so it was not used and nothing was guessed \
@@ -809,8 +813,14 @@ fn in_order<T: Clone>(rest: &[T], batch: &[T], steps: &[T]) -> Vec<T> {
 impl Debloater {
     /// Reads the saved undo list once, on the first draw (never in the administrator helper).
     fn load_saved_undo(&mut self) {
+        let loaded = self.saved.store.load();
+        self.use_loaded(loaded);
+    }
+
+    /// Takes in what was found on disk.
+    fn use_loaded(&mut self, loaded: Loaded) {
         self.saved.loaded = true;
-        match self.saved.store.load() {
+        match loaded {
             Loaded::Nothing => {}
             Loaded::List(list) => {
                 if !list.unreadable.is_empty() {
@@ -836,6 +846,8 @@ impl Debloater {
                 self.saved.unreadable = list.unreadable;
             }
             Loaded::Damaged { reason, kept } => {
+                // A damaged file that is still in place must never be replaced by a save.
+                self.saved.paused = !kept;
                 self.saved.note = Some(damaged_note(&reason, kept));
             }
             Loaded::Newer(version) => {
@@ -1609,6 +1621,26 @@ impl Debloater {
             self.startup.steps.len().min(1)
         };
         let from = self.startup.steps.len() - take;
+        // A step whose entry is gone (the app was uninstalled) is dropped with the reason before
+        // anything is sent, so it can never block the undo of the others, also after a restart.
+        // If the list cannot be read, nothing is dropped and the undo itself checks each entry.
+        let dropped = match startup::WinStartup.list() {
+            Ok(entries) => saved_undo::drop_gone_startup(&mut self.startup.steps, from, |step| {
+                entries
+                    .iter()
+                    .any(|e| e.source == step.step.source && e.name == step.step.name)
+            }),
+            Err(_) => Vec::new(),
+        };
+        if self.startup.steps.len() == from {
+            if !dropped.is_empty() {
+                self.startup.message = Some(startup_undo_summary(0, 0, &dropped));
+                self.save_undo();
+            }
+            self.startup.pending = None;
+            self.startup.started = false;
+            return;
+        }
         if self.startup.steps[from..]
             .iter()
             .any(|step| step.step.source.needs_admin())
@@ -1618,6 +1650,7 @@ impl Debloater {
             let request = admin::startup_undo_request(&batch);
             self.startup_batch = batch;
             self.startup_rest = std::mem::take(&mut self.startup.steps);
+            self.startup_dropped = dropped;
             self.send_admin(AdminKind::StartupUndo, request);
             return;
         }
@@ -1627,7 +1660,9 @@ impl Debloater {
             |step| (step.step.source, step.step.name.clone()),
             |step| saved_undo::undo_startup(step, &mut startup::WinStartup),
         );
-        self.startup.message = Some(startup_undo_summary(done, failed, &refused));
+        let mut reasons = dropped;
+        reasons.extend(refused);
+        self.startup.message = Some(startup_undo_summary(done, failed, &reasons));
         self.save_undo();
         self.startup.pending = None;
         self.startup.started = false;
@@ -3326,6 +3361,43 @@ mod tests {
         assert_eq!(third.saved.removed_apps, vec!["clipchamp"]);
         assert_eq!(third.tasks.steps.len(), 1);
         assert!(third.saved.note.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_list_that_stayed_in_place_is_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolboks-debloater-page-damaged-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("undo.jsonl");
+        std::fs::write(&file, b"damaged").unwrap();
+
+        let mut page = page_with_store(&dir);
+        page.use_loaded(saved_undo::Loaded::Damaged {
+            reason: "its header cannot be read".into(),
+            kept: false,
+        });
+        assert!(page.saved.paused);
+        assert!(page
+            .saved
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("could not be moved aside"));
+        page.saved.removed_apps.push("clipchamp");
+        page.save_undo();
+        assert_eq!(std::fs::read(&file).unwrap(), b"damaged");
+
+        // Moved aside: saving goes on.
+        let mut moved = page_with_store(&dir);
+        moved.use_loaded(saved_undo::Loaded::Damaged {
+            reason: "its header cannot be read".into(),
+            kept: true,
+        });
+        assert!(!moved.saved.paused);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

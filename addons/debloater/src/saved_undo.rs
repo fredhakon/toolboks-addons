@@ -38,8 +38,13 @@ use toolboks_debloat_engine::{
 pub const VERSION: u64 = 1;
 const FORMAT: &str = "toolboks.debloater.undo";
 const FILE: &str = "undo.jsonl";
-/// Where a damaged file is moved, so nothing is lost and it is never read again.
-const DAMAGED: &str = "undo-damaged.jsonl";
+/// Damaged files are moved to `undo-damaged-1.jsonl` (newest) .. `-3`, so nothing is lost and they
+/// are never read again. A fourth one drops the oldest copy.
+const DAMAGED_COPIES: usize = 3;
+
+fn damaged_name(slot: usize) -> String {
+    format!("undo-damaged-{slot}.jsonl")
+}
 /// The list is a few kilobytes; anything near this is not a file Debloater wrote.
 const MAX_BYTES: u64 = 1024 * 1024;
 
@@ -307,9 +312,51 @@ pub fn undo_task(step: &TaskStep, list: &mut dyn Tasks) -> StepResult {
     }
 }
 
-/// Switches a startup entry back, unless it is no longer switched the way Debloater left it.
+/// The startup entry (its Run value or Startup folder file) is still there.
+fn entry_exists(
+    store: &dyn StartupStore,
+    source: startup::Source,
+    name: &str,
+) -> Result<bool, String> {
+    Ok(store
+        .list()?
+        .iter()
+        .any(|entry| entry.source == source && entry.name == name))
+}
+
+/// Takes the steps from `from` on whose startup entry is gone out of `steps`, and says why for
+/// each. A stale step is never sent to the helper, so it cannot block the undo of the others.
+pub fn drop_gone_startup(
+    steps: &mut Vec<StartupStep>,
+    from: usize,
+    exists: impl Fn(&StartupStep) -> bool,
+) -> Vec<String> {
+    let batch = steps.split_off(from.min(steps.len()));
+    let mut reasons = Vec::new();
+    for step in batch {
+        if exists(&step) {
+            steps.push(step);
+        } else {
+            reasons.push(gone(&step.step.name));
+        }
+    }
+    reasons
+}
+
+/// Why a startup step whose entry is gone was left alone.
+pub fn startup_gone(name: &str) -> String {
+    gone(name)
+}
+
+/// Switches a startup entry back, unless the entry is gone or no longer switched the way
+/// Debloater left it.
 pub fn undo_startup(step: &StartupStep, store: &mut dyn StartupStore) -> StepResult {
     let (source, name) = (step.step.source, step.step.name.as_str());
+    match entry_exists(store, source, name) {
+        Err(error) => return StepResult::Failed(error),
+        Ok(false) => return StepResult::Refused(gone(name)),
+        Ok(true) => {}
+    }
     if let Some(after) = step.after {
         match store.approval(source, name) {
             Err(error) => return StepResult::Failed(error),
@@ -532,8 +579,9 @@ pub enum Loaded {
     /// No saved list.
     Nothing,
     List(UndoList),
-    /// Not used. It was moved to `undo-damaged.jsonl` in the same folder (`kept`), so it is never
-    /// read again and new changes can be saved.
+    /// Not used. It was moved to `undo-damaged-1.jsonl` in the same folder (`kept`), so it is never
+    /// read again and new changes can be saved. If it could not be moved, it is left in place and
+    /// must never be replaced.
     Damaged {
         reason: String,
         kept: bool,
@@ -609,11 +657,29 @@ impl UndoStore {
         match result {
             Ok(list) => Loaded::List(list),
             Err(DecodeError::Newer(version)) => Loaded::Newer(version),
-            Err(DecodeError::Damaged(reason)) => {
-                let kept = fs::rename(&path, self.dir.join(DAMAGED)).is_ok();
-                Loaded::Damaged { reason, kept }
+            Err(DecodeError::Damaged(reason)) => Loaded::Damaged {
+                reason,
+                kept: self.set_aside(&path),
+            },
+        }
+    }
+
+    /// Moves a damaged file to slot 1, after shifting older copies up; the oldest copy is the only
+    /// one ever deleted. A copy only moves into an empty slot, so nothing is overwritten. Returns
+    /// false if the file had to stay where it is.
+    fn set_aside(&self, path: &Path) -> bool {
+        let _ = fs::remove_file(self.dir.join(damaged_name(DAMAGED_COPIES)));
+        for slot in (1..DAMAGED_COPIES).rev() {
+            let (from, to) = (
+                self.dir.join(damaged_name(slot)),
+                self.dir.join(damaged_name(slot + 1)),
+            );
+            if from.exists() && !to.exists() {
+                let _ = fs::rename(&from, &to);
             }
         }
+        let first = self.dir.join(damaged_name(1));
+        !first.exists() && fs::rename(path, &first).is_ok()
     }
 
     /// Writes the list (temp file, flushed to disk, then renamed over the old one), or removes the
@@ -644,9 +710,11 @@ impl UndoStore {
         Ok(())
     }
 
-    /// Removes the saved list, a damaged copy and the folder.
+    /// Removes the saved list, the damaged copies and the folder.
     pub fn delete(&self) -> Result<(), String> {
-        for name in [FILE, DAMAGED, &format!("{FILE}.pending")] {
+        let mut names = vec![FILE.to_string(), format!("{FILE}.pending")];
+        names.extend((1..=DAMAGED_COPIES).map(damaged_name));
+        for name in names {
             match fs::remove_file(self.dir.join(name)) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                     return Err(error.to_string())
@@ -702,6 +770,8 @@ mod tests {
         values: HashMap<(Hive, String, String), RegValue>,
         /// Value names whose writes and deletes fail.
         broken: Vec<&'static str>,
+        /// Value names whose writes "work" but change nothing (a policy wins).
+        ignored: Vec<&'static str>,
     }
 
     impl Registry for FakeRegistry {
@@ -718,8 +788,10 @@ mod tests {
             if self.broken.contains(&name) {
                 return Err("access denied".into());
             }
-            self.values
-                .insert((hive, path.into(), name.into()), value.clone());
+            if !self.ignored.contains(&name) {
+                self.values
+                    .insert((hive, path.into(), name.into()), value.clone());
+            }
             Ok(())
         }
         fn delete(&mut self, hive: Hive, path: &str, name: &str) -> Result<(), String> {
@@ -768,12 +840,33 @@ mod tests {
         }
     }
 
+    /// Approval values, and the entries that exist.
     #[derive(Default)]
-    struct FakeStartup(HashMap<(Source, String), Vec<u8>>);
+    struct FakeStartup(HashMap<(Source, String), Vec<u8>>, Vec<(Source, String)>);
+
+    impl FakeStartup {
+        fn with(entries: &[(Source, &str)]) -> Self {
+            Self(
+                HashMap::new(),
+                entries
+                    .iter()
+                    .map(|(source, name)| (*source, name.to_string()))
+                    .collect(),
+            )
+        }
+    }
 
     impl StartupStore for FakeStartup {
         fn list(&self) -> Result<Vec<RawEntry>, String> {
-            Ok(Vec::new())
+            Ok(self
+                .1
+                .iter()
+                .map(|(source, name)| RawEntry {
+                    source: *source,
+                    name: name.clone(),
+                    command: String::new(),
+                })
+                .collect())
         }
         fn approval(&self, source: Source, name: &str) -> Result<Option<Vec<u8>>, String> {
             Ok(self.0.get(&(source, name.to_string())).cloned())
@@ -865,7 +958,7 @@ mod tests {
         list.0.insert(task.path.into(), true);
         let task_step = task_done(tasks::set_enabled(&mut list, task, false).unwrap());
 
-        let mut store = FakeStartup::default();
+        let mut store = FakeStartup::with(&[(Source::UserRun, ENTRY_NAME)]);
         let startup = startup_done(
             startup::set_enabled(&mut store, &entry(), false, 133_000_000_000_000_000).unwrap(),
             false,
@@ -967,23 +1060,35 @@ mod tests {
         let mut flipped = good.clone();
         let at = flipped.len() - 10;
         flipped[at] ^= 0x01;
-        for bad in [
+        let bads = [
             cut,
             flipped,
             b"not an undo list".to_vec(),
             Vec::new(),
             b"{\"format\":\"toolboks.debloater.undo\",\"version\":0}\n{}".to_vec(),
-        ] {
+        ];
+        for bad in &bads {
             fs::create_dir_all(dir.store().dir()).unwrap();
-            fs::write(&file, &bad).unwrap();
+            fs::write(&file, bad).unwrap();
             match dir.store().load() {
                 Loaded::Damaged { kept, .. } => assert!(kept),
                 other => panic!("damaged file read as {other:?}"),
             }
             assert!(!file.exists());
-            assert_eq!(fs::read(dir.store().dir().join(DAMAGED)).unwrap(), bad);
+            assert_eq!(
+                &fs::read(dir.store().dir().join(damaged_name(1))).unwrap(),
+                bad
+            );
             assert_eq!(dir.store().load(), Loaded::Nothing);
         }
+        // The three newest damaged copies are kept, newest first; none was overwritten.
+        for (slot, bad) in (1..=DAMAGED_COPIES).zip(bads.iter().rev()) {
+            assert_eq!(
+                &fs::read(dir.store().dir().join(damaged_name(slot))).unwrap(),
+                bad
+            );
+        }
+        assert!(!dir.store().dir().join(damaged_name(4)).exists());
         // A good file still reads.
         fs::write(&file, &good).unwrap();
         assert_eq!(reopen(&dir), list);
@@ -1000,7 +1105,7 @@ mod tests {
         fs::write(&file, &bytes).unwrap();
         assert_eq!(dir.store().load(), Loaded::Newer(2));
         assert_eq!(fs::read(&file).unwrap(), bytes, "the file must not change");
-        assert!(!dir.store().dir().join(DAMAGED).exists());
+        assert!(!dir.store().dir().join(damaged_name(1)).exists());
         assert_eq!(decode(&bytes), Err(DecodeError::Newer(2)));
     }
 
@@ -1153,7 +1258,7 @@ mod tests {
             StepResult::Refused(_)
         ));
 
-        let mut store = FakeStartup::default();
+        let mut store = FakeStartup::with(&[(Source::UserRun, ENTRY_NAME)]);
         let step = startup_done(
             startup::set_enabled(&mut store, &entry(), false, 1).unwrap(),
             false,
@@ -1167,6 +1272,107 @@ mod tests {
             StepResult::Refused(_)
         ));
         assert_eq!(store.0[&key], startup::enabled_bytes().to_vec());
+    }
+
+    #[test]
+    fn a_damaged_file_that_cannot_be_moved_aside_is_reported_as_not_kept() {
+        let dir = TempDir::new();
+        let file = dir.store().dir().join(FILE);
+        fs::create_dir_all(dir.store().dir()).unwrap();
+        fs::write(&file, b"damaged").unwrap();
+        // The oldest slot is a folder that cannot be removed, so no copy can move up, slot 1
+        // stays taken, and the file has to stay where it is. No copy is overwritten.
+        fs::create_dir_all(dir.store().dir().join(damaged_name(DAMAGED_COPIES))).unwrap();
+        fs::write(
+            dir.store()
+                .dir()
+                .join(damaged_name(DAMAGED_COPIES))
+                .join("x"),
+            b"",
+        )
+        .unwrap();
+        for slot in 1..DAMAGED_COPIES {
+            fs::write(dir.store().dir().join(damaged_name(slot)), b"old").unwrap();
+        }
+        match dir.store().load() {
+            Loaded::Damaged { kept, .. } => assert!(!kept),
+            other => panic!("damaged file read as {other:?}"),
+        }
+        assert_eq!(fs::read(&file).unwrap(), b"damaged");
+        for slot in 1..DAMAGED_COPIES {
+            assert_eq!(
+                fs::read(dir.store().dir().join(damaged_name(slot))).unwrap(),
+                b"old"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_all_users_startup_step_is_dropped_and_never_blocks_the_others() {
+        let real = startup_done(
+            startup::UndoStep {
+                source: Source::MachineRun,
+                name: "Real App".into(),
+                previous: None,
+            },
+            false,
+        );
+        let stale = startup_done(
+            startup::UndoStep {
+                source: Source::MachineRun,
+                name: "Uninstalled App".into(),
+                previous: None,
+            },
+            false,
+        );
+        let mut store = FakeStartup::with(&[(Source::MachineRun, "Real App")]);
+        store.0.insert(
+            (Source::MachineRun, "Real App".into()),
+            startup::disabled_bytes(1).to_vec(),
+        );
+
+        // The page takes stale steps out before anything is sent ("Undo all": from 0).
+        let mut steps = vec![real.clone(), stale.clone()];
+        let exists = |s: &StartupStep| {
+            store
+                .1
+                .iter()
+                .any(|(source, name)| *source == s.step.source && *name == s.step.name)
+        };
+        let reasons = drop_gone_startup(&mut steps, 0, exists);
+        assert_eq!(steps, vec![real.clone()]);
+        assert_eq!(reasons, vec![startup_gone("Uninstalled App")]);
+
+        // The undo itself refuses a gone entry too (the helper path), and undoes the real one.
+        let tally = undo_steps(
+            vec![stale, real],
+            |s| (s.step.source, s.step.name.clone()),
+            |s| undo_startup(s, &mut store),
+        );
+        assert_eq!((tally.done, tally.kept.len()), (1, 0));
+        assert_eq!(tally.refused, vec![startup_gone("Uninstalled App")]);
+        assert!(
+            store.0.is_empty(),
+            "the real entry went back to no approval value"
+        );
+        assert!(!store
+            .0
+            .contains_key(&(Source::MachineRun, "Uninstalled App".to_string())));
+    }
+
+    #[test]
+    fn a_registry_item_windows_ignores_leaves_no_undo_step() {
+        // NotEffective: written, read back different, put back. The engine keeps no step for it,
+        // so there is nothing to mark; if it could not be put back the outcome is Failed and the
+        // steps are recovery steps (no "left at" state, so the retry is not refused).
+        let item = user_items()[0];
+        let mut reg = FakeRegistry {
+            ignored: item.settings.iter().map(|s| s.name).collect(),
+            ..FakeRegistry::default()
+        };
+        let run = plan::apply(catalog::items(), &[item.id], &mut reg, ENV);
+        assert_eq!(run.applied[0].outcome, Outcome::NotEffective);
+        assert!(track_run(&run).is_empty());
     }
 
     #[test]
@@ -1191,7 +1397,9 @@ mod tests {
             ..UndoList::default()
         };
         dir.store().save(&list).unwrap();
-        fs::write(dir.store().dir().join(DAMAGED), b"old").unwrap();
+        for slot in 1..=DAMAGED_COPIES {
+            fs::write(dir.store().dir().join(damaged_name(slot)), b"old").unwrap();
+        }
         dir.store().delete().unwrap();
         assert!(!dir.store().dir().exists());
         assert_eq!(dir.store().load(), Loaded::Nothing);

@@ -962,6 +962,8 @@ struct StartupSet {
 
 struct StartupUndo {
     steps: Vec<StartupStep>,
+    /// Steps whose entry is gone: left alone and reported as refused, so they leave the list.
+    gone: Vec<StartupStep>,
     description: String,
 }
 
@@ -982,11 +984,27 @@ fn startup_set_description(entry: &Entry, enable: bool) -> String {
     ))
 }
 
-fn startup_undo_description(steps: &[StartupStep]) -> String {
-    let mut text = String::from("Put these startup items back?\n");
+fn startup_undo_description(steps: &[StartupStep], gone: &[StartupStep]) -> String {
+    let mut text = if steps.is_empty() {
+        String::from(
+            "These startup items are no longer on this PC, so nothing will change.\nConfirm to take them off the undo list.\n",
+        )
+    } else {
+        String::from("Put these startup items back?\n")
+    };
     for step in steps.iter().map(|step| &step.step) {
         text.push_str(&format!(
             "\n\u{2022} {} ({})\n  Its start-up setting goes back to what it was.\n",
+            step.name,
+            step.source.label()
+        ));
+    }
+    if !gone.is_empty() && !steps.is_empty() {
+        text.push_str("\nLeft alone, no longer on this PC:\n");
+    }
+    for step in gone.iter().map(|step| &step.step) {
+        text.push_str(&format!(
+            "\n\u{2022} {} ({})\n",
             step.name,
             step.source.label()
         ));
@@ -1025,17 +1043,18 @@ fn prepare_startup_undo(value: &Value) -> Result<Box<dyn AdminChange>, String> {
         .iter()
         .map(saved_undo::startup_from)
         .collect::<Result<Vec<_>, _>>()?;
+    // A step whose entry is gone is left alone and dropped, never a reason to refuse the others:
+    // otherwise one uninstalled app would block startup undo for good (the list is saved).
     let entries = current_entries()?;
-    if let Some(step) = steps.iter().map(|step| &step.step).find(|step| {
-        !entries
+    let (steps, gone): (Vec<StartupStep>, Vec<StartupStep>) = steps.into_iter().partition(|step| {
+        entries
             .iter()
-            .any(|entry| entry.source == step.source && entry.name == step.name)
-    }) {
-        return Err(format!("{} is no longer a startup item.", step.name));
-    }
+            .any(|entry| entry.source == step.step.source && entry.name == step.step.name)
+    });
     Ok(Box::new(StartupUndo {
-        description: startup_undo_description(&steps),
+        description: startup_undo_description(&steps, &gone),
         steps,
+        gone,
     }))
 }
 
@@ -1070,10 +1089,15 @@ impl AdminChange for StartupUndo {
         self.description.clone()
     }
     fn apply(self: Box<Self>) -> Result<String, String> {
-        let tally = saved_undo::undo_steps(
+        let mut tally = saved_undo::undo_steps(
             self.steps,
             |step| (step.step.source, step.step.name.clone()),
             |step| saved_undo::undo_startup(step, &mut WinStartup),
+        );
+        tally.refused.extend(
+            self.gone
+                .iter()
+                .map(|step| saved_undo::startup_gone(&step.step.name)),
         );
         Ok(batch_json(&tally, saved_undo::startup_json))
     }
@@ -1432,16 +1456,19 @@ mod tests {
             r#"{"kind":"startup_set","source":"machine_run","name":"x"}"#
         ))
         .is_err());
+        // An undo step for an entry that is gone is not a reason to refuse the batch: it is
+        // listed as left alone (and dropped when the helper answers). Prepare only; nothing runs.
         let step = startup::UndoStep {
             source: Source::MachineRun,
             name: "No Such Entry Exists 12345".into(),
             previous: None,
         };
-        assert!(
-            prepare_admin(&request(&startup_undo_request(&[saved_undo::recovery(
-                step
-            )])))
-            .is_err()
-        );
+        let change = prepare_admin(&request(&startup_undo_request(&[saved_undo::recovery(
+            step,
+        )])))
+        .unwrap();
+        let text = change.description();
+        assert!(text.contains("No Such Entry Exists 12345"), "{text}");
+        assert!(text.contains("no longer on this PC"), "{text}");
     }
 }

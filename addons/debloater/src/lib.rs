@@ -220,6 +220,8 @@ pub struct Debloater {
     startup_rest: Vec<StartupStep>,
     /// The title of the startup item a pending set request is about, and what was asked.
     pending_startup: Option<(String, bool)>,
+    /// Why startup steps were dropped (entry gone) before a pending undo request was sent.
+    startup_dropped: Vec<String>,
     /// The saved undo list on disk.
     saved: SavedState,
 }
@@ -291,6 +293,7 @@ impl Debloater {
             startup_batch: Vec::new(),
             startup_rest: Vec::new(),
             pending_startup: None,
+            startup_dropped: Vec::new(),
             saved: SavedState::new(saved_undo::UndoStore::default_dir()),
         }
     }

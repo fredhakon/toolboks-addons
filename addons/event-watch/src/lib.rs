@@ -2,19 +2,22 @@
 //! bluescreen, a hard reset or a hardware fault. All Event Log work runs on worker threads.
 //! It only reads: it never clears a log. The opt-in latency check (`latency`, `admin`) is the
 //! one part that asks for administrator rights, each time, through the SDK's separate helper.
+//! It also runs in the background (`crash_watch`): one crash check at start and every 30 minutes
+//! reports `recent-crashes` to Home, in memory only.
 
 pub mod admin;
 pub mod analysis;
 pub mod bugchecks;
 pub mod catalog;
 mod crash_check;
+mod crash_watch;
 mod latency;
 pub mod model;
 mod page;
 pub mod source;
 
 use std::collections::BTreeMap;
-use toolboks_addon_sdk::{NativeAddon, TutorialStep};
+use toolboks_addon_sdk::{Finding, NativeAddon, TutorialStep};
 
 pub const ID: &str = "toolboks.event-watch";
 /// Page names, in order. They match `host-services.json`.
@@ -57,6 +60,8 @@ pub struct EventWatch {
     /// Kept across `suspend`, so an answer from the helper still lands. Memory only.
     latency: latency::Latency,
     index: usize,
+    /// The background crash check. Kept across `suspend`: it runs while the window is hidden.
+    crashes: crash_watch::CrashWatch,
 }
 
 impl Default for EventWatch {
@@ -65,6 +70,7 @@ impl Default for EventWatch {
             page: page::Page::new(),
             latency: latency::Latency::default(),
             index: 0,
+            crashes: crash_watch::CrashWatch::default(),
         }
     }
 }
@@ -92,6 +98,23 @@ impl NativeAddon for EventWatch {
             self.page.ui(ui, self.index);
         }
         false
+    }
+    /// Drives the crash check while the page is shown (a due or running read).
+    fn tick(&mut self, ctx: &egui::Context) {
+        self.crashes.step(Some(ctx));
+    }
+    /// True only while a crash read runs or one is due, so the runtime sleeps between checks.
+    fn has_background_work(&self) -> bool {
+        self.crashes.wants_tick()
+    }
+    fn tick_background(&mut self) {
+        self.crashes.step(None);
+    }
+    fn findings(&self) -> Vec<Finding> {
+        vec![self.crashes.finding()]
+    }
+    fn check_now(&mut self) {
+        self.crashes.request();
     }
     fn set_capabilities(&mut self, capabilities: &[toolboks_addon_sdk::Capability]) {
         self.latency.set_capabilities(capabilities);
@@ -148,6 +171,166 @@ impl NativeAddon for EventWatch {
     }
     fn tutorial_navigate(&mut self, page: &str) {
         self.navigate(page);
+    }
+}
+
+#[cfg(test)]
+mod finding_tests {
+    use super::*;
+    use crate::crash_watch::{Clock, Source};
+    use crate::model::Event;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use toolboks_addon_sdk::{FindingStatus, Severity};
+
+    const NOW: u64 = 1_800_000_000;
+    const DAY_MS: i64 = 86_400_000;
+
+    fn kernel_power(t: i64, code: &str) -> Event {
+        Event {
+            record_id: (t / 1000) as u64,
+            time_ms: t,
+            channel: "System".into(),
+            provider: "Microsoft-Windows-Kernel-Power".into(),
+            id: 41,
+            level: 1,
+            data: vec![("BugcheckCode".into(), code.into())],
+            message: None,
+        }
+    }
+
+    fn addon(events: Vec<Event>, fail: bool) -> (EventWatch, Arc<AtomicU64>) {
+        let mut fake = crate::crash_watch::tests::Fake::new(events);
+        fake.fail = fail;
+        let time = Arc::new(AtomicU64::new(NOW));
+        let clock: Clock = {
+            let time = time.clone();
+            Arc::new(move || time.load(Ordering::SeqCst))
+        };
+        let source: Source = Arc::new(fake);
+        let watch = EventWatch {
+            crashes: crash_watch::CrashWatch::with(source, clock),
+            ..Default::default()
+        };
+        (watch, time)
+    }
+
+    /// What the runtime does while the window is hidden: tick while there is background work.
+    fn run_hidden(watch: &mut EventWatch) {
+        watch.suspend();
+        for _ in 0..2000 {
+            if !watch.has_background_work() {
+                return;
+            }
+            watch.tick_background();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("background work never finished");
+    }
+
+    #[test]
+    fn it_reports_one_not_checked_finding_before_the_first_read() {
+        let (watch, _) = addon(vec![], false);
+        let findings = watch.findings();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "recent-crashes");
+        assert_eq!(findings[0].status, FindingStatus::NotChecked);
+        assert!(
+            watch.has_background_work(),
+            "the first check is due at start"
+        );
+    }
+
+    #[test]
+    fn each_case_reaches_findings_through_the_background_tick() {
+        let now_ms = NOW as i64 * 1000;
+        let cases: [(Vec<Event>, bool, FindingStatus, Severity); 5] = [
+            (vec![], false, FindingStatus::Ok, Severity::Watch),
+            (
+                vec![kernel_power(now_ms - DAY_MS, "0")],
+                false,
+                FindingStatus::Ok,
+                Severity::Watch,
+            ),
+            (
+                vec![
+                    kernel_power(now_ms - DAY_MS, "0"),
+                    kernel_power(now_ms - 2 * DAY_MS, "0"),
+                ],
+                false,
+                FindingStatus::Attention,
+                Severity::Watch,
+            ),
+            (
+                vec![kernel_power(now_ms - DAY_MS, "313")],
+                false,
+                FindingStatus::Attention,
+                Severity::Problem,
+            ),
+            (vec![], true, FindingStatus::Unavailable, Severity::Watch),
+        ];
+        for (events, fail, status, severity) in cases {
+            let (mut watch, _) = addon(events, fail);
+            run_hidden(&mut watch);
+            let findings = watch.findings();
+            assert_eq!(findings.len(), 1);
+            assert_eq!(findings[0].status, status);
+            assert_eq!(findings[0].severity, severity);
+            assert!(Finding::valid_id(&findings[0].id));
+            assert!(!watch.has_background_work(), "asleep after the check");
+        }
+    }
+
+    #[test]
+    fn findings_do_not_change_between_ticks_or_frames_until_the_next_check() {
+        let (mut watch, time) = addon(vec![], false);
+        run_hidden(&mut watch);
+        let done = watch.findings();
+        for _ in 0..20 {
+            watch.tick_background();
+            assert_eq!(watch.findings(), done);
+        }
+        // Showing the page and hiding it again does not start a read or change the finding.
+        watch.resume();
+        watch.tick(&egui::Context::default());
+        watch.suspend();
+        assert_eq!(watch.findings(), done);
+        // The next check is 30 minutes after the first, and only then.
+        time.fetch_add(30 * 60 - 1, Ordering::SeqCst);
+        assert!(!watch.has_background_work());
+        time.fetch_add(1, Ordering::SeqCst);
+        assert!(watch.has_background_work());
+        run_hidden(&mut watch);
+        assert_eq!(watch.findings()[0].measured_at, NOW + 30 * 60);
+    }
+
+    #[test]
+    fn check_now_makes_a_new_reading_while_suspended() {
+        let (mut watch, time) = addon(vec![], false);
+        run_hidden(&mut watch);
+        time.fetch_add(5, Ordering::SeqCst);
+        assert!(!watch.has_background_work());
+        watch.check_now();
+        assert!(watch.has_background_work());
+        run_hidden(&mut watch);
+        assert_eq!(watch.findings()[0].measured_at, NOW + 5);
+    }
+
+    #[test]
+    fn the_background_check_does_not_touch_the_pages_and_opens_a_real_page() {
+        let (mut watch, _) = addon(vec![], false);
+        for page in 0..PAGES.len() {
+            watch.navigate(&page.to_string());
+            assert_eq!(watch.page_index(), page);
+        }
+        run_hidden(&mut watch);
+        assert_eq!(watch.page_index(), PAGES.len() - 1);
+        let Some(toolboks_addon_sdk::FindingAction::OpenPage { route, .. }) =
+            watch.findings()[0].action.clone()
+        else {
+            panic!("the finding opens a page");
+        };
+        assert!(PAGES.contains(&route.as_str()));
     }
 }
 

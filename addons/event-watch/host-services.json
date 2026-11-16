@@ -1,3 +1,4 @@
 {
-  "pages": ["Live", "Crashes", "Summary", "Latency check", "Boot"]
+  "pages": ["Live", "Crashes", "Summary", "Latency check", "Boot"],
+  "background": true
 }

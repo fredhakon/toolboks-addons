@@ -7,8 +7,9 @@ use egui::{self, Color32, RichText};
 use super::apps::{self, AppRow, AppRun};
 use super::model::{Applicable, Edition, Group, Hive, Item, RegValue, Risk, State, Status};
 use super::restore::{self, RestoreStatus};
+use super::saved_undo::{self, Loaded, RegStep, ServiceStep, StepResult, UndoList};
 use super::services::{self, ServiceDef, ServiceState};
-use super::startup::{self, Class, Entry, Source};
+use super::startup::{self, Class, Entry, Source, StartupStore};
 use super::style::{self, Chip};
 use super::tasks::{self, TaskDef, TaskState};
 use super::{
@@ -236,34 +237,36 @@ impl Debloater {
             AdminKind::ServiceUndo => {
                 let batch = std::mem::take(&mut self.service_batch);
                 let mut remaining = std::mem::take(&mut self.service_rest);
-                let (done, kept) = match &completed {
-                    Some(value) => admin::undo_batch_from_json(value, admin::service_step_from),
-                    None => (0, batch),
+                let tally = match &completed {
+                    Some(value) => admin::undo_batch_from_json(value, saved_undo::service_from),
+                    None => unchanged(batch),
                 };
-                let failed = kept.len();
-                remaining.extend(kept.into_iter().rev());
+                let failed = tally.kept.len();
+                remaining.extend(tally.kept.into_iter().rev());
                 if let Some(tx) = self.service_tx.take() {
                     let _ = tx.send(ServiceJob::Undo {
                         remaining,
-                        done,
+                        done: tally.done,
                         failed,
+                        refused: tally.refused,
                     });
                 }
             }
             AdminKind::TaskUndo => {
                 let batch = std::mem::take(&mut self.task_batch);
                 let mut remaining = std::mem::take(&mut self.task_rest);
-                let (done, kept) = match &completed {
-                    Some(value) => admin::undo_batch_from_json(value, admin::task_step_from),
-                    None => (0, batch),
+                let tally = match &completed {
+                    Some(value) => admin::undo_batch_from_json(value, saved_undo::task_from),
+                    None => unchanged(batch),
                 };
-                let failed = kept.len();
-                remaining.extend(kept.into_iter().rev());
+                let failed = tally.kept.len();
+                remaining.extend(tally.kept.into_iter().rev());
                 if let Some(tx) = self.task_tx.take() {
                     let _ = tx.send(TaskJob::Undo {
                         remaining,
-                        done,
+                        done: tally.done,
                         failed,
+                        refused: tally.refused,
                     });
                 }
             }
@@ -297,12 +300,16 @@ impl Debloater {
                 };
                 self.startup.message = Some(match result {
                     Ok(step) => {
-                        self.startup.steps.push(step);
+                        self.startup
+                            .steps
+                            .push(saved_undo::startup_done(step, enable));
                         format!("{name} is now {}.", if enable { "on" } else { "off" })
                     }
                     Err(e) => {
                         let message = format!("Could not change {name}: {e}");
-                        self.startup.steps.extend(e.recovery);
+                        self.startup
+                            .steps
+                            .extend(e.recovery.map(saved_undo::recovery));
                         message
                     }
                 });
@@ -310,22 +317,28 @@ impl Debloater {
             AdminKind::StartupUndo => {
                 let batch = std::mem::take(&mut self.startup_batch);
                 let mut remaining = std::mem::take(&mut self.startup_rest);
-                let (done, kept) = match &value {
-                    Some(value) => admin::undo_batch_from_json(value, admin::startup_step_from),
-                    None => (0, batch),
+                let tally = match &value {
+                    Some(value) => admin::undo_batch_from_json(value, saved_undo::startup_from),
+                    None => unchanged(batch),
                 };
-                let failed = kept.len();
-                remaining.extend(kept.into_iter().rev());
+                let failed = tally.kept.len();
+                remaining.extend(tally.kept.into_iter().rev());
+                // Changes made on this page while the helper was open come after the rest.
+                remaining.append(&mut self.startup.steps);
                 self.startup.steps = remaining;
+                // Steps whose entry was already gone were taken out before the request.
+                let mut refused = std::mem::take(&mut self.startup_dropped);
                 self.startup.message = Some(if value.is_none() {
-                    stopped
+                    with_refused(stopped, &refused)
                 } else {
-                    startup_undo_summary(done, failed)
+                    refused.extend(tally.refused);
+                    startup_undo_summary(tally.done, failed, &refused)
                 });
             }
             _ => {}
         }
         self.startup.started = false;
+        self.save_undo();
     }
 
     fn registry_applied(&mut self, value: &serde_json::Value) {
@@ -340,20 +353,22 @@ impl Debloater {
         self.message = Some(summarize(&run));
         self.run_notes = run_notes(&run);
         if !run.undo.is_empty() {
-            self.undo_runs.push(run.undo);
+            self.undo_runs.push(saved_undo::track_run(&run));
+            self.save_undo();
         }
     }
 
     fn registry_undone(&mut self, value: &serde_json::Value) {
         let total = value["total"].as_u64().unwrap_or(0) as usize;
         let remaining = admin::steps_from_json(&value["remaining"]);
-        self.message = Some(undo_summary(total, remaining.len()));
-        if remaining.is_empty() {
-            self.undo_runs.pop();
-        } else if let Some(last) = self.undo_runs.last_mut() {
-            *last = remaining;
+        let refused = admin::refused_from_json(value);
+        self.message = Some(undo_summary(total, remaining.len(), &refused));
+        self.undo_runs.pop();
+        if !remaining.is_empty() {
+            self.undo_runs.push(remaining);
         }
         self.run_notes.clear();
+        self.save_undo();
     }
 
     /// Starts an apply. An item that writes the machine-wide registry, or a restore point, needs
@@ -420,6 +435,9 @@ impl Debloater {
         if !self.loaded {
             self.refresh();
         }
+        if !self.saved.loaded {
+            self.load_saved_undo();
+        }
 
         if page == 0 {
             self.restore_poll();
@@ -441,18 +459,17 @@ impl Debloater {
             }
         }
 
-        if page == 3 {
-            self.tasks_poll();
-            if !self.tasks.started {
-                self.tasks_refresh(ui.ctx());
-            }
+        // A task or service change the helper answered while another page was open is picked up
+        // (and saved) right away, not when that page is opened again.
+        self.tasks_poll();
+        self.services_poll();
+
+        if page == 3 && !self.tasks.started {
+            self.tasks_refresh(ui.ctx());
         }
 
-        if page == 4 {
-            self.services_poll();
-            if !self.services.started {
-                self.services_refresh(ui.ctx());
-            }
+        if page == 4 && !self.services.started {
+            self.services_refresh(ui.ctx());
         }
 
         let panel = egui::Panel::right("debloat_inspector")
@@ -649,7 +666,7 @@ impl Debloater {
             style::note(ui, "Creating restore point...");
         } else if self.confirming {
             ui.label(format!(
-                "Apply {}? You can undo them until you close toolboks.",
+                "Apply {}? You can undo them later, also after Toolboks closes.",
                 plural(applicable, "change", "changes")
             ));
             ui.horizontal(|ui| {
@@ -682,11 +699,8 @@ impl Debloater {
         if can_undo && ui.link(RichText::new("Copy undo steps").small()).clicked() {
             ctx.copy_text(undo_text(&self.undo_runs));
         }
-        style::note(
-            ui,
-            "Undo works until you close toolboks. Removed apps come back from the \
-             Microsoft Store.",
-        );
+        style::note(ui, "Removed apps come back from the Microsoft Store.");
+        self.saved_undo_panel(ui);
     }
 
     fn apply_selected(&mut self, ids: &[&str]) {
@@ -695,7 +709,8 @@ impl Debloater {
         self.message = Some(summarize(&run));
         self.run_notes = run_notes(&run);
         if !run.undo.is_empty() {
-            self.undo_runs.push(run.undo);
+            self.undo_runs.push(saved_undo::track_run(&run));
+            self.save_undo();
         }
         // Refreshing also clears the ticks of items that are now off.
         self.refresh();
@@ -706,23 +721,237 @@ impl Debloater {
             return;
         }
         if let Some(steps) = self.undo_runs.last() {
-            if steps.iter().any(|op| op.hive == Hive::LocalMachine) {
+            if steps.iter().any(|op| op.step.hive == Hive::LocalMachine) {
                 let request = admin::registry_undo_request(steps);
                 self.send_admin(AdminKind::RegistryUndo, request);
                 return;
             }
         }
-        let Some(steps) = self.undo_runs.last_mut() else {
+        let Some(steps) = self.undo_runs.pop() else {
             return;
         };
         let total = steps.len();
-        plan::undo(steps, &mut backend::WinRegistry);
-        self.message = Some(undo_summary(total, steps.len()));
-        if steps.is_empty() {
-            self.undo_runs.pop();
+        let tally = saved_undo::undo_steps(
+            steps.into_iter().rev().collect(),
+            |s| (s.step.hive, s.step.path, s.step.name),
+            |s| saved_undo::undo_registry(s, &mut backend::WinRegistry),
+        );
+        let mut kept = tally.kept;
+        kept.reverse();
+        self.message = Some(undo_summary(total, kept.len(), &tally.refused));
+        if !kept.is_empty() {
+            self.undo_runs.push(kept);
         }
         self.run_notes.clear();
+        self.save_undo();
         self.refresh();
+    }
+}
+
+/// Where Debloater keeps its undo list, in plain words.
+const SAVED_NOTE: &str = "Debloater saves its undo list on this PC, so you can undo after \
+                          closing Toolboks or restarting Windows. It keeps only what undo needs: \
+                          the earlier values of the settings, services, tasks and startup items \
+                          it changed, and the names of apps it removed. It is kept in:";
+const REFUSE_NOTE: &str = "An item that something else changed since is left as it is, and \
+                           Debloater says which.";
+
+fn unreadable_note(count: usize) -> String {
+    format!(
+        "{} could not be read by this version of Debloater (it no longer offers that item). \
+         They are kept as they are and not used.",
+        plural(count, "saved undo step", "saved undo steps")
+    )
+}
+
+fn damaged_note(reason: &str, kept: bool) -> String {
+    let copy = if kept {
+        " A copy was kept as undo-damaged-1.jsonl in the folder below."
+    } else {
+        " It could not be moved aside, so it is left as it is and new changes are not saved \
+         until you use \"Delete saved undo\"; until then they can be undone until Toolboks closes."
+    };
+    format!(
+        "The saved undo list is damaged ({reason}), so it was not used and nothing was guessed \
+         from it. Changes made earlier can still be switched back on these pages.{copy}"
+    )
+}
+
+fn newer_note(version: u64) -> String {
+    format!(
+        "The saved undo list was made by a newer version of Debloater (format {version}), so this \
+         version does not use or change it. Update Debloater to undo those changes. Changes you \
+         make now can be undone until Toolboks closes."
+    )
+}
+
+fn unavailable_note(error: &str) -> String {
+    format!(
+        "The saved undo list could not be read ({error}). It was left as it is. Changes you make \
+         now can be undone until Toolboks closes."
+    )
+}
+
+/// An undo batch the helper did not run: every step stays.
+fn unchanged<T>(batch: Vec<T>) -> saved_undo::Tally<T> {
+    saved_undo::Tally {
+        done: 0,
+        kept: batch,
+        refused: Vec::new(),
+    }
+}
+
+/// Older steps, then a batch that is out at the helper (newest first), then newer steps.
+fn in_order<T: Clone>(rest: &[T], batch: &[T], steps: &[T]) -> Vec<T> {
+    rest.iter()
+        .chain(batch.iter().rev())
+        .chain(steps)
+        .cloned()
+        .collect()
+}
+
+impl Debloater {
+    /// Reads the saved undo list once, on the first draw (never in the administrator helper).
+    fn load_saved_undo(&mut self) {
+        let loaded = self.saved.store.load();
+        self.use_loaded(loaded);
+    }
+
+    /// Takes in what was found on disk.
+    fn use_loaded(&mut self, loaded: Loaded) {
+        self.saved.loaded = true;
+        match loaded {
+            Loaded::Nothing => {}
+            Loaded::List(list) => {
+                if !list.unreadable.is_empty() {
+                    self.saved.note = Some(unreadable_note(list.unreadable.len()));
+                }
+                let mut runs = list.registry_runs;
+                runs.append(&mut self.undo_runs);
+                self.undo_runs = runs;
+                let mut steps = list.startup;
+                steps.append(&mut self.startup.steps);
+                self.startup.steps = steps;
+                let mut steps = list.tasks;
+                steps.append(&mut self.tasks.steps);
+                self.tasks.steps = steps;
+                let mut steps = list.services;
+                steps.append(&mut self.services.steps);
+                self.services.steps = steps;
+                for id in list.removed_apps {
+                    if !self.saved.removed_apps.contains(&id) {
+                        self.saved.removed_apps.push(id);
+                    }
+                }
+                self.saved.unreadable = list.unreadable;
+            }
+            Loaded::Damaged { reason, kept } => {
+                // A damaged file that is still in place must never be replaced by a save.
+                self.saved.paused = !kept;
+                self.saved.note = Some(damaged_note(&reason, kept));
+            }
+            Loaded::Newer(version) => {
+                self.saved.paused = true;
+                self.saved.note = Some(newer_note(version));
+            }
+            Loaded::Unavailable(error) => {
+                self.saved.paused = true;
+                self.saved.note = Some(unavailable_note(&error));
+            }
+        }
+    }
+
+    /// Everything that can be undone now, including a batch that is out at the helper.
+    fn undo_list(&self) -> UndoList {
+        UndoList {
+            registry_runs: self.undo_runs.clone(),
+            startup: in_order(&self.startup_rest, &self.startup_batch, &self.startup.steps),
+            tasks: in_order(&self.task_rest, &self.task_batch, &self.tasks.steps),
+            services: in_order(
+                &self.service_rest,
+                &self.service_batch,
+                &self.services.steps,
+            ),
+            removed_apps: self.saved.removed_apps.clone(),
+            unreadable: self.saved.unreadable.clone(),
+        }
+    }
+
+    /// Writes the undo list. Called after every change and every undo.
+    fn save_undo(&mut self) {
+        if !self.saved.loaded {
+            // Never replace a saved list that was not read yet.
+            self.load_saved_undo();
+        }
+        if self.saved.paused {
+            return;
+        }
+        self.saved.error = self.saved.store.save(&self.undo_list()).err().map(|error| {
+            format!("Could not save the undo list ({error}). Undo works until Toolboks closes.")
+        });
+    }
+
+    /// "Delete saved undo": forgets every undo step, saved and in memory. The changes stay in
+    /// Windows.
+    fn delete_saved_undo(&mut self) {
+        self.saved.confirming = false;
+        if let Err(error) = self.saved.store.delete() {
+            self.saved.error = Some(format!("Could not delete the saved undo list ({error})."));
+            return;
+        }
+        self.undo_runs.clear();
+        self.startup.steps.clear();
+        self.tasks.steps.clear();
+        self.services.steps.clear();
+        self.saved.removed_apps.clear();
+        self.saved.unreadable.clear();
+        self.saved.paused = false;
+        self.saved.note = None;
+        self.saved.error = None;
+        self.run_notes.clear();
+        self.message = Some(
+            "The saved undo list was deleted. The changes stay in Windows; you can still switch \
+             items back on these pages."
+                .to_string(),
+        );
+    }
+
+    /// What is kept, where, and the "Delete saved undo" button. Shown under Undo on every page.
+    fn saved_undo_panel(&mut self, ui: &mut egui::Ui) {
+        style::note(ui, SAVED_NOTE);
+        style::note(ui, &self.saved.store.dir().display().to_string());
+        style::note(ui, REFUSE_NOTE);
+        for line in [&self.saved.note, &self.saved.error].into_iter().flatten() {
+            ui.add(egui::Label::new(RichText::new(line).small().color(AMBER)).wrap());
+        }
+        let busy = self.admin_pending.is_some()
+            || self.tasks.working.is_some()
+            || self.services.working.is_some()
+            || self.apps.removing.is_some();
+        let anything =
+            !self.undo_list().is_empty() || self.saved.paused || self.saved.note.is_some();
+        if busy || !anything {
+            self.saved.confirming = false;
+        }
+        if self.saved.confirming {
+            ui.label(
+                "Delete the saved undo list? The changes stay in Windows, but Debloater can no \
+                 longer undo them.",
+            );
+            ui.horizontal(|ui| {
+                if ui.add(style::primary_button("Delete")).clicked() {
+                    self.delete_saved_undo();
+                }
+                if ui.button("Cancel").clicked() {
+                    self.saved.confirming = false;
+                }
+            });
+        } else if ui
+            .add_enabled(anything && !busy, egui::Button::new("Delete saved undo"))
+            .clicked()
+        {
+            self.saved.confirming = true;
+        }
     }
 }
 
@@ -739,16 +968,31 @@ fn summarize(run: &plan::Run) -> String {
     )
 }
 
-fn undo_summary(total: usize, failed: usize) -> String {
-    if failed == 0 {
-        format!("Restored {}.", plural(total, "setting", "settings"))
+/// The reasons refused undo steps were left alone, after a summary line.
+fn with_refused(line: String, refused: &[String]) -> String {
+    if refused.is_empty() {
+        line
     } else {
+        format!("{line} Left alone: {}", refused.join(" "))
+    }
+}
+
+fn undo_summary(total: usize, failed: usize, refused: &[String]) -> String {
+    let done = total.saturating_sub(failed + refused.len());
+    let line = if failed == 0 && refused.is_empty() {
+        format!("Restored {}.", plural(total, "setting", "settings"))
+    } else if failed == 0 {
         format!(
-            "Restored {} of {}, {failed} failed. Undo is still available.",
-            total - failed,
+            "Restored {done} of {}.",
             plural(total, "setting", "settings")
         )
-    }
+    } else {
+        format!(
+            "Restored {done} of {}, {failed} failed. Undo is still available.",
+            plural(total, "setting", "settings")
+        )
+    };
+    with_refused(line, refused)
 }
 
 fn title_of(id: &str) -> String {
@@ -783,9 +1027,14 @@ fn hive_text(hive: Hive) -> &'static str {
 }
 
 /// A plain text list of what to put back by hand: item, setting path, previous value.
-fn undo_text(runs: &[Vec<plan::UndoOp>]) -> String {
+fn undo_text(runs: &[Vec<RegStep>]) -> String {
     let mut out = String::from("toolboks undo steps\n");
-    for op in runs.iter().rev().flat_map(|steps| steps.iter().rev()) {
+    for op in runs
+        .iter()
+        .rev()
+        .flat_map(|steps| steps.iter().rev())
+        .map(|step| &step.step)
+    {
         let previous = match &op.previous {
             Some(RegValue::Dword(v)) => format!("number {v}"),
             Some(RegValue::Sz(s)) => format!("text \"{s}\""),
@@ -872,6 +1121,17 @@ impl Debloater {
                                 rows.iter()
                                     .any(|r| r.entry.id == *id && r.installed.is_some())
                             });
+                            // An app that is installed again no longer needs its reminder.
+                            let installed = |id: &str| {
+                                rows.iter()
+                                    .any(|r| r.entry.id == id && r.installed.is_some())
+                            };
+                            if saved_undo::forget_reinstalled(
+                                &mut self.saved.removed_apps,
+                                installed,
+                            ) {
+                                self.save_undo();
+                            }
                         }
                         Err(e) => self.apps.error = Some(e),
                     }
@@ -888,6 +1148,10 @@ impl Debloater {
                 Ok(run) => {
                     self.apps.removing = None;
                     self.apps.message = Some(app_summary(&run, app_title));
+                    // Only the catalog id is kept: enough to say which app to get back.
+                    if saved_undo::record_removed(&mut self.saved.removed_apps, &run) {
+                        self.save_undo();
+                    }
                     self.apps.last_run = Some(run);
                     self.apps.selected.clear();
                     self.apps.started = false; // reload right away
@@ -1042,6 +1306,16 @@ impl Debloater {
         }
 
         style::divider(ui);
+        if !self.saved.removed_apps.is_empty() {
+            style::panel_heading(ui, "Removed by Debloater");
+            for id in &self.saved.removed_apps {
+                ui.label(app_title(id));
+            }
+            style::note(
+                ui,
+                "To get one back, open the Microsoft Store, search for its name and install it.",
+            );
+        }
         if ui
             .link(RichText::new("Open Microsoft Store").small())
             .clicked()
@@ -1049,14 +1323,16 @@ impl Debloater {
             open_store();
         }
         style::note(ui, REINSTALL_NOTE);
+        style::divider(ui);
+        style::panel_heading(ui, "Undo");
+        self.saved_undo_panel(ui);
     }
 }
 
 const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 const NEVER_TIP: &str = "Security and system items cannot be changed here";
-const STARTUP_NOTE: &str = "Changes are the same switch Task Manager uses. Undo works until you \
-                            close toolboks; you can always switch an app back on here or in \
-                            Task Manager.";
+const STARTUP_NOTE: &str = "Changes are the same switch Task Manager uses. You can always switch \
+                            an app back on here or in Task Manager.";
 
 /// Windows FILETIME (100 ns ticks since 1601) for a point in time.
 fn filetime_at(time: std::time::SystemTime) -> u64 {
@@ -1128,30 +1404,22 @@ fn confirm_off_text(entry: &Entry) -> String {
 }
 
 /// Undoes steps newest first through `undo_one`: the last one only, or all. Steps that fail stay
-/// in the list (original order). Returns (undone, failed).
-fn run_undo<T, K: Eq + std::hash::Hash>(
+/// in the list (original order); refused steps are dropped. Returns (undone, failed, why each
+/// refused step was left alone).
+fn run_undo<T, K: PartialEq>(
     steps: &mut Vec<T>,
     all: bool,
     key_of: impl Fn(&T) -> K,
-    mut undo_one: impl FnMut(&T) -> Result<(), String>,
-) -> (usize, usize) {
+    undo_one: impl FnMut(&T) -> StepResult,
+) -> (usize, usize, Vec<String>) {
     let take = if all { steps.len() } else { steps.len().min(1) };
     let batch: Vec<T> = steps.split_off(steps.len() - take);
-    let (mut done, mut kept) = (0, Vec::new());
-    let mut blocked = std::collections::HashSet::new();
-    for step in batch.into_iter().rev() {
-        let key = key_of(&step);
-        if !blocked.contains(&key) && undo_one(&step).is_ok() {
-            done += 1;
-        } else {
-            blocked.insert(key);
-            kept.push(step);
-        }
-    }
+    let tally = saved_undo::undo_steps(batch.into_iter().rev().collect(), key_of, undo_one);
+    let mut kept = tally.kept;
     kept.reverse();
     let failed = kept.len();
     steps.extend(kept);
-    (done, failed)
+    (tally.done, failed, tally.refused)
 }
 
 /// How far back the boot log is read for the Startup page.
@@ -1219,12 +1487,15 @@ fn startup_cost_sentence(
     }
 }
 
-fn startup_undo_summary(done: usize, failed: usize) -> String {
-    if failed == 0 {
-        format!("Undid {}.", plural(done, "change", "changes"))
+fn startup_undo_summary(done: usize, failed: usize, refused: &[String]) -> String {
+    let line = if failed > 0 {
+        format!("Undid {done}, {failed} failed. They stay in the undo list.")
+    } else if done == 0 && !refused.is_empty() {
+        "Nothing was undone.".to_string()
     } else {
-        format!("Undid {done}, {failed} failed. They stay in the undo list.",)
-    }
+        format!("Undid {}.", plural(done, "change", "changes"))
+    };
+    with_refused(line, refused)
 }
 
 impl Debloater {
@@ -1317,7 +1588,9 @@ impl Debloater {
         let result = startup::set_enabled(&mut startup::WinStartup, entry, enable, filetime_now());
         self.startup.message = Some(match result {
             Ok(step) => {
-                self.startup.steps.push(step);
+                self.startup
+                    .steps
+                    .push(saved_undo::startup_done(step, enable));
                 format!(
                     "{} is now {}.",
                     entry.name,
@@ -1326,10 +1599,13 @@ impl Debloater {
             }
             Err(e) => {
                 let message = format!("Could not change {}: {e}", entry.name);
-                self.startup.steps.extend(e.recovery);
+                self.startup
+                    .steps
+                    .extend(e.recovery.map(saved_undo::recovery));
                 message
             }
         });
+        self.save_undo();
         self.startup.started = false;
     }
 
@@ -1345,25 +1621,49 @@ impl Debloater {
             self.startup.steps.len().min(1)
         };
         let from = self.startup.steps.len() - take;
+        // A step whose entry is gone (the app was uninstalled) is dropped with the reason before
+        // anything is sent, so it can never block the undo of the others, also after a restart.
+        // If the list cannot be read, nothing is dropped and the undo itself checks each entry.
+        let dropped = match startup::WinStartup.list() {
+            Ok(entries) => saved_undo::drop_gone_startup(&mut self.startup.steps, from, |step| {
+                entries
+                    .iter()
+                    .any(|e| e.source == step.step.source && e.name == step.step.name)
+            }),
+            Err(_) => Vec::new(),
+        };
+        if self.startup.steps.len() == from {
+            if !dropped.is_empty() {
+                self.startup.message = Some(startup_undo_summary(0, 0, &dropped));
+                self.save_undo();
+            }
+            self.startup.pending = None;
+            self.startup.started = false;
+            return;
+        }
         if self.startup.steps[from..]
             .iter()
-            .any(|step| step.source.needs_admin())
+            .any(|step| step.step.source.needs_admin())
         {
             let mut batch = self.startup.steps.split_off(from);
             batch.reverse();
             let request = admin::startup_undo_request(&batch);
             self.startup_batch = batch;
             self.startup_rest = std::mem::take(&mut self.startup.steps);
+            self.startup_dropped = dropped;
             self.send_admin(AdminKind::StartupUndo, request);
             return;
         }
-        let (done, failed) = run_undo(
+        let (done, failed, refused) = run_undo(
             &mut self.startup.steps,
             all,
-            |step| (step.source, step.name.clone()),
-            |step| startup::undo(&mut startup::WinStartup, step),
+            |step| (step.step.source, step.step.name.clone()),
+            |step| saved_undo::undo_startup(step, &mut startup::WinStartup),
         );
-        self.startup.message = Some(startup_undo_summary(done, failed));
+        let mut reasons = dropped;
+        reasons.extend(refused);
+        self.startup.message = Some(startup_undo_summary(done, failed, &reasons));
+        self.save_undo();
         self.startup.pending = None;
         self.startup.started = false;
     }
@@ -1557,7 +1857,7 @@ impl Debloater {
         style::divider(ui);
         style::panel_heading(ui, "Undo");
         let count = self.startup.steps.len();
-        ui.label(plural(count, "change this session", "changes this session"));
+        ui.label(plural(count, "change to undo", "changes to undo"));
         let has = count > 0;
         ui.horizontal(|ui| {
             if ui
@@ -1571,17 +1871,16 @@ impl Debloater {
             }
         });
         if has && ui.link(RichText::new("Copy undo steps").small()).clicked() {
-            ctx.copy_text(startup::undo_text(&self.startup.steps));
+            ctx.copy_text(startup::undo_text(&plain(&self.startup.steps)));
         }
         style::note(ui, STARTUP_NOTE);
+        self.saved_undo_panel(ui);
     }
 }
 
 const TASKS_NEVER_NOTE: &str =
     "Update, security, repair and system maintenance tasks are never offered.";
-const TASKS_NOTE: &str =
-    "Switching a task off only pauses it. Undo works until you close toolboks; \
-                          you can switch it back on here.";
+const TASKS_NOTE: &str = "Switching a task off only pauses it. You can switch it back on here.";
 
 /// Text for the small state column of a task row.
 fn task_state_text(state: &TaskState) -> &'static str {
@@ -1679,12 +1978,14 @@ impl Debloater {
                 match result {
                     Ok(step) => {
                         let now = if step.was_enabled { "off" } else { "on" };
-                        self.tasks.steps.push(step);
+                        self.tasks.steps.push(saved_undo::task_done(step));
                         format!("{title} is now {now}.")
                     }
                     Err(e) => {
                         let message = format!("Could not change {title}: {e}");
-                        self.tasks.steps.extend(e.recovery);
+                        self.tasks
+                            .steps
+                            .extend(e.recovery.map(saved_undo::recovery));
                         message
                     }
                 }
@@ -1693,12 +1994,14 @@ impl Debloater {
                 remaining,
                 done,
                 failed,
+                refused,
             }) => {
                 self.tasks.steps = remaining;
-                startup_undo_summary(done, failed)
+                startup_undo_summary(done, failed, &refused)
             }
             None => "The change stopped unexpectedly.".to_string(),
         });
+        self.save_undo();
     }
 
     fn tasks_set(&mut self, _ctx: &egui::Context, def: TaskDef, enable: bool) {
@@ -1728,10 +2031,10 @@ impl Debloater {
         run_undo(
             &mut steps,
             all,
-            |step| step.path,
-            |s: &tasks::UndoStep| {
+            |step| step.step.path,
+            |s| {
                 batch.push(s.clone());
-                Ok(())
+                StepResult::Done
             },
         );
         if batch.is_empty() {
@@ -1918,7 +2221,7 @@ impl Debloater {
             style::note(ui, "Working...");
         }
         let count = self.tasks.steps.len();
-        ui.label(plural(count, "change this session", "changes this session"));
+        ui.label(plural(count, "change to undo", "changes to undo"));
         let has = count > 0 && !working;
         ui.horizontal(|ui| {
             if ui
@@ -1932,9 +2235,10 @@ impl Debloater {
             }
         });
         if count > 0 && ui.link(RichText::new("Copy undo steps").small()).clicked() {
-            ctx.copy_text(tasks::undo_text(&self.tasks.steps));
+            ctx.copy_text(tasks::undo_text(&plain(&self.tasks.steps)));
         }
         style::note(ui, TASKS_NOTE);
+        self.saved_undo_panel(ui);
     }
 }
 
@@ -1945,7 +2249,7 @@ const SERVICES_CAREFUL_NOTE: &str =
 const SERVICES_TAKES_EFFECT: &str =
     "This takes effect when Windows restarts or the service stops. \
                                      toolboks never stops a running service.";
-const SERVICES_NOTE: &str = "Undo works until you close toolboks.";
+const SERVICES_NOTE: &str = "You can also change a service back in Services in Windows.";
 const SERVICES_CHANGED_TIP: &str = "Use Undo, or Services in Windows, to change it back";
 
 /// Text for the small start type column of a service row.
@@ -2014,19 +2318,24 @@ fn group_services(rows: &[ServiceRow]) -> [Vec<&ServiceRow>; 2] {
 /// Undoes the newest step of one service. A step that fails stays in the list.
 /// Returns (undone, failed).
 fn undo_for_id(
-    steps: &mut Vec<services::UndoStep>,
+    steps: &mut Vec<ServiceStep>,
     id: &str,
-    undo_one: impl FnOnce(&services::UndoStep) -> Result<(), String>,
+    undo_one: impl FnOnce(&ServiceStep) -> StepResult,
 ) -> (usize, usize) {
-    let Some(index) = steps.iter().rposition(|s| s.id == id) else {
+    let Some(index) = steps.iter().rposition(|s| s.step.id == id) else {
         return (0, 0);
     };
-    if undo_one(&steps[index]).is_ok() {
+    if undo_one(&steps[index]) == StepResult::Done {
         steps.remove(index);
         (1, 0)
     } else {
         (0, 1)
     }
+}
+
+/// The engine's own steps, for its "Copy undo steps" text.
+fn plain<T: Clone, V>(steps: &[saved_undo::Tracked<T, V>]) -> Vec<T> {
+    steps.iter().map(|s| s.step.clone()).collect()
 }
 
 impl Debloater {
@@ -2077,12 +2386,14 @@ impl Debloater {
                 }
                 match result {
                     Ok(step) => {
-                        self.services.steps.push(step);
+                        self.services.steps.push(saved_undo::service_done(step));
                         format!("{title} is now switched off.")
                     }
                     Err(e) => {
                         let message = format!("Could not change {title}: {e}");
-                        self.services.steps.extend(e.recovery);
+                        self.services
+                            .steps
+                            .extend(e.recovery.map(saved_undo::recovery));
                         message
                     }
                 }
@@ -2091,12 +2402,14 @@ impl Debloater {
                 remaining,
                 done,
                 failed,
+                refused,
             }) => {
                 self.services.steps = remaining;
-                startup_undo_summary(done, failed)
+                startup_undo_summary(done, failed, &refused)
             }
             None => "The change stopped unexpectedly.".to_string(),
         });
+        self.save_undo();
     }
 
     fn services_set_off(&mut self, _ctx: &egui::Context, def: ServiceDef) {
@@ -2125,16 +2438,16 @@ impl Debloater {
         }
         let mut steps = std::mem::take(&mut self.services.steps);
         let mut batch = Vec::new();
-        let mut pick = |s: &services::UndoStep| {
+        let mut pick = |s: &ServiceStep| {
             batch.push(s.clone());
-            Ok(())
+            StepResult::Done
         };
         match only {
             Some(id) => {
                 undo_for_id(&mut steps, id, &mut pick);
             }
             None => {
-                run_undo(&mut steps, all, |step| step.name, &mut pick);
+                run_undo(&mut steps, all, |step| step.step.name, &mut pick);
             }
         }
         if batch.is_empty() {
@@ -2231,7 +2544,7 @@ impl Debloater {
         let focused = self.services.focus == Some(def.id);
         let switchable = service_switchable(state);
         let on = service_on(def, state);
-        let has_step = self.services.steps.iter().any(|s| s.id == def.id);
+        let has_step = self.services.steps.iter().any(|s| s.step.id == def.id);
         let can_revert = on || has_step;
         let usable = switchable && !self.services_busy() && can_revert;
 
@@ -2332,7 +2645,7 @@ impl Debloater {
             style::note(ui, "Working...");
         }
         let count = self.services.steps.len();
-        ui.label(plural(count, "change this session", "changes this session"));
+        ui.label(plural(count, "change to undo", "changes to undo"));
         let has = count > 0 && !working;
         ui.horizontal(|ui| {
             if ui
@@ -2346,9 +2659,10 @@ impl Debloater {
             }
         });
         if count > 0 && ui.link(RichText::new("Copy undo steps").small()).clicked() {
-            ctx.copy_text(services::undo_text(&self.services.steps));
+            ctx.copy_text(services::undo_text(&plain(&self.services.steps)));
         }
         style::note(ui, SERVICES_NOTE);
+        self.saved_undo_panel(ui);
     }
 }
 
@@ -2428,15 +2742,15 @@ mod tests {
             was_enabled: true,
         };
         let mut steps = vec![step("a"), step("b")];
-        let (done, failed) = run_undo(
+        let (done, failed, _) = run_undo(
             &mut steps,
             true,
             |step| step.path,
             |s| {
                 if s.id == "a" {
-                    Err("no".into())
+                    StepResult::Failed("no".into())
                 } else {
-                    Ok(())
+                    StepResult::Done
                 }
             },
         );
@@ -2602,8 +2916,13 @@ mod tests {
             &entry("x", Class::Suggest, Source::UserRun),
             false
         ));
-        assert_eq!(startup_undo_summary(2, 0), "Undid 2 changes.");
-        assert!(startup_undo_summary(2, 1).starts_with("Undid 2, 1 failed"));
+        assert_eq!(startup_undo_summary(2, 0, &[]), "Undid 2 changes.");
+        assert!(startup_undo_summary(2, 1, &[]).starts_with("Undid 2, 1 failed"));
+        let refused = ["Foo was changed by something else.".to_string()];
+        assert_eq!(
+            startup_undo_summary(0, 0, &refused),
+            "Nothing was undone. Left alone: Foo was changed by something else."
+        );
     }
 
     #[test]
@@ -2623,16 +2942,16 @@ mod tests {
         };
         let mut steps = vec![step("a"), step("b"), step("c")];
         let mut order = Vec::new();
-        let (done, failed) = run_undo(
+        let (done, failed, _) = run_undo(
             &mut steps,
             true,
             |step| step.name.clone(),
             |s| {
                 order.push(s.name.clone());
                 if s.name == "b" {
-                    Err("no".into())
+                    StepResult::Failed("no".into())
                 } else {
-                    Ok(())
+                    StepResult::Done
                 }
             },
         );
@@ -2642,13 +2961,40 @@ mod tests {
         assert_eq!(steps[0].name, "b");
 
         let mut steps = vec![step("a"), step("b")];
-        let (done, failed) = run_undo(&mut steps, false, |step| step.name.clone(), |_| Ok(()));
+        let (done, failed, _) = run_undo(
+            &mut steps,
+            false,
+            |step| step.name.clone(),
+            |_| StepResult::Done,
+        );
         assert_eq!((done, failed), (1, 0));
         assert_eq!(steps[0].name, "a");
         assert_eq!(
-            run_undo(&mut Vec::<u8>::new(), true, |step| *step, |_| Ok(())),
-            (0, 0)
+            run_undo(
+                &mut Vec::<u8>::new(),
+                true,
+                |step| *step,
+                |_| StepResult::Done
+            ),
+            (0, 0, Vec::new())
         );
+
+        // A refused step leaves the list with its reason; the others are undone.
+        let mut steps = vec![step("a"), step("b")];
+        let (done, failed, refused) = run_undo(
+            &mut steps,
+            true,
+            |step| step.name.clone(),
+            |s| match s.name.as_str() {
+                "b" => StepResult::Refused("b was changed".into()),
+                _ => StepResult::Done,
+            },
+        );
+        assert_eq!(
+            (done, failed, refused),
+            (1, 0, vec!["b was changed".to_string()])
+        );
+        assert!(steps.is_empty());
     }
 
     #[test]
@@ -2664,16 +3010,16 @@ mod tests {
             step("App", Some(vec![2])),
         ];
         let mut attempted = Vec::new();
-        let (done, failed) = run_undo(
+        let (done, failed, _) = run_undo(
             &mut steps,
             true,
             |s| (s.source, s.name.clone()),
             |s| {
                 attempted.push(s.name.clone());
                 if s.name == "App" {
-                    Err("Windows rejected the restore".into())
+                    StepResult::Failed("Windows rejected the restore".into())
                 } else {
-                    Ok(())
+                    StepResult::Done
                 }
             },
         );
@@ -2683,8 +3029,13 @@ mod tests {
         assert_eq!(steps[0].previous, None);
         assert_eq!(steps[1].previous, Some(vec![2]));
         assert_eq!(
-            run_undo(&mut steps, true, |s| (s.source, s.name.clone()), |_| Ok(())),
-            (2, 0)
+            run_undo(
+                &mut steps,
+                true,
+                |s| (s.source, s.name.clone()),
+                |_| StepResult::Done
+            ),
+            (2, 0, Vec::new())
         );
     }
 
@@ -2784,28 +3135,33 @@ mod tests {
 
     #[test]
     fn undo_summary_wording() {
-        assert_eq!(undo_summary(3, 0), "Restored 3 settings.");
-        assert_eq!(undo_summary(1, 0), "Restored 1 setting.");
-        assert!(undo_summary(3, 1).starts_with("Restored 2 of 3 settings, 1 failed"));
+        assert_eq!(undo_summary(3, 0, &[]), "Restored 3 settings.");
+        assert_eq!(undo_summary(1, 0, &[]), "Restored 1 setting.");
+        assert!(undo_summary(3, 1, &[]).starts_with("Restored 2 of 3 settings, 1 failed"));
+        let refused = ["Ads was changed by something else.".to_string()];
+        assert_eq!(
+            undo_summary(3, 0, &refused),
+            "Restored 2 of 3 settings. Left alone: Ads was changed by something else."
+        );
     }
 
     #[test]
     fn undo_text_lists_previous_values() {
         let runs = [
-            vec![plan::UndoOp {
+            vec![saved_undo::recovery(plan::UndoOp {
                 id: "unknown-id",
                 hive: Hive::CurrentUser,
                 path: r"Software\T",
                 name: "A",
                 previous: Some(RegValue::Dword(1)),
-            }],
-            vec![plan::UndoOp {
+            })],
+            vec![saved_undo::recovery(plan::UndoOp {
                 id: "unknown-id",
                 hive: Hive::LocalMachine,
                 path: r"Software\T",
                 name: "B",
                 previous: None,
-            }],
+            })],
         ];
         let text = undo_text(&runs);
         assert!(text.contains("unknown-id"));
@@ -2920,23 +3276,129 @@ mod tests {
     #[test]
     fn undo_for_id_takes_newest_matching_step() {
         use services::StartType::*;
-        let step = |id: &'static str, previous| services::UndoStep {
-            id,
-            name: id,
-            previous,
+        let step = |id: &'static str, previous| {
+            saved_undo::recovery(services::UndoStep {
+                id,
+                name: id,
+                previous,
+            })
         };
         let mut steps = vec![step("a", Auto), step("b", Auto), step("a", Manual)];
         let mut seen = None;
         let r = undo_for_id(&mut steps, "a", |s| {
-            seen = Some(s.previous);
-            Ok(())
+            seen = Some(s.step.previous);
+            StepResult::Done
         });
         assert_eq!(r, (1, 0));
         assert_eq!(seen, Some(Manual));
         assert_eq!(steps.len(), 2);
-        assert_eq!(undo_for_id(&mut steps, "b", |_| Err("no".into())), (0, 1));
+        assert_eq!(
+            undo_for_id(&mut steps, "b", |_| StepResult::Failed("no".into())),
+            (0, 1)
+        );
         assert_eq!(steps.len(), 2);
-        assert_eq!(undo_for_id(&mut steps, "zzz", |_| Ok(())), (0, 0));
+        assert_eq!(undo_for_id(&mut steps, "zzz", |_| StepResult::Done), (0, 0));
+    }
+
+    fn page_with_store(dir: &std::path::Path) -> Debloater {
+        Debloater {
+            saved: crate::SavedState::new(dir.to_path_buf()),
+            ..Debloater::default()
+        }
+    }
+
+    #[test]
+    fn the_page_never_overwrites_a_newer_list_and_reloads_its_own_after_a_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolboks-debloater-page-undo-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("undo.jsonl");
+        let newer: &[u8] = b"{\"format\":\"toolboks.debloater.undo\",\"version\":9}\n{}";
+        std::fs::write(&file, newer).unwrap();
+
+        let mut page = page_with_store(&dir);
+        page.load_saved_undo();
+        assert!(page.saved.paused);
+        assert!(page
+            .saved
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("newer version"));
+        page.saved.removed_apps.push("clipchamp");
+        page.save_undo();
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            newer,
+            "a newer list was replaced"
+        );
+
+        // "Delete saved undo" removes it and saving works again.
+        page.delete_saved_undo();
+        assert!(!file.exists());
+        assert!(page.saved.removed_apps.is_empty() && !page.saved.paused);
+        page.saved.removed_apps.push("clipchamp");
+        page.save_undo();
+        assert!(file.exists());
+
+        // A new process, before its first draw: a save reads the file first, never replaces it.
+        let mut again = page_with_store(&dir);
+        let task = tasks::catalog().first().unwrap();
+        again
+            .tasks
+            .steps
+            .push(saved_undo::task_done(tasks::UndoStep {
+                id: task.id,
+                path: task.path,
+                was_enabled: true,
+            }));
+        again.save_undo();
+        let mut third = page_with_store(&dir);
+        third.load_saved_undo();
+        assert_eq!(third.saved.removed_apps, vec!["clipchamp"]);
+        assert_eq!(third.tasks.steps.len(), 1);
+        assert!(third.saved.note.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_list_that_stayed_in_place_is_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolboks-debloater-page-damaged-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("undo.jsonl");
+        std::fs::write(&file, b"damaged").unwrap();
+
+        let mut page = page_with_store(&dir);
+        page.use_loaded(saved_undo::Loaded::Damaged {
+            reason: "its header cannot be read".into(),
+            kept: false,
+        });
+        assert!(page.saved.paused);
+        assert!(page
+            .saved
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("could not be moved aside"));
+        page.saved.removed_apps.push("clipchamp");
+        page.save_undo();
+        assert_eq!(std::fs::read(&file).unwrap(), b"damaged");
+
+        // Moved aside: saving goes on.
+        let mut moved = page_with_store(&dir);
+        moved.use_loaded(saved_undo::Loaded::Damaged {
+            reason: "its header cannot be read".into(),
+            kept: true,
+        });
+        assert!(!moved.saved.paused);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

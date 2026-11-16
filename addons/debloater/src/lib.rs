@@ -1,5 +1,6 @@
-//! The Debloater tool: turn off Windows ads, suggestions and tracking toggles. State lives in
-//! memory only; the page always reads the real state from Windows.
+//! The Debloater tool: turn off Windows ads, suggestions and tracking toggles. The page always
+//! reads the real state from Windows. The only thing written to disk is the undo list
+//! (`saved_undo`), so changes can be undone after Toolboks closes.
 
 // model::Group::Apps is not constructed anywhere yet; drop this once the curated list is used.
 
@@ -17,8 +18,11 @@ pub use toolboks_debloat_engine::{
 
 mod admin;
 mod page;
+mod saved_undo;
 mod style;
 mod tutorial;
+
+use saved_undo::{RegStep, ServiceStep, StartupStep, TaskStep};
 
 /// What an administrator request that is waiting for its answer was for.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,8 +71,8 @@ struct StartupState {
     focus: Option<(startup::Source, String)>,
     /// A Careful entry waiting for the inline "Switch off?" confirm.
     pending: Option<(startup::Source, String)>,
-    /// Changes of this session, oldest first.
-    steps: Vec<startup::UndoStep>,
+    /// Changes that can be undone, oldest first (saved, so they survive a restart).
+    steps: Vec<StartupStep>,
     message: Option<String>,
 }
 
@@ -109,11 +113,12 @@ enum TaskJob {
         Result<tasks::UndoStep, ChangeError<tasks::UndoStep>>,
         Option<restore::RestoreStatus>,
     ),
-    /// Undo ran; the steps that failed come back with the counts.
+    /// Undo ran; the steps that failed come back with the counts and the refusal reasons.
     Undo {
-        remaining: Vec<tasks::UndoStep>,
+        remaining: Vec<TaskStep>,
         done: usize,
         failed: usize,
+        refused: Vec<String>,
     },
 }
 
@@ -130,8 +135,8 @@ struct TasksState {
     focus: Option<&'static str>,
     /// A Careful task waiting for the inline "Switch off?" confirm.
     pending: Option<&'static str>,
-    /// Changes of this session, oldest first.
-    steps: Vec<tasks::UndoStep>,
+    /// Changes that can be undone, oldest first (saved, so they survive a restart).
+    steps: Vec<TaskStep>,
     message: Option<String>,
 }
 
@@ -143,11 +148,12 @@ enum ServiceJob {
         Result<services::UndoStep, ChangeError<services::UndoStep>>,
         Option<restore::RestoreStatus>,
     ),
-    /// Undo ran; the steps that failed come back with the counts.
+    /// Undo ran; the steps that failed come back with the counts and the refusal reasons.
     Undo {
-        remaining: Vec<services::UndoStep>,
+        remaining: Vec<ServiceStep>,
         done: usize,
         failed: usize,
+        refused: Vec<String>,
     },
 }
 
@@ -164,8 +170,8 @@ struct ServicesState {
     focus: Option<&'static str>,
     /// A service waiting for the inline "Switch off?" confirm.
     pending: Option<&'static str>,
-    /// Changes of this session, oldest first.
-    steps: Vec<services::UndoStep>,
+    /// Changes that can be undone, oldest first (saved, so they survive a restart).
+    steps: Vec<ServiceStep>,
     message: Option<String>,
 }
 
@@ -178,7 +184,7 @@ pub struct Debloater {
     /// The item shown in "About this item".
     focus: Option<&'static str>,
     /// Registry undo steps grouped by apply run, oldest first.
-    undo_runs: Vec<Vec<plan::UndoOp>>,
+    undo_runs: Vec<Vec<RegStep>>,
     message: Option<String>,
     /// Plain-words lines for items of the last run that did not fully work.
     run_notes: Vec<String>,
@@ -206,14 +212,53 @@ pub struct Debloater {
     pending_title: String,
     /// An undo that is waiting for the helper: the steps it was asked to undo (newest first) and the
     /// steps that were left alone (oldest first).
-    service_batch: Vec<services::UndoStep>,
-    service_rest: Vec<services::UndoStep>,
-    task_batch: Vec<tasks::UndoStep>,
-    task_rest: Vec<tasks::UndoStep>,
-    startup_batch: Vec<startup::UndoStep>,
-    startup_rest: Vec<startup::UndoStep>,
+    service_batch: Vec<ServiceStep>,
+    service_rest: Vec<ServiceStep>,
+    task_batch: Vec<TaskStep>,
+    task_rest: Vec<TaskStep>,
+    startup_batch: Vec<StartupStep>,
+    startup_rest: Vec<StartupStep>,
     /// The title of the startup item a pending set request is about, and what was asked.
     pending_startup: Option<(String, bool)>,
+    /// Why startup steps were dropped (entry gone) before a pending undo request was sent.
+    startup_dropped: Vec<String>,
+    /// The saved undo list on disk.
+    saved: SavedState,
+}
+
+/// The saved undo list: where it lives and what happened to it.
+struct SavedState {
+    store: saved_undo::UndoStore,
+    /// The file was read (once, on the first draw).
+    loaded: bool,
+    /// Writing is paused: the file on disk is from a newer Debloater or could not be read, and is
+    /// never overwritten. "Delete saved undo" ends the pause.
+    paused: bool,
+    /// Plain words about what was found on disk (damaged, newer, unreadable entries).
+    note: Option<String>,
+    /// The last save failed; undo still works until Toolboks closes.
+    error: Option<String>,
+    /// Catalog ids of apps Debloater removed (they come back from the Microsoft Store).
+    removed_apps: Vec<&'static str>,
+    /// Saved entries this version could not read; written back unchanged, never used.
+    unreadable: Vec<serde_json::Value>,
+    /// The inline "Delete saved undo?" confirm is open.
+    confirming: bool,
+}
+
+impl SavedState {
+    fn new(dir: std::path::PathBuf) -> Self {
+        Self {
+            store: saved_undo::UndoStore::new(dir),
+            loaded: false,
+            paused: false,
+            note: None,
+            error: None,
+            removed_apps: Vec::new(),
+            unreadable: Vec::new(),
+            confirming: false,
+        }
+    }
 }
 
 impl Debloater {
@@ -248,6 +293,8 @@ impl Debloater {
             startup_batch: Vec::new(),
             startup_rest: Vec::new(),
             pending_startup: None,
+            startup_dropped: Vec::new(),
+            saved: SavedState::new(saved_undo::UndoStore::default_dir()),
         }
     }
 }
@@ -303,7 +350,7 @@ impl NativeAddon for Debloater {
     fn has_background_work(&self) -> bool {
         self.admin_pending.is_some()
     }
-    /// Drops what was read from Windows. Results and undo steps of this session stay in memory.
+    /// Drops what was read from Windows. Results and undo steps stay (the undo list is also saved).
     fn suspend(&mut self) {
         self.statuses = Vec::new();
         self.loaded = false;

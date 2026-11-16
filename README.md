@@ -289,6 +289,18 @@ for registry locations the catalog itself lists.
 
 All families are now done, so nothing in the Debloater is listed as unavailable any more.
 
+**Saved undo list (#81, decision Gusseti/toolboks#52).** Undo survives closing Toolboks and a
+restart: after every change and every undo the add-on rewrites `undo/undo.jsonl` in its own data
+folder (`addon-data/toolboks.debloater/`, so "delete my data" removes it), as a temp file renamed
+over the old one. The file has a header line (format, version, length, checksum) and a body with
+only what undo needs: each previous registry value, service start type, task switch and startup
+approval, what Debloater set it to, and the catalog ids of removed apps (they come back from the
+Microsoft Store). A damaged file is moved to `undo-damaged-1.jsonl` (the three newest are kept) and not used, and if it cannot be moved, saving pauses so it is never replaced; a file from a newer
+Debloater is left untouched and not overwritten; an entry for an item this version no longer
+offers is kept but not used. An undo whose item something else changed since, or whose startup
+entry is gone, is refused with the reason and leaves the list, in the add-on and in the helper. Every page shows what is kept and where, with a "Delete
+saved undo" button.
+
 Real UAC validation of the new operations has not been done; the owner chose to test on use and
 report anything found.
 

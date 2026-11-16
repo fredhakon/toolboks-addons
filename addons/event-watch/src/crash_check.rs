@@ -3,12 +3,12 @@
 //! no clock reads, no I/O.
 //!
 //! `Reading` has exactly the fields of the host's `Finding` (docs/PLAN-health.md section 1), so
-//! the hookup after the host release is one conversion. Until then nothing sends it.
-#![allow(dead_code)]
+//! it becomes one with [`Reading::finding`]. `crash_watch` runs it in the background.
 
 use super::analysis::{detect_crashes, ms_to_text, DEFAULT_WINDOW_MS};
 use super::bugchecks;
 use super::model::{CrashKind, Event};
+use toolboks_addon_sdk::{Finding, Severity as FindingSeverity};
 
 /// The finding's id. Stable across runs.
 pub const ID: &str = "recent-crashes";
@@ -61,6 +61,33 @@ pub struct Reading {
     pub action: Option<Action>,
 }
 
+impl Reading {
+    /// The SDK finding for this reading, with its own time and staleness kept.
+    pub fn finding(&self) -> Finding {
+        let (title, text) = (self.title.as_str(), self.observation.as_str());
+        let finding = match (self.status, self.severity) {
+            (Status::Ok, _) => Finding::ok(self.id, title, text),
+            (Status::Attention, severity) => Finding::attention(
+                self.id,
+                title,
+                text,
+                match severity {
+                    Severity::Watch => FindingSeverity::Watch,
+                    Severity::Problem => FindingSeverity::Problem,
+                },
+            ),
+            (Status::NotChecked, _) => Finding::not_checked(self.id, title, text),
+            (Status::Unavailable, _) => Finding::unavailable(self.id, title, text),
+        }
+        .measured_at(self.measured_at)
+        .stale_after(self.stale_after_secs);
+        match &self.action {
+            Some(Action::OpenPage { label, route }) => finding.open_page(label, route),
+            None => finding,
+        }
+    }
+}
+
 /// What the add-on has of the event log right now.
 #[derive(Clone, Copy, Debug)]
 pub enum Input<'a> {
@@ -70,6 +97,14 @@ pub enum Input<'a> {
     Unreadable(&'a str),
     /// Events from the System log (any order, any span; older ones are ignored here).
     Events(&'a [Event]),
+}
+
+/// Start of the window the check looks at, ms since 1970, for a check made at `now_secs`.
+pub fn since_ms(now_secs: u64) -> i64 {
+    i64::try_from(now_secs)
+        .unwrap_or(i64::MAX / 1000)
+        .saturating_mul(1000)
+        .saturating_sub(WINDOW_MS)
 }
 
 /// Reading for `input` at `now_secs` (Unix seconds).
@@ -97,10 +132,7 @@ pub fn check(input: Input<'_>, now_secs: u64) -> Reading {
 }
 
 fn from_events(events: &[Event], now_secs: u64) -> Reading {
-    let now_ms = i64::try_from(now_secs)
-        .unwrap_or(i64::MAX / 1000)
-        .saturating_mul(1000);
-    let since = now_ms.saturating_sub(WINDOW_MS);
+    let since = since_ms(now_secs);
     let crashes: Vec<_> = detect_crashes(events, DEFAULT_WINDOW_MS, |_| None)
         .into_iter()
         .filter(|c| c.noticed_ms >= since)
@@ -209,7 +241,7 @@ fn reading(
         measured_at: now_secs,
         stale_after_secs: STALE_AFTER_SECS,
         action: Some(Action::OpenPage {
-            label: "Open crashes".into(),
+            label: clip("Open crashes", LABEL_MAX),
             route: ROUTE.into(),
         }),
     }

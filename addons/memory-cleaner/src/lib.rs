@@ -9,6 +9,7 @@ mod commit;
 mod engine;
 mod groups;
 mod growth;
+mod health;
 mod home;
 mod memlist;
 mod pressure;

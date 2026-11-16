@@ -1708,7 +1708,12 @@ mod tests {
     }
     #[test]
     fn official_package_validates() {
-        let p = toolboks_addon_sdk::Package::parse(PACKAGE.as_bytes(), "0.12.5").unwrap();
+        let p = toolboks_addon_sdk::Package::parse(PACKAGE.as_bytes(), "0.14.0").unwrap();
         assert_eq!(p.manifest.native_provider.as_deref(), Some(PROVIDER));
+        // Shown in the install review; it names what the saved scans hold.
+        assert_eq!(
+            p.manifest.data_note.as_deref(),
+            Some("Keeps your last scan of each drive on this PC (file and folder names).")
+        );
     }
 }

@@ -3,6 +3,7 @@ mod category;
 mod explorer;
 mod folder_picker;
 mod health;
+mod health_findings;
 mod map;
 mod optimization;
 mod saved_scan;
@@ -105,6 +106,7 @@ pub struct DiskManager {
     picker: Option<mpsc::Receiver<Result<Option<String>, String>>>,
     tutorial_snapshot: Option<(usize, bool, usize, usize)>,
     optimization: optimization::Panel,
+    reporter: health_findings::Reporter,
     cache: Option<saved_scan::Worker>,
     cache_started: bool,
     reload_cache: bool,
@@ -114,7 +116,10 @@ pub struct DiskManager {
 }
 impl Default for DiskManager {
     fn default() -> Self {
+        let optimization = optimization::Panel::default();
         Self {
+            reporter: health_findings::Reporter::new(optimization.health_cache()),
+            optimization,
             settings: Default::default(),
             loaded: false,
             styled: false,
@@ -136,7 +141,6 @@ impl Default for DiskManager {
             map_cache: None,
             picker: None,
             tutorial_snapshot: None,
-            optimization: Default::default(),
             cache: None,
             cache_started: false,
             reload_cache: false,
@@ -144,6 +148,16 @@ impl Default for DiskManager {
             restore: None,
             delete_confirm: None,
         }
+    }
+}
+impl DiskManager {
+    /// Work that is not the periodic drive-health read.
+    #[cfg(test)]
+    fn has_user_work(&self) -> bool {
+        self.export_job.is_some()
+            || self.picker.is_some()
+            || self.optimization.busy()
+            || self.cache.as_ref().is_some_and(|w| w.pending > 0)
     }
 }
 impl Drop for DiskManager {
@@ -902,12 +916,18 @@ impl NativeAddon for DiskManager {
         self.offset = 0;
     }
     fn has_background_work(&self) -> bool {
-        self.export_job.is_some()
-            || self.picker.is_some()
-            || self.optimization.busy()
-            || self.cache.as_ref().is_some_and(|w| w.pending > 0)
+        // Always: the runtime has no timer, so the six-hour drive-health read is started from
+        // its 200 ms background tick, which only does a lock and a clock comparison.
+        true
+    }
+    fn findings(&self) -> Vec<toolboks_addon_sdk::Finding> {
+        self.reporter.findings()
+    }
+    fn check_now(&mut self) {
+        self.reporter.check_now();
     }
     fn tick_background(&mut self) {
+        self.reporter.poll();
         self.poll_workers();
         if self.cache_started {
             self.cache_tick(false);
@@ -928,12 +948,15 @@ impl NativeAddon for DiskManager {
     fn take_host_request(&mut self) -> Option<toolboks_addon_sdk::HostRequest> {
         self.optimization.request()
     }
-    fn navigate(&mut self, page: &str) {
-        let page = page.parse::<usize>().unwrap_or(0).min(PAGES.len() - 1);
+    fn navigate(&mut self, route: &str) {
+        let (page, drive) = parse_route(route);
         if page != self.page {
             self.export_kind = None;
             self.page = page;
             self.offset = 0;
+        }
+        if let Some(letter) = drive {
+            self.optimization.select(&letter);
         }
     }
     fn page_index(&self) -> usize {
@@ -985,6 +1008,7 @@ impl NativeAddon for DiskManager {
             }
             self.loaded = true;
         }
+        self.reporter.poll();
         self.poll_workers();
         self.cache_tick(true);
         self.tick(ui.ctx());
@@ -1333,6 +1357,29 @@ impl NativeAddon for DiskManager {
     }
 }
 
+/// The page and drive a route names. The sidebar sends the page number ("4"); Home sends the
+/// route of a finding ("Optimization/C:"). Anything unknown opens the first page.
+fn parse_route(route: &str) -> (usize, Option<String>) {
+    let (head, tail) = match route.split_once('/') {
+        Some((head, tail)) => (head.trim(), Some(tail)),
+        None => (route.trim(), None),
+    };
+    let page = head
+        .parse::<usize>()
+        .ok()
+        .or_else(|| {
+            PAGES
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(head))
+        })
+        .unwrap_or(0)
+        .min(PAGES.len() - 1);
+    let drive = tail
+        .filter(|_| PAGES[page] == "Optimization")
+        .and_then(health_findings::normalize_letter);
+    (page, drive)
+}
+
 fn drives() -> Vec<Drive> {
     #[cfg(windows)]
     {
@@ -1418,11 +1465,15 @@ mod tests {
         assert!(scan_cancel.load(Ordering::Relaxed));
         assert!(!Arc::ptr_eq(&scan_state, &addon.shared));
         assert_eq!(addon.progress().0.generation, 0);
-        assert!(addon.has_background_work());
+        assert!(addon.has_user_work());
         tx.send(Ok("Export finished".into())).unwrap();
         addon.tick_background();
         assert_eq!(addon.message.as_deref(), Some("Export finished"));
-        assert!(!addon.has_background_work());
+        assert!(!addon.has_user_work());
+        assert!(
+            addon.has_background_work(),
+            "the drive-health timer keeps ticking"
+        );
         let mut saved = BTreeMap::new();
         assert!(addon.save_preferences(&mut saved));
         assert_eq!(saved["settings"], prefs["settings"]);
@@ -1708,12 +1759,50 @@ mod tests {
     }
     #[test]
     fn official_package_validates() {
-        let p = toolboks_addon_sdk::Package::parse(PACKAGE.as_bytes(), "0.14.0").unwrap();
+        let p = toolboks_addon_sdk::Package::parse(PACKAGE.as_bytes(), "0.15.0").unwrap();
         assert_eq!(p.manifest.native_provider.as_deref(), Some(PROVIDER));
         // Shown in the install review; it names what the saved scans hold.
         assert_eq!(
             p.manifest.data_note.as_deref(),
             Some("Keeps your last scan of each drive on this PC (file and folder names).")
         );
+    }
+    #[test]
+    fn routes_from_the_sidebar_and_from_home() {
+        assert_eq!(parse_route("0"), (0, None));
+        assert_eq!(parse_route("4"), (4, None));
+        assert_eq!(parse_route("99"), (4, None));
+        assert_eq!(parse_route("Optimization"), (4, None));
+        assert_eq!(parse_route("optimization/C:"), (4, Some("C:".into())));
+        assert_eq!(parse_route("Optimization/d"), (4, Some("D:".into())));
+        assert_eq!(parse_route("Optimization/C:\\x"), (4, None));
+        assert_eq!(parse_route("Largest files"), (1, None));
+        assert_eq!(
+            parse_route("Largest files/C:"),
+            (1, None),
+            "a drive only on Optimization"
+        );
+        assert_eq!(parse_route("nonsense"), (0, None));
+        assert_eq!(parse_route(""), (0, None));
+    }
+    #[test]
+    fn home_opens_the_drive_it_names() {
+        let mut addon = DiskManager::default();
+        addon.navigate("Optimization/E:");
+        assert_eq!(addon.page_index(), 4);
+        assert_eq!(addon.optimization.wanted_for_test().as_deref(), Some("E:"));
+        addon.navigate("2");
+        assert_eq!(addon.page_index(), 2);
+    }
+    #[test]
+    fn it_reports_drive_health_to_home() {
+        let addon = DiskManager::default();
+        assert!(
+            addon.findings().is_empty(),
+            "nothing before the first listing"
+        );
+        let p = toolboks_addon_sdk::Package::parse(PACKAGE.as_bytes(), "0.15.0").unwrap();
+        assert_eq!(p.manifest.checks, ["Drive health"]);
+        assert_eq!(p.manifest.min_toolboks_version, "0.15.0");
     }
 }

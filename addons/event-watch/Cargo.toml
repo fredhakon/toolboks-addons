@@ -1,6 +1,6 @@
 [package]
 name = "event-watch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Event Watch - native Toolboks add-on that explains Windows events and crashes"

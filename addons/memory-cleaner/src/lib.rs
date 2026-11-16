@@ -9,6 +9,8 @@ mod commit;
 mod engine;
 mod groups;
 mod growth;
+mod health;
+mod health_feed;
 mod home;
 mod memlist;
 mod pressure;
@@ -33,12 +35,12 @@ use self::admin::PurgeJob;
 use self::engine::{RunJob, RunSummary, Settling};
 use self::growth::GrowthTracker;
 use self::memlist::Lists;
-use self::pressure::{Assessment, PressureModel, Verdict, WindowsSignals};
+use self::pressure::{Assessment, PressureModel, SignalSource, Verdict, WindowsSignals};
 use self::sampler::WindowsSampler;
 use self::scheduler::Scheduler;
 use self::stats::{Sampler, Snapshot, SortKey};
 use self::workbench::Selection;
-use toolboks_addon_sdk::{HostRequest, NativeAddon, StatusItem, TutorialStep};
+use toolboks_addon_sdk::{Finding, HostRequest, NativeAddon, StatusItem, TutorialStep};
 
 const REFRESH: Duration = Duration::from_secs(2);
 
@@ -111,8 +113,12 @@ pub struct Memory {
     activity: Activity,
     /// Pressure verdict: the model, the Windows readings and the latest assessment.
     pressure: PressureModel,
-    signals: Option<WindowsSignals>,
+    signals: Option<Box<dyn SignalSource>>,
     assessment: Assessment,
+    /// The `memory-pressure` finding for Home: what the last pressure reading said, and the
+    /// reading kept for a minute at a time. In memory only.
+    health: health::Tracker,
+    health_source: health::Source,
     /// Automatic mode (off by default) and the advice shown instead of a run.
     scheduler: Scheduler,
     advice: Option<String>,
@@ -180,7 +186,14 @@ impl Memory {
             cooldowns: Cooldowns::new(),
             activity: Activity::new(0),
             pressure: PressureModel::new(),
-            signals: Some(WindowsSignals::new()),
+            signals: Some(Box::new(WindowsSignals::new())),
+            health: {
+                // "Not checked yet" until the first pressure reading arrives.
+                let mut tracker = health::Tracker::new();
+                tracker.refresh(health_feed::unix_now(), health::Source::NotRead);
+                tracker
+            },
+            health_source: health::Source::NotRead,
             assessment: Assessment {
                 verdict: Verdict::Healthy,
                 reasons: Vec::new(),
@@ -347,13 +360,6 @@ impl Memory {
             advanced::Tab::Rules => "rules",
         }
     }
-    fn background_pending(&self) -> bool {
-        self.purge.is_some()
-            || self.run.is_some()
-            || self.trim_job.is_some()
-            || self.settling.is_some()
-            || self.refresh_action_pending
-    }
 }
 
 /// Applies the Toolboks look (fonts, text sizes, spacing, colours) the first time the add-on
@@ -410,6 +416,7 @@ impl NativeAddon for Memory {
             self.refresh_now(ctx);
         }
         self.background(ctx);
+        self.update_health(health_feed::unix_now());
     }
     fn suspend(&mut self) {
         self.active = false;
@@ -418,13 +425,11 @@ impl NativeAddon for Memory {
             self.refresh_worker = None;
             self.refresh_in_flight = 0;
         }
-        self.signals = None;
         self.last_ui = None;
         self.breakdown = Default::default();
         self.growth = GrowthTracker::new();
         self.last_growth = None;
         self.history = series::History::new();
-        self.pressure = PressureModel::new();
         self.activity = Activity::new(self.now_ms());
         self.selection = Selection::default();
         if self.run.is_none() && self.settling.is_none() {
@@ -433,11 +438,15 @@ impl NativeAddon for Memory {
     }
     fn resume(&mut self) {
         self.active = true;
-        self.signals = Some(WindowsSignals::new());
+        if self.signals.is_none() {
+            self.signals = Some(Box::new(WindowsSignals::new()));
+        }
     }
     /// A running trim or optimize keeps going, and finishes, while the window is hidden.
     fn has_background_work(&self) -> bool {
-        self.background_pending()
+        // Always: the memory-pressure finding is fed from the background tick while the page
+        // is closed. The tick does two time comparisons unless a reading is due.
+        true
     }
     fn tick_background(&mut self) {
         let ctx = self.ctx.clone().unwrap_or_default();
@@ -447,6 +456,7 @@ impl NativeAddon for Memory {
         self.poll_run(&ctx);
         self.poll_trim(&ctx);
         self.settle_tick();
+        self.health_background_tick();
         if self.settling.is_none() && self.sampler.is_none() && self.run.is_none() {
             self.win_sampler = None;
         }
@@ -459,6 +469,12 @@ impl NativeAddon for Memory {
             }],
             _ => Vec::new(),
         }
+    }
+    fn findings(&self) -> Vec<Finding> {
+        self.health_findings()
+    }
+    fn check_now(&mut self) {
+        self.health_check_now();
     }
     fn tutorial_steps(&self) -> Vec<TutorialStep> {
         tutorial::steps()

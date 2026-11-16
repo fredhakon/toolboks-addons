@@ -367,7 +367,7 @@ pub fn estimate_stop(src: &dyn EventSource, since_ms: i64, noticed_ms: i64) -> O
 }
 
 const LOAD_MAX_PER_CHANNEL: usize = 20_000;
-const LOAD_MAX_MARKERS: usize = 5_000;
+pub(crate) const LOAD_MAX_MARKERS: usize = 5_000;
 
 /// Loads System and Application since `since_ms` (all crash markers plus warnings and errors),
 /// merged and sorted oldest first, plus one status per channel.

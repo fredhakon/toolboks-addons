@@ -471,7 +471,7 @@ mod tests {
         // A note or checks the current manifest does not have fail too.
         let mut bare = manifest("2.0.0", None);
         bare.min_toolboks_version = current.min_toolboks_version.clone();
-        assert!(entry_problem(&[made.clone()], &[bare.clone()]).is_some());
+        assert!(entry_problem(std::slice::from_ref(&made), std::slice::from_ref(&bare)).is_some());
         assert_eq!(entry_problem(&[entry(&bare)], &[bare]), None);
     }
 

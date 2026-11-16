@@ -14,7 +14,7 @@ use super::actions::{
 };
 use super::activity::{self, Activity};
 use super::growth::{self, WindowsPrivateMemory};
-use super::pressure::{Assessment, SignalSource, Verdict};
+use super::pressure::{Assessment, Verdict};
 use super::report::{self, HonestReport, RunMeasurement, RunMeasurements, Trigger};
 use super::sampler::{WindowsSampler, WorkingSets};
 use super::scheduler::Decision;
@@ -344,11 +344,11 @@ impl Memory {
 
     /// One pressure reading, then the scheduler's answer to it.
     fn evaluate(&mut self, ctx: &egui::Context) {
-        let Some(signals) = self.signals.as_mut().and_then(SignalSource::read) else {
+        let now = self.now_ms();
+        let Some((signals, assessment)) = self.read_pressure(now, super::health_feed::unix_now())
+        else {
             return;
         };
-        let now = self.now_ms();
-        let assessment = self.pressure.evaluate(now, &signals);
         let commit_fraction = if signals.commit_limit > 0 {
             signals.commit_used as f64 / signals.commit_limit as f64
         } else {

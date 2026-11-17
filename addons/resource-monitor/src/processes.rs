@@ -35,6 +35,7 @@ use toolboks_shared::win::Handle;
 
 use crate::lower_confirm::{is_confirmed, lower_text, settle, Pending};
 
+mod facts;
 mod graphs;
 mod groups;
 use groups::Kind;
@@ -1337,6 +1338,8 @@ pub(super) struct Page {
     own: Option<graphs::OwnGraphs>,
     /// An "Open in history" click, waiting for the add-on to switch pages.
     open_history: Option<String>,
+    /// Command line, user, parent, threads and handles of the one selected process (#67).
+    facts: facts::Reader,
 }
 
 #[cfg(test)]
@@ -1373,6 +1376,7 @@ impl Page {
             lines: Vec::new(),
             gpu: None,
             own: None,
+            facts: facts::Reader::new(),
             open_history: None,
         }
     }
@@ -1918,6 +1922,10 @@ impl Page {
             .all()
             .filter(|r| self.selection.keys.contains(&r.key))
             .collect();
+        // The facts are read for one selected process only, and dropped when it is not.
+        let only = (selected.len() == 1).then(|| self.selected_procs(procs));
+        let only = only.as_deref().and_then(|p| <&[Proc; 1]>::try_from(p).ok());
+        self.facts.follow(ui.ctx(), only.map(|[p]| p));
         if selected.is_empty() {
             ui.label(RichText::new("Nothing selected.").weak());
             ui.label(
@@ -1969,6 +1977,8 @@ impl Page {
             if let Some(path) = &one.exe {
                 kv(ui, "Path", path);
             }
+            let identity = only.and_then(|[p]| p.identity);
+            facts::show(ui, &self.facts, identity);
             if let Some(own) = self.own.as_ref().filter(|g| g.key() == one.key) {
                 ui.add_space(4.0);
                 graphs::ui(ui, own);

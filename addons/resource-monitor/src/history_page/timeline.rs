@@ -518,13 +518,20 @@ pub fn show(
     if let Some(c) = marks.cursor.filter(|c| (view.from..view.to).contains(c)) {
         let x = x_of(c);
         painter.vline(x, lanes.y_range(), Stroke::new(1.5, TEXT));
-        painter.text(
-            Pos2::new(x, axis.center().y),
-            egui::Align2::CENTER_CENTER,
-            time::hms(c),
-            caption.clone(),
-            TEXT,
+        // Kept inside the axis, on the axis background, so it never runs into a tick label.
+        let galley = painter.layout_no_wrap(time::hms(c), caption.clone(), TEXT);
+        let half = galley.size().x / 2.0 + 4.0;
+        let cx = if axis.width() > 2.0 * half {
+            x.clamp(axis.left() + half, axis.right() - half)
+        } else {
+            x
+        };
+        let label = Rect::from_center_size(
+            Pos2::new(cx, axis.center().y),
+            galley.size() + Vec2::new(8.0, 2.0),
         );
+        painter.rect_filled(label, 2, BAR_BG);
+        painter.galley(label.center() - galley.size() / 2.0, galley, TEXT);
     }
 
     // Hover: a guide line and the values at that moment.

@@ -853,13 +853,38 @@ pub fn size_on_disk(dir: &Path) -> u64 {
     list(dir).iter().map(|f| f.4).sum()
 }
 
-/// "Delete history" (#45): deletes every history file in `dir` (only files with our names;
-/// anything else is left alone), then the folder if it is empty. Call it only while no
-/// recorder writes there. Returns the number deleted, or what could not be deleted.
+/// The "Mark this moment" files (#44, `markers::manual`) kept next to the history: the marks,
+/// a damaged file moved aside, and the temporary file of a rewrite.
+const MARK_FILES: [&str; 3] = ["marks.rmm", "marks.rmm.bad", "marks.rmm.tmp"];
+
+fn mark_files(dir: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    MARK_FILES
+        .iter()
+        .map(|n| dir.join(n))
+        .filter(|p| p.is_file())
+}
+
+/// Bytes of everything "Delete history" removes: the history files and the user's marks.
+pub fn saved_bytes(dir: &Path) -> u64 {
+    size_on_disk(dir)
+        + mark_files(dir)
+            .filter_map(|p| fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum::<u64>()
+}
+
+/// "Delete history" (#45): deletes every history file in `dir` and the user's marks (only
+/// files with our names; anything else is left alone), then the folder if it is empty. Call it
+/// only while no recorder writes there. Returns the number deleted, or what could not be
+/// deleted.
 pub fn delete_all(dir: &Path) -> Result<usize, String> {
     let mut deleted = 0;
     let mut failed = Vec::new();
-    for (path, ..) in list(dir) {
+    let ours = list(dir)
+        .into_iter()
+        .map(|f| f.0)
+        .chain(mark_files(dir).collect::<Vec<_>>());
+    for path in ours {
         match fs::remove_file(&path) {
             Ok(()) => deleted += 1,
             Err(e) => failed.push(format!(
@@ -1249,9 +1274,13 @@ pub(crate) mod tests {
             fs::write(dir.join(file_name(level, DAY0, run)), b"x").unwrap();
         }
         fs::write(dir.join("notes.txt"), b"not ours").unwrap();
+        // The user's marks (#44) are part of the history and go with it.
+        fs::write(dir.join("marks.rmm"), b"mm").unwrap();
         assert_eq!(size_on_disk(&dir), 3);
-        assert_eq!(delete_all(&dir), Ok(3));
-        assert_eq!(size_on_disk(&dir), 0);
+        assert_eq!(saved_bytes(&dir), 5);
+        assert_eq!(delete_all(&dir), Ok(4));
+        assert_eq!(saved_bytes(&dir), 0);
+        assert!(!dir.join("marks.rmm").exists());
         assert!(dir.join("notes.txt").exists(), "other files are left alone");
         fs::remove_file(dir.join("notes.txt")).unwrap();
         // Empty now: the folder goes too; a missing folder is nothing to delete.

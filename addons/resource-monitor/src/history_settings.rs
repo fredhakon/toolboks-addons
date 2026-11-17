@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn a_finished_delete_is_reported_once() {
-        let dir = std::env::temp_dir().join(format!("rm-settings-delete-{}", std::process::id()));
+        let dir = crate::recording::disk::tests::test_dir("settings-delete");
         let mut control = Control::default();
         let mut settings = Settings::default();
         assert!(!settings.deleted_now(&control));

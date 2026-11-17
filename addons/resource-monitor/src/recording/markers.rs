@@ -1421,7 +1421,6 @@ mod tests {
         assert_eq!(manual_moment(&got.marks[0]).text, "You marked this moment.");
         // The history loader never mistakes it for a history file.
         assert!(super::super::disk::list(&dir).is_empty());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1457,7 +1456,6 @@ mod tests {
         assert!(got.problems.is_empty(), "{:?}", got.problems);
         assert_eq!(got.marks.len(), 4);
         assert_eq!(got.marks[3].note, "after");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1486,7 +1484,6 @@ mod tests {
             Err(manual::AddError::NewerFormat)
         ));
         assert_eq!(std::fs::read(&path).unwrap(), newer);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1510,7 +1507,6 @@ mod tests {
             got.marks.last().unwrap().utc_ms,
             NOW - 30 * MIN + (manual::MAX_MARKS as i64 + 4) * 1000
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ----- the recorded fixture --------------------------------------------------------------
@@ -1690,6 +1686,5 @@ mod tests {
                 NOW - 2 * HOUR + POINT_HALF_WINDOW_MS
             )
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

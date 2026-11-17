@@ -7,7 +7,9 @@ use toolboks_addon_proto::{
     host_handshake, AddonMessage, FrameReader, FrameWriter, Hello, HostMessage, InputBatch, Theme,
 };
 
-struct Guard(Child);
+/// Owns the child and its throwaway data folder: on drop (also when the test fails or panics) the
+/// child is stopped first, then the folder is removed.
+struct Guard(Child, std::path::PathBuf);
 
 #[test]
 fn manifest_matches_the_executable() {
@@ -45,6 +47,14 @@ impl Drop for Guard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+        // Retry for up to 3 seconds: a file may be held for a moment after the exit.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while self.1.exists() {
+            if std::fs::remove_dir_all(&self.1).is_ok() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
@@ -80,6 +90,7 @@ fn protocol_test_host_draws_pings_and_quits() {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
+        data,
     );
     let stdout = child.0.stdout.take().unwrap();
     let stdin = child.0.stdin.take().unwrap();
@@ -164,5 +175,4 @@ fn protocol_test_host_draws_pings_and_quits() {
         assert!(std::time::Instant::now() < deadline, "add-on did not quit");
         std::thread::sleep(Duration::from_millis(10));
     }
-    let _ = std::fs::remove_dir_all(&data);
 }

@@ -39,7 +39,19 @@ impl Drop for Guard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
-        let _ = std::fs::remove_dir_all(&self.1);
+        remove_dir_with_retry(&self.1);
+    }
+}
+
+/// Removes a test folder, retrying for up to 3 seconds because a child process (or the virus
+/// scanner) may still hold a file for a moment. Errors at the end are ignored.
+fn remove_dir_with_retry(dir: &std::path::Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while dir.exists() {
+        if std::fs::remove_dir_all(dir).is_ok() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 

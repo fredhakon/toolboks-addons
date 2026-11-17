@@ -3,9 +3,12 @@ use toolboks_catalog::Index;
 
 #[test]
 fn catalog_update_uses_released_bytes_and_preserves_other_versions() {
-    let root = std::env::temp_dir().join(format!("toolboks-addon-catalog-{}", std::process::id()));
-    // create_dir refuses to reuse another test's workspace.
-    fs::create_dir(&root).unwrap();
+    // Removed when the test ends, also when it fails or panics.
+    let tmp = tempfile::Builder::new()
+        .prefix("toolboks-addon-catalog-")
+        .tempdir()
+        .unwrap();
+    let root = tmp.path().to_path_buf();
     fs::create_dir_all(root.join("addons/hello")).unwrap();
     fs::create_dir(root.join("catalog")).unwrap();
     let mut manifest: serde_json::Value =
@@ -90,7 +93,6 @@ fn catalog_update_uses_released_bytes_and_preserves_other_versions() {
     assert_eq!(value["format_version"], 1);
     assert!(value.get("entries").is_some());
     assert_eq!(fs::read_dir(root.join("catalog")).unwrap().count(), 1);
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// `catalog-update` copies the manifest's data note into the entry, leaves it out when the
@@ -99,9 +101,11 @@ fn catalog_update_uses_released_bytes_and_preserves_other_versions() {
 #[test]
 fn data_note_is_copied_checked_and_validated() {
     const NOTE: &str = "Keeps your last scan of each drive on this PC (file and folder names).";
-    let root =
-        std::env::temp_dir().join(format!("toolboks-addon-data-note-{}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix("toolboks-addon-data-note-")
+        .tempdir()
+        .unwrap();
+    let root = tmp.path().to_path_buf();
     fs::create_dir_all(root.join("addons/hello")).unwrap();
     fs::create_dir(root.join("catalog")).unwrap();
     fs::write(root.join("hello.exe"), b"release fixture").unwrap();
@@ -195,7 +199,6 @@ fn data_note_is_copied_checked_and_validated() {
     manifest["manifest"]["data_note"] = "A newer note.".into();
     write(&manifest);
     assert!(run(&["validate"]).status.success());
-    fs::remove_dir_all(root).unwrap();
 }
 
 /// `catalog-update` copies the manifest's health check names and gives the entry the first host
@@ -203,8 +206,11 @@ fn data_note_is_copied_checked_and_validated() {
 /// manifest, and leaves entries of older versions released at protocol 3 alone.
 #[test]
 fn checks_and_minimum_host_are_copied_and_validated() {
-    let root = std::env::temp_dir().join(format!("toolboks-addon-checks-{}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let tmp = tempfile::Builder::new()
+        .prefix("toolboks-addon-checks-")
+        .tempdir()
+        .unwrap();
+    let root = tmp.path().to_path_buf();
     fs::create_dir_all(root.join("addons/hello")).unwrap();
     fs::create_dir(root.join("catalog")).unwrap();
     fs::write(root.join("hello.exe"), b"release fixture").unwrap();
@@ -328,5 +334,4 @@ fn checks_and_minimum_host_are_copied_and_validated() {
     let out = run(&["validate"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("0.16.0"));
-    fs::remove_dir_all(root).unwrap();
 }

@@ -248,7 +248,11 @@ administrator rights. The live graphs live in memory while the add-on is shown.
   axis to pan, wheel to zoom, arrow keys and Shift+arrows on the focused timeline, and the apps at
   the cursor, over the selection or over the whole period. Reading runs on query workers
   (`recording/query.rs`), never on the UI thread.
-- The guided tour has the built-in tool's 22 steps plus 3 for the History page.
+- **Notable moments (#44).** `recording/markers.rs` finds CPU, GPU or disk held near full,
+  memory above 90 %, steady memory growth and gaps, plus your own marks (`marks.rmm` in the
+  history folder). The page lists them under the timeline, marks them along its top, and
+  choosing one selects its period; "Mark this moment" saves a mark at the cursor or now.
+- The guided tour has the built-in tool's 22 steps plus 4 for the History page.
 
 The built-in copy stays in the host until the final removal and "Restore your tools" step (host
 #94). Measure with `cargo run --locked -p addon-repo -- measure resource-monitor`.

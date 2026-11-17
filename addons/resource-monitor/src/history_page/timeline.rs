@@ -123,6 +123,8 @@ pub struct Timeline<'a> {
     pub lane_h: f32,
     /// The app drawn over the totals (exe name), with its starts and exits.
     pub app: Option<&'a str>,
+    /// Notable moments (#44), marked along the top of the lanes.
+    pub moments: &'a [crate::recording::markers::Moment],
 }
 
 /// The bin of `curve` holding `t`.
@@ -435,6 +437,49 @@ pub fn show(
             }
         }
         flush(run);
+    }
+
+    // Notable moments: a coloured band along the top of the lanes for a period, a line for a
+    // mark. Gaps are already hatched, and the selected app's starts and exits drawn above.
+    if t.empty.is_none() {
+        use crate::recording::markers::MomentKind;
+        for m in t.moments {
+            if matches!(
+                m.kind,
+                MomentKind::Gap | MomentKind::AppStarted(_) | MomentKind::AppExited(_)
+            ) || m.end_ms < view.from
+                || m.start_ms >= view.to
+            {
+                continue;
+            }
+            let color = super::moments::color(&m.kind);
+            let (x0, x1) = (
+                x_of(m.start_ms).max(lanes.left()),
+                x_of(m.end_ms).min(lanes.right()),
+            );
+            if m.is_point() {
+                painter.vline(
+                    x0,
+                    lanes.y_range(),
+                    Stroke::new(1.0, color.gamma_multiply(0.7)),
+                );
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        Pos2::new(x0, lanes.top()),
+                        Pos2::new(x0 + 7.0, lanes.top() + 4.0),
+                        Pos2::new(x0, lanes.top() + 8.0),
+                    ],
+                    color,
+                    Stroke::NONE,
+                ));
+            } else {
+                let r = Rect::from_min_max(
+                    Pos2::new(x0, lanes.top() + 1.0),
+                    Pos2::new(x1.max(x0 + 3.0), lanes.top() + 5.0),
+                );
+                painter.rect_filled(r, 2, color);
+            }
+        }
     }
 
     // Empty states.

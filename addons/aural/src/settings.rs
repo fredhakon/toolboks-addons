@@ -63,47 +63,203 @@ struct Inventory {
     inputs: Vec<Device>,
     outputs: Vec<Device>,
 }
+
+const DISCOVERY_PERIOD: Duration = Duration::from_secs(2);
+
+/// Active endpoints as Windows lists them, without opening them: `host.devices()` only
+/// enumerates endpoints and reads their names. No audio client is activated and no format is
+/// queried, so this is safe to repeat every couple of seconds.
+#[cfg_attr(test, allow(dead_code))]
+struct Endpoints(Vec<Device>);
+impl PartialEq for Endpoints {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(&other.0)
+                .all(|(a, b)| a.name == b.name && a.same_endpoint(b))
+    }
+}
+#[cfg_attr(test, allow(dead_code))]
+fn endpoints(host: &cpal::Host) -> Result<Endpoints, String> {
+    Ok(Endpoints(
+        host.devices()
+            .map_err(|e| e.to_string())?
+            .map(Device::listed)
+            .collect(),
+    ))
+}
+
+/// The full input and output lists. CPAL's `input_devices`/`output_devices` decide what each
+/// endpoint is by activating an `IAudioClient` on it and asking it about ~70 formats. Those
+/// questions are answered by the audio drivers inside `audiodg.exe`, and on some PCs every
+/// round leaks memory and handles there. So this runs only when the endpoints change.
+#[cfg_attr(test, allow(dead_code))]
+fn inventory(host: &cpal::Host) -> Result<Inventory, String> {
+    Ok(Inventory {
+        inputs: host
+            .input_devices()
+            .map_err(|e| e.to_string())?
+            .map(Device::listed)
+            .collect(),
+        outputs: host
+            .output_devices()
+            .map_err(|e| e.to_string())?
+            .map(Device::listed)
+            .collect(),
+    })
+}
+
+/// Decides, once per discovery pass, whether the expensive inventory is needed.
+struct Watch<S> {
+    last: Option<S>,
+    rescan: bool,
+}
+impl<S: PartialEq> Watch<S> {
+    fn new() -> Self {
+        Self {
+            last: None,
+            rescan: true,
+        }
+    }
+    fn rescan(&mut self) {
+        self.rescan = true;
+    }
+    /// `snapshot` is the cheap endpoint list; `full` is called only on the first pass, when
+    /// the endpoints changed, after a rescan request, or after the previous inventory failed.
+    fn pass<I>(
+        &mut self,
+        snapshot: Result<S, String>,
+        full: impl FnOnce() -> Result<I, String>,
+    ) -> Option<Result<I, String>> {
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.last = None;
+                return Some(Err(error));
+            }
+        };
+        if !self.rescan && self.last.as_ref() == Some(&snapshot) {
+            return None;
+        }
+        let result = full();
+        self.rescan = false;
+        self.last = result.is_ok().then_some(snapshot);
+        Some(result)
+    }
+}
+
+/// Backs off reopening streams that keep failing. The first loss is retried on the next
+/// discovery pass, as before; each further loss within `CALM` waits twice as long, up to a
+/// minute. A failing stream is not rebuilt every 2 seconds forever.
+#[derive(Default)]
+pub struct Recovery {
+    losses: u32,
+    last_loss: Option<Instant>,
+    retry_at: Option<Instant>,
+}
+impl Recovery {
+    const CALM: Duration = Duration::from_secs(300);
+    const MAX: Duration = Duration::from_secs(60);
+    pub fn lost(&mut self, now: Instant) {
+        if self
+            .last_loss
+            .is_none_or(|last| now.duration_since(last) > Self::CALM)
+        {
+            self.losses = 0;
+        }
+        self.losses += 1;
+        self.last_loss = Some(now);
+        let delay = if self.losses == 1 {
+            Duration::ZERO
+        } else {
+            (DISCOVERY_PERIOD * 2u32.saturating_pow(self.losses - 1)).min(Self::MAX)
+        };
+        self.retry_at = Some(now + delay);
+    }
+    /// True while a scheduled retry is still in the future.
+    pub fn waiting(&self, now: Instant) -> bool {
+        self.retry_at.is_some_and(|at| at > now)
+    }
+    /// True once when the scheduled retry is due.
+    pub fn due(&mut self, now: Instant) -> bool {
+        let due = self.retry_at.is_some_and(|at| at <= now);
+        if due {
+            self.retry_at = None;
+        }
+        due
+    }
+}
+
+enum Wake {
+    Rescan,
+    Stop,
+}
+type Mailbox = Arc<Mutex<Option<Result<Inventory, String>>>>;
 pub struct Discovery {
-    stop: std::sync::mpsc::Sender<()>,
-    inventory: std::sync::mpsc::Receiver<Result<Inventory, String>>,
+    wake: std::sync::mpsc::Sender<Wake>,
+    // The newest inventory replaces an unread older one, so a change is never dropped.
+    inventory: Mailbox,
+    thread: std::thread::JoinHandle<()>,
 }
 impl Drop for Discovery {
     fn drop(&mut self) {
-        let _ = self.stop.send(());
+        let _ = self.wake.send(Wake::Stop);
     }
 }
 impl Discovery {
     fn start() -> Self {
-        let (stop, stopped) = std::sync::mpsc::channel();
-        let (send, inventory) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || loop {
-            let host = cpal::default_host();
-            let result = (|| {
-                Ok(Inventory {
-                    inputs: host
-                        .input_devices()
-                        .map_err(|e| e.to_string())?
-                        .map(Device::listed)
-                        .collect(),
-                    outputs: host
-                        .output_devices()
-                        .map_err(|e| e.to_string())?
-                        .map(Device::listed)
-                        .collect(),
-                })
-            })();
-            if let Err(std::sync::mpsc::TrySendError::Disconnected(_)) = send.try_send(result) {
-                break;
-            }
-            if stopped.recv_timeout(Duration::from_secs(2))
-                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-            {
-                break;
-            }
-        });
-        Self { stop, inventory }
+        Self::spawn(watch_devices)
+    }
+    fn spawn(body: fn(std::sync::mpsc::Receiver<Wake>, Mailbox)) -> Self {
+        let (wake, woken) = std::sync::mpsc::channel();
+        let inventory = Arc::new(Mutex::new(None));
+        let slot = inventory.clone();
+        let thread = std::thread::spawn(move || body(woken, slot));
+        Self {
+            wake,
+            inventory,
+            thread,
+        }
+    }
+    /// Asks for one fresh inventory on the next pass, so a stream lost to an error can be
+    /// reopened even when the endpoints did not change.
+    pub fn rescan(&self) {
+        let _ = self.wake.send(Wake::Rescan);
+    }
+    fn alive(&self) -> bool {
+        !self.thread.is_finished()
     }
 }
+
+#[cfg(not(test))]
+fn watch_devices(woken: std::sync::mpsc::Receiver<Wake>, slot: Mailbox) {
+    let host = cpal::default_host();
+    let mut watch = Watch::new();
+    loop {
+        if let Some(result) = watch.pass(endpoints(&host), || inventory(&host)) {
+            *slot.lock().unwrap() = Some(result);
+        }
+        // A rescan request waits for the next pass, so streams are retried at most once
+        // per period.
+        let next = Instant::now() + DISCOVERY_PERIOD;
+        loop {
+            match woken.recv_timeout(next.saturating_duration_since(Instant::now())) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Ok(Wake::Rescan) => watch.rescan(),
+                Ok(Wake::Stop) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+}
+
+/// Unit tests never touch real audio devices: this stand-in only waits to be stopped.
+#[cfg(test)]
+fn watch_devices(woken: std::sync::mpsc::Receiver<Wake>, _: Mailbox) {
+    while let Ok(Wake::Rescan) = woken.recv() {}
+}
+
 impl Aural {
     pub fn request_settings_update(&mut self) {
         self.settings_update_requested = true;
@@ -272,12 +428,23 @@ impl Aural {
         self.route_intent[index] = false;
     }
     pub fn ensure_discovery(&mut self) {
+        self.ensure_discovery_at(Instant::now());
+    }
+    fn ensure_discovery_at(&mut self, now: Instant) {
+        if self.discovery.as_ref().is_some_and(|d| !d.alive()) {
+            // The thread ended unexpectedly (a panic in a debug build; release builds abort).
+            // Restart it with the same back-off as lost streams, since every new thread
+            // starts with a full inventory.
+            self.discovery = None;
+            self.discovery_restart.lost(now);
+        }
         let needed = self.allowed
             && self.preferences_allowed
             && (self.preferences.auto_enable
                 || self.want_input
                 || self.preferences.default_input.is_some());
-        if needed && self.discovery.is_none() {
+        if needed && self.discovery.is_none() && !self.discovery_restart.waiting(now) {
+            self.discovery_restart.due(now);
             self.discovery = Some(Discovery::start());
         }
         if !needed {
@@ -289,7 +456,7 @@ impl Aural {
         let result = self
             .discovery
             .as_ref()
-            .and_then(|w| w.inventory.try_recv().ok());
+            .and_then(|w| w.inventory.lock().unwrap().take());
         let Some(result) = result else {
             return;
         };
@@ -389,6 +556,201 @@ impl Aural {
         }
     }
 }
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Runs one discovery pass against a fake endpoint list and counts full inventories, the
+    /// calls that open every endpoint and query its formats inside audiodg.exe.
+    fn pass(
+        watch: &mut Watch<Vec<&'static str>>,
+        endpoints: Result<Vec<&'static str>, String>,
+        full: &Cell<u32>,
+        fails: bool,
+    ) -> Option<Result<u32, String>> {
+        watch.pass(endpoints, || {
+            full.set(full.get() + 1);
+            if fails {
+                Err("busy".into())
+            } else {
+                Ok(full.get())
+            }
+        })
+    }
+
+    #[test]
+    fn unchanged_endpoints_never_reopen_devices() {
+        let full = Cell::new(0);
+        let mut watch = Watch::new();
+        let mics = || Ok(vec!["Mic", "Speakers"]);
+        assert_eq!(pass(&mut watch, mics(), &full, false), Some(Ok(1)));
+        // An hour of 2-second passes with nothing plugged in or out.
+        for _ in 0..1800 {
+            assert_eq!(pass(&mut watch, mics(), &full, false), None);
+        }
+        assert_eq!(full.get(), 1, "the inventory ran once, not every pass");
+    }
+
+    #[test]
+    fn a_change_rescan_or_failure_runs_one_inventory() {
+        let full = Cell::new(0);
+        let mut watch = Watch::new();
+        pass(&mut watch, Ok(vec!["Mic"]), &full, false);
+        // A headset is plugged in: one inventory, then quiet again.
+        assert!(pass(&mut watch, Ok(vec!["Mic", "Headset"]), &full, false).is_some());
+        assert_eq!(
+            pass(&mut watch, Ok(vec!["Mic", "Headset"]), &full, false),
+            None
+        );
+        assert_eq!(full.get(), 2);
+        // A stream error asks for a rescan: exactly one more inventory.
+        watch.rescan();
+        assert!(pass(&mut watch, Ok(vec!["Mic", "Headset"]), &full, false).is_some());
+        assert_eq!(
+            pass(&mut watch, Ok(vec!["Mic", "Headset"]), &full, false),
+            None
+        );
+        assert_eq!(full.get(), 3);
+        // A failed inventory is retried on the next pass until it succeeds.
+        watch.rescan();
+        assert_eq!(
+            pass(&mut watch, Ok(vec!["Mic", "Headset"]), &full, true),
+            Some(Err("busy".into()))
+        );
+        assert!(pass(&mut watch, Ok(vec!["Mic", "Headset"]), &full, false).is_some());
+        assert_eq!(
+            pass(&mut watch, Ok(vec!["Mic", "Headset"]), &full, false),
+            None
+        );
+        assert_eq!(full.get(), 5);
+        // A listing error is reported without opening devices, and recovery re-inventories.
+        assert_eq!(
+            pass(&mut watch, Err("gone".into()), &full, false),
+            Some(Err("gone".into()))
+        );
+        assert_eq!(full.get(), 5);
+        assert!(pass(&mut watch, Ok(vec!["Mic", "Headset"]), &full, false).is_some());
+        assert_eq!(full.get(), 6);
+    }
+
+    #[test]
+    fn repeated_stream_losses_back_off_and_calm_resets() {
+        let start = Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut recovery = Recovery::default();
+        assert!(!recovery.due(start));
+        // First loss: retried on the next pass, as before.
+        recovery.lost(at(0));
+        assert!(recovery.due(at(0)));
+        assert!(!recovery.due(at(0)), "a retry is handed out once");
+        // Each further loss waits twice as long: 4, 8, 16, 32, then 60 s at most.
+        let mut now = 0;
+        for wait in [4, 8, 16, 32, 60, 60] {
+            now += 1;
+            recovery.lost(at(now));
+            assert!(
+                !recovery.due(at(now + wait - 1)),
+                "too early after {wait} s"
+            );
+            assert!(recovery.due(at(now + wait)));
+            now += wait;
+        }
+        // After five quiet minutes a loss is treated as the first again.
+        recovery.lost(at(now + 301));
+        assert!(recovery.due(at(now + 301)));
+    }
+
+    /// Stand-in thread that answers each rescan with a numbered (error) inventory.
+    fn counting(woken: std::sync::mpsc::Receiver<Wake>, slot: Mailbox) {
+        let mut rescans = 0;
+        while let Ok(Wake::Rescan) = woken.recv() {
+            rescans += 1;
+            *slot.lock().unwrap() = Some(Err(format!("rescan {rescans}")));
+        }
+    }
+
+    fn wait_for(addon: &mut Aural, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while addon.microphone_refresh_error.as_deref()
+            != Some(&format!("Could not refresh audio devices: {expected}"))
+        {
+            assert!(Instant::now() < deadline, "no {expected}");
+            addon.poll_discovery();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn watching() -> Aural {
+        Aural {
+            allowed: true,
+            preferences_allowed: true,
+            preferences_loaded: true,
+            want_input: true,
+            ..Aural::default()
+        }
+    }
+
+    #[test]
+    fn a_lost_stream_asks_discovery_for_one_inventory_with_back_off() {
+        let mut addon = watching();
+        addon.discovery = Some(Discovery::spawn(counting));
+        let start = Instant::now();
+        // Nothing lost: no rescan, however often the add-on ticks.
+        for tick in 0..50 {
+            addon.retry_lost_streams(false, start + Duration::from_millis(200 * tick));
+        }
+        // A lost stream: one rescan, which delivers an inventory to poll_discovery.
+        addon.retry_lost_streams(true, start);
+        wait_for(&mut addon, "rescan 1");
+        // Lost again right away: no rescan until the back-off has passed.
+        addon.retry_lost_streams(true, start + Duration::from_secs(1));
+        addon.retry_lost_streams(false, start + Duration::from_secs(4));
+        std::thread::sleep(Duration::from_millis(50));
+        addon.poll_discovery();
+        assert_eq!(
+            addon.microphone_refresh_error.as_deref(),
+            Some("Could not refresh audio devices: rescan 1")
+        );
+        addon.retry_lost_streams(false, start + Duration::from_secs(5));
+        wait_for(&mut addon, "rescan 2");
+    }
+
+    #[test]
+    fn a_dead_discovery_thread_is_restarted_with_back_off() {
+        fn die(addon: &mut Aural) {
+            addon.discovery = Some(Discovery::spawn(|_, _| {}));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while addon.discovery.as_ref().unwrap().alive() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let mut addon = watching();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        // First death: restarted on the next tick.
+        die(&mut addon);
+        addon.ensure_discovery_at(at(0));
+        assert!(addon.discovery.as_ref().unwrap().alive());
+        // Dies again soon after: no new thread (and no full inventory) on every 200 ms tick.
+        die(&mut addon);
+        for tick in 1..20 {
+            addon.ensure_discovery_at(at(200 * tick));
+            assert!(
+                addon.discovery.is_none(),
+                "restarted too early at tick {tick}"
+            );
+        }
+        addon.ensure_discovery_at(at(4200));
+        assert!(addon.discovery.as_ref().unwrap().alive());
+        // And it is stopped when nothing needs it.
+        addon.want_input = false;
+        addon.ensure_discovery_at(at(4400));
+        assert!(addon.discovery.is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

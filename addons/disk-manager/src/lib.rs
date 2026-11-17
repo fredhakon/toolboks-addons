@@ -1561,7 +1561,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(addon.progress().0.files, 1);
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn remembering_off_deletes_on_disk_and_exclusions_disable_quick_rescan() {
@@ -1598,7 +1597,6 @@ mod tests {
         }
         assert!(!addon.settings.remember);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn rescan_restores_parent_selection_and_pagination_by_path() {
@@ -1642,7 +1640,6 @@ mod tests {
         assert_eq!(nodes[addon.parent].path, parent);
         assert_eq!(nodes[addon.map_state.selected.unwrap()].path, selected);
         assert_eq!(addon.offset, 100);
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     #[ignore = "700,000-node streaming/load responsiveness measurement"]
@@ -1745,7 +1742,6 @@ mod tests {
         assert_eq!(addon.progress().1.len(), 700101);
         println!("LARGE_SNAPSHOT nodes=700101 files=700000 bytes={} load={:.3}s frames={} longest_frame={:.3}s",bytes,started.elapsed().as_secs_f64(),frames,max_frame.as_secs_f64());
         drop(addon);
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn csv_protects_formulas_and_quotes() {

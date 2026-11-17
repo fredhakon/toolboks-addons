@@ -3360,12 +3360,12 @@ mod tests {
 
     #[test]
     fn the_page_never_overwrites_a_newer_list_and_reloads_its_own_after_a_restart() {
-        let dir = std::env::temp_dir().join(format!(
-            "toolboks-debloater-page-undo-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // Removed when the test ends, also when it fails or panics.
+        let tmp = tempfile::Builder::new()
+            .prefix("toolboks-debloater-page-undo-test-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().to_path_buf();
         let file = dir.join("undo.jsonl");
         let newer: &[u8] = b"{\"format\":\"toolboks.debloater.undo\",\"version\":9}\n{}";
         std::fs::write(&file, newer).unwrap();
@@ -3412,17 +3412,16 @@ mod tests {
         assert_eq!(third.saved.removed_apps, vec!["clipchamp"]);
         assert_eq!(third.tasks.steps.len(), 1);
         assert!(third.saved.note.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_damaged_list_that_stayed_in_place_is_never_overwritten() {
-        let dir = std::env::temp_dir().join(format!(
-            "toolboks-debloater-page-damaged-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // Removed when the test ends, also when it fails or panics.
+        let tmp = tempfile::Builder::new()
+            .prefix("toolboks-debloater-page-damaged-test-")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().to_path_buf();
         let file = dir.join("undo.jsonl");
         std::fs::write(&file, b"damaged").unwrap();
 
@@ -3449,7 +3448,6 @@ mod tests {
             kept: true,
         });
         assert!(!moved.saved.paused);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

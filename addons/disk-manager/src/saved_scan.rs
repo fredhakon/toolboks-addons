@@ -404,7 +404,7 @@ mod tests {
     use super::*;
     use crate::scanner::{self, State};
     use std::sync::{atomic::AtomicBool, Mutex};
-    fn fixture(tag: &str) -> (PathBuf, Progress, Arc<Vec<Node>>) {
+    fn fixture(tag: &str) -> (scanner::tests::TestDir, Progress, Arc<Vec<Node>>) {
         let root = scanner::tests::temp(tag);
         fs::create_dir_all(root.join("nested")).unwrap();
         fs::write(root.join("nested/spaces \u{e6} \u{6f22}.txt"), b"saved").unwrap();
@@ -441,7 +441,6 @@ mod tests {
         save(&dir, &p, &nodes).unwrap();
         assert!(read(&path).is_ok());
         assert!(!path.with_extension("scan.pending").exists());
-        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn version_damage_truncation_and_impossible_counts_are_rejected() {
@@ -469,7 +468,6 @@ mod tests {
         fs::write(&path, &wrong).unwrap();
         assert!(read(&path).is_err());
         assert!(newest(&dir, &[]).is_err());
-        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn identity_exclusions_and_deletion_are_scoped_to_the_addon() {
@@ -497,7 +495,6 @@ mod tests {
             directory_for(&installed, PathBuf::from("wrong")),
             PathBuf::from("D:/isolated/Toolboks Preview/addon-data/toolboks.disk-manager/scans")
         );
-        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn queued_delete_runs_after_an_inflight_save() {
@@ -522,6 +519,5 @@ mod tests {
         ));
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
         drop(worker);
-        fs::remove_dir_all(root).unwrap();
     }
 }

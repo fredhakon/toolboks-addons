@@ -306,6 +306,5 @@ mod tests {
             .collect();
         assert_eq!(marks.len(), 1);
         assert_eq!(marks[0].start_ms, NOW - 10 * MIN);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

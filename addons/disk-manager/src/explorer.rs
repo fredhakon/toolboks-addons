@@ -84,8 +84,12 @@ mod tests {
                 UI::Shell::SHParseDisplayName,
             },
         };
-        let base = std::env::temp_dir().join(format!("toolboks-shell-long-{}", std::process::id()));
-        let mut dir = base.clone();
+        // Removed when the test ends, also when it fails or panics.
+        let tmp = tempfile::Builder::new()
+            .prefix("toolboks-shell-long-")
+            .tempdir()
+            .unwrap();
+        let mut dir = tmp.path().to_path_buf();
         for _ in 0..5 {
             dir = dir.join("long directory with spaces abcdefghijklmnopqrstuvwxyz");
         }
@@ -106,14 +110,14 @@ mod tests {
             }
             result.unwrap();
         }
-        std::fs::remove_file(path).unwrap();
-        // Only remove the explicit temporary fixture created above.
-        std::fs::remove_dir_all(base).unwrap();
     }
     #[test]
     fn missing_item_falls_back_only_to_existing_parent() {
-        let root = std::env::temp_dir().join(format!("toolboks-explorer-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("toolboks-explorer-")
+            .tempdir()
+            .unwrap();
+        let root = tmp.path().to_path_buf();
         let path = root.join("spaces and \u{e6}\u{f8} \u{6f22}\u{5b57}.txt");
         assert_eq!(target(&path).unwrap(), (root.clone(), true));
         std::fs::write(&path, b"test").unwrap();

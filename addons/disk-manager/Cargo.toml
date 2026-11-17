@@ -14,6 +14,7 @@ toolboks-addon-sdk.workspace = true
 toolboks-shared.workspace = true
 
 [dev-dependencies]
+tempfile = "3.27.0"
 toolboks-addon-proto.workspace = true
 
 [target.'cfg(windows)'.dependencies]

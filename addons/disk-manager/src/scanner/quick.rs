@@ -319,7 +319,6 @@ mod tests {
             v
         };
         assert_eq!(tree(&qnodes), tree(&fresh_nodes));
-        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn cancelled_quick_scan_is_partial_and_never_marked_finished() {
@@ -329,7 +328,6 @@ mod tests {
         let shared = Arc::new(Mutex::new(State::default()));
         rescan(nodes, p, shared.clone(), Arc::new(AtomicBool::new(true)));
         assert!(shared.lock().unwrap().progress.cancelled);
-        fs::remove_dir(root).unwrap();
     }
     #[test]
     #[ignore = "read-only full-drive benchmark; mutates only the explicitly named fixture folder"]

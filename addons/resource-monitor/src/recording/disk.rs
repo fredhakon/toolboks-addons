@@ -1325,11 +1325,14 @@ pub(crate) mod tests {
         let a = store.names.intern("a.exe").unwrap();
         let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(Writer::new(dir.clone(), 1, t))];
         for i in 0..11 {
-            store.push_step(step(i + 1, t + i as i64 * 5000, &[(a, 1.0)]), &mut sinks);
+            store.push_step(
+                step(i + 1, t + (i as i64 + 1) * 5000, &[(a, 1.0)]),
+                &mut sinks,
+            );
         }
         assert_eq!(size_on_disk(&dir), 0, "nothing written inside the minute");
         // The first step of the next minute closes the minute bucket: one write of everything.
-        store.push_step(step(13, t + 60_000, &[(a, 1.0)]), &mut sinks);
+        store.push_step(step(13, t + 65_000, &[(a, 1.0)]), &mut sinks);
         let after_minute = load(&dir, &all(t));
         assert_eq!(after_minute.steps.len(), 11);
         assert_eq!(after_minute.minutes.len(), 1);

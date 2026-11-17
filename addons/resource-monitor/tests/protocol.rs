@@ -70,8 +70,12 @@ fn protocol_test_host_draws_pings_and_quits() {
     // CI can exercise the exact release executable, rather than Cargo's test build.
     let exe = std::env::var("ADDON_TEST_EXE")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_resource-monitor").into());
+    // Recording is on by default (#45): the add-on gets its own throwaway data folder, so the
+    // test never writes history into a real Toolboks folder.
+    let data = std::env::temp_dir().join(format!("rm-protocol-{}", std::process::id()));
     let mut child = Guard(
         Command::new(exe)
+            .env("TOOLBOKS_DATA_DIR", &data)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -160,4 +164,5 @@ fn protocol_test_host_draws_pings_and_quits() {
         assert!(std::time::Instant::now() < deadline, "add-on did not quit");
         std::thread::sleep(Duration::from_millis(10));
     }
+    let _ = std::fs::remove_dir_all(&data);
 }

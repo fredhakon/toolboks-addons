@@ -224,15 +224,23 @@ administrator rights. The live graphs live in memory while the add-on is shown.
 - **Background add-on.** `host-services.json` sets `"background": true`, so the host suspends
   Resource Monitor instead of ending it when another add-on is opened or the window goes to the
   tray. Only the history recorder keeps working then.
-- **Resource history (#36).** With the `history_recording` preference on, a recorder thread
+- **Resource history (#36).** Unless the `history_recording` preference is `false` (it is on by
+  default, owner decision on #45), a recorder thread
   (`src/recording/`) reads the system every 5 s and saves per-app use (exe names, times and
   figures; never paths, window titles or command lines) to
   `addon-data/toolboks.resource-monitor/history/` in the Toolboks data folder: every step for the
   last hour, per-minute buckets for 24 hours, 5-minute buckets, app starts and exits for 7 days.
   Append-only files split by time, written once a minute, pruned on start and every hour; at
   most about 7 MB for a full week (budget 20 MB; 6.8 MB in the worst-case test). Nothing is sent anywhere. The manifest's `data_note`
-  says so in the install review. The switch, size, Delete history and Open history folder come
-  with #45; until then recording is off by default.
+  says so in the install review. It records while Toolboks runs, also when the window is closed
+  to the tray, and stops when Toolboks quits.
+- **History settings (#45, `src/history_settings.rs`).** At the top of the History page: a
+  one-time note that says what is saved and where (with a link to the switch), and one compact
+  group with the "Record resource history" switch, the size on disk, "Delete history" (asks
+  first) and "Open history folder". With the switch off no resource history is recorded or
+  written (Toolboks still saves its own settings, this switch among them), and the history saved
+  earlier is offered for deletion. Switching off never blocks the page; a new recorder starts
+  only after the previous one has finished its last reading, so two never write at once.
 - **History page (#42).** A fifth page, History, reads the saved history (`src/history_page/`):
   presets (last hour, last 24 hours, yesterday, last 7 days), a From and To in local time, Now
   back to live, one lane per resource in the Overview colours, gaps hatched and labelled

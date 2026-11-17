@@ -8,6 +8,7 @@ mod details;
 mod gpu;
 mod history;
 mod history_page;
+mod history_settings;
 mod list;
 mod lower_confirm;
 mod memory_breakdown;
@@ -146,9 +147,23 @@ pub struct Resources {
     /// Which page is shown: 0 Overview, 1 Details, 2 Processes, 3 Connections, 4 History.
     page: usize,
     history: history_page::Page,
-    /// Resource history recorder (off unless the preference switches it on). Kept across
+    /// The switch, size, delete and folder group and the one-time note on the History page.
+    history_settings: history_settings::Settings,
+    /// Resource history recorder (on unless the preference switches it off). Kept across
     /// `suspend`, so it records while the page is closed and Toolboks sits in the tray.
     recording: recording::Control,
+}
+
+/// Starts the real recorder, saving to the history folder.
+#[cfg(not(test))]
+fn start_recorder() -> Option<recording::Recorder> {
+    recording::Recorder::start_system()
+}
+
+/// Unit tests never record the real system or write a history folder.
+#[cfg(test)]
+fn start_recorder() -> Option<recording::Recorder> {
+    recording::fake_recorder(Duration::from_secs(3600))
 }
 
 impl Resources {
@@ -179,6 +194,7 @@ impl Resources {
             connections: connections::Page::new(),
             page: 0,
             history: history_page::Page::new(),
+            history_settings: history_settings::Settings::default(),
             recording: recording::Control::default(),
         }
     }
@@ -245,24 +261,33 @@ fn style_once(ctx: &egui::Context) {
 }
 
 impl NativeAddon for Resources {
-    /// Starts or stops the history recorder from the add-on's own preferences (default off).
+    /// Starts or stops the history recorder from the add-on's own preferences (default on).
     fn load_preferences(
         &mut self,
         preferences: &std::collections::BTreeMap<String, serde_json::Value>,
     ) {
-        self.recording.apply(
-            recording::wanted(preferences),
-            recording::Recorder::start_system,
-        );
+        self.recording
+            .apply(recording::wanted(preferences), start_recorder);
     }
     fn ui(
         &mut self,
         ui: &mut egui::Ui,
-        _preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
+        preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
     ) -> bool {
         style_once(ui.ctx());
+        self.recording.poll(start_recorder);
+        let mut changed = false;
+        if self.page == 4 {
+            changed = self.history_settings.ui(
+                ui,
+                preferences,
+                &mut self.recording,
+                &recording::disk::directory(),
+                start_recorder,
+            );
+        }
         self.draw(ui, self.page);
-        false
+        changed
     }
     fn navigate(&mut self, page: &str) {
         self.page = page
@@ -287,10 +312,14 @@ impl NativeAddon for Resources {
         self.page = page;
         self.recording = recording;
     }
-    /// False: the recorder has its own thread and needs no 200 ms background ticks, so a
-    /// suspended Resource Monitor wakes nothing (and does nothing at all with recording off).
+    /// Normally false: the recorder has its own thread and needs no 200 ms background ticks,
+    /// so a suspended Resource Monitor wakes nothing (and does nothing at all with recording
+    /// off). True only while a restart or a delete waits for an old recorder thread to end.
     fn has_background_work(&self) -> bool {
-        false
+        self.recording.pending()
+    }
+    fn tick_background(&mut self) {
+        self.recording.poll(start_recorder);
     }
     fn status_items(&self) -> Vec<StatusItem> {
         let live = self.last_at.is_some_and(|t| t.elapsed() < LIVE_WITHIN);
@@ -462,13 +491,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recording_is_off_by_default_and_survives_suspend() {
+    fn recording_is_on_by_default_and_survives_suspend() {
         let mut addon = Resources::new();
+        let off = std::collections::BTreeMap::from([(
+            recording::PREF_KEY.to_string(),
+            serde_json::json!(false),
+        )]);
+        addon.load_preferences(&off);
+        assert!(!addon.recording.is_on(), "off when switched off");
         addon.load_preferences(&Default::default());
-        assert!(!addon.recording.is_on(), "off unless switched on");
-        addon.recording.apply(true, || {
-            recording::Recorder::spawn(std::time::Duration::from_secs(3600), || None)
-        });
+        assert!(addon.recording.is_on(), "on by default");
         let store = addon.recording.store().unwrap();
         addon.page = 2;
         addon.suspend();
@@ -479,8 +511,8 @@ mod tests {
         ));
         addon.resume();
         assert!(addon.recording.is_on());
-        // Switched off in the preferences: the recorder goes.
-        addon.load_preferences(&Default::default());
+        // Switched off in the preferences: the recorder goes, and nothing waits to start.
+        addon.load_preferences(&off);
         assert!(!addon.recording.is_on());
         assert!(!addon.has_background_work());
     }
@@ -537,8 +569,9 @@ mod tests {
             Box::new(|| steps() >= at_suspend + 5),
         );
         // Switched off: the recorder thread ends and releases its history.
+        let off = serde_json::json!({ recording::PREF_KEY: false }).to_string();
         writer
-            .write(&HostMessage::LoadPreferences { json: "{}".into() })
+            .write(&HostMessage::LoadPreferences { json: off })
             .unwrap();
         wait_until(
             "recorder thread ended",

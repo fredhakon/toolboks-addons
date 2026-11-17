@@ -853,6 +853,34 @@ pub fn size_on_disk(dir: &Path) -> u64 {
     list(dir).iter().map(|f| f.4).sum()
 }
 
+/// "Delete history" (#45): deletes every history file in `dir` (only files with our names;
+/// anything else is left alone), then the folder if it is empty. Call it only while no
+/// recorder writes there. Returns the number deleted, or what could not be deleted.
+pub fn delete_all(dir: &Path) -> Result<usize, String> {
+    let mut deleted = 0;
+    let mut failed = Vec::new();
+    for (path, ..) in list(dir) {
+        match fs::remove_file(&path) {
+            Ok(()) => deleted += 1,
+            Err(e) => failed.push(format!(
+                "{}: {e}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )),
+        }
+    }
+    // Only succeeds when nothing else is in the folder.
+    let _ = fs::remove_dir(dir);
+    if failed.is_empty() {
+        Ok(deleted)
+    } else {
+        Err(format!(
+            "{} history file(s) could not be deleted ({}). Try again in a moment.",
+            failed.len(),
+            failed.join("; ")
+        ))
+    }
+}
+
 /// Deletes the files whose whole period is older than their level's window, files dated more
 /// than a week ahead (a clock that was wrong), and then the oldest files while the total is
 /// over [`MAX_DISK_BYTES`]. Files in `open` are kept. Returns the number deleted.
@@ -1211,6 +1239,25 @@ pub(crate) mod tests {
             skip_run: None,
             now_ms: now,
         }
+    }
+
+    #[test]
+    fn delete_all_removes_only_history_files() {
+        let dir = test_dir("delete-only-ours");
+        fs::create_dir_all(&dir).unwrap();
+        for (level, run) in [(Level::Fine, 1), (Level::Minute, 1), (Level::Day, 2)] {
+            fs::write(dir.join(file_name(level, DAY0, run)), b"x").unwrap();
+        }
+        fs::write(dir.join("notes.txt"), b"not ours").unwrap();
+        assert_eq!(size_on_disk(&dir), 3);
+        assert_eq!(delete_all(&dir), Ok(3));
+        assert_eq!(size_on_disk(&dir), 0);
+        assert!(dir.join("notes.txt").exists(), "other files are left alone");
+        fs::remove_file(dir.join("notes.txt")).unwrap();
+        // Empty now: the folder goes too; a missing folder is nothing to delete.
+        assert_eq!(delete_all(&dir), Ok(0));
+        assert!(!dir.exists());
+        assert_eq!(delete_all(&dir), Ok(0));
     }
 
     #[test]

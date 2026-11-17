@@ -594,6 +594,131 @@
       "release_notes": "Release aural-v0.3.1.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.resource-monitor",
+      "title": "Resource Monitor",
+      "short_description": "Watch your processor, graphics, memory, disk and network.",
+      "long_description": "Resource Monitor draws live graphs of what your PC is doing. It also lists running apps, lets you change a process's priority or end it, and shows network connections. It reads system and process information; it changes something only when you use one of those process actions. With Record resource history on (the default), it saves which apps used the processor, memory, graphics and disk, and when: app names, times and figures, never window titles, file names or what you do in an app. It records while Toolboks runs, also when the window is closed to the tray, and stops when you quit. The history stays on this PC in the add-on's data folder, is kept for 7 days and is never sent anywhere. You can switch recording off and delete the history.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "activity",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "host_metrics",
+        "local_preferences"
+      ],
+      "pages": [
+        "Overview",
+        "Details",
+        "Processes",
+        "Connections",
+        "History"
+      ],
+      "background": true,
+      "data_note": "On by default: saves which apps used your PC's resources and when (app names, times, figures) on this PC for 7 days. Can be switched off and deleted.",
+      "kind": "native",
+      "version": "0.2.0",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/resource-monitor-v0.2.0/resource-monitor.exe",
+      "size": 4341760,
+      "sha256": "9eaa3f74979255250fd3104034199a6a21fe86516a1070adc41c9b8984946163",
+      "release_notes": "Release resource-monitor-v0.2.0.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.debloater",
+      "title": "Debloater",
+      "short_description": "Tune Windows privacy, apps, startup and background tasks.",
+      "long_description": "Debloater explains optional Windows changes in plain language, so you can turn off what you do not need. Nothing is changed until you choose it, and supported changes can be undone later, also after Toolboks closes or Windows restarts: Debloater keeps a small undo list in its own data folder. It changes your own account's settings: privacy and advertising switches, startup entries and installed apps. Changes that need administrator rights are made by a small separate helper that shows its own Confirm or Cancel window listing exactly what will change; Debloater itself never runs as administrator. The Startup page shows how much slower Windows measured an entry to start, read from Windows' boot performance log; the boot timings are read in memory only and never saved. Windows only lets administrators read that log on a default PC, and an administrator can allow reading in the log's access list (Toolboks never changes it).",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "sliders",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "system_tuning"
+      ],
+      "pages": [
+        "Privacy and ads",
+        "Apps",
+        "Startup",
+        "Tasks",
+        "Services"
+      ],
+      "background": false,
+      "kind": "native",
+      "version": "0.2.0",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/debloater-v0.2.0/debloater.exe",
+      "size": 3665920,
+      "sha256": "7b05480f41ac401345179ae648110010ddeafafe4471d2d90c8957771d2b6a81",
+      "release_notes": "Release debloater-v0.2.0.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.memory-cleaner",
+      "title": "Memory Cleaner",
+      "short_description": "Keep an eye on memory and clean up what idle apps are holding.",
+      "long_description": "Memory Cleaner shows how your memory is used, which apps hold the most, and how close Windows is to running short. It can trim the memory that idle apps are not using, by hand or automatically when memory is under real pressure, and it keeps a short history. Trimming moves memory into the cache and never closes an app. One advanced action, clearing the low-priority cache, changes how Windows manages memory for the whole PC: it asks for administrator rights in a separate window and only runs when you confirm there. It also reports to Home whether memory is under pressure, kept in memory only and never saved. Nothing is stored between runs.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "chip",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "host_metrics",
+        "system_tuning"
+      ],
+      "pages": [
+        "Home",
+        "Advanced"
+      ],
+      "background": true,
+      "checks": [
+        "Memory pressure"
+      ],
+      "kind": "native",
+      "version": "0.4.0",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/memory-cleaner-v0.4.0/memory-cleaner.exe",
+      "size": 3594752,
+      "sha256": "143225f8c14a0e7e034f9319cfe756785bbdc9c482baab8e50ff7462e5a9ce7d",
+      "release_notes": "Release memory-cleaner-v0.4.0.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.system-profiles",
+      "title": "System Profiles",
+      "short_description": "Review and apply a Windows gaming profile with a restore point, registry backup, and activity log.",
+      "long_description": "Choose the Gaming profile changes to apply, follow guided Windows and NVIDIA settings, and restore the settings Toolboks applied.",
+      "publisher": "Toolboks",
+      "category": "System",
+      "icon": "gauge",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "system_tuning"
+      ],
+      "pages": [],
+      "background": false,
+      "kind": "native",
+      "version": "0.2.0",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/system-profiles-v0.2.0/system-profiles.exe",
+      "size": 3355136,
+      "sha256": "1e434abe5524f7dcad77ac800aab1fa7685397f7520f5e353c9f3152f99ab50e",
+      "release_notes": "Release system-profiles-v0.2.0.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

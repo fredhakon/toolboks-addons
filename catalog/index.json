@@ -693,6 +693,32 @@
       "release_notes": "Release memory-cleaner-v0.4.0.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.system-profiles",
+      "title": "System Profiles",
+      "short_description": "Review and apply a Windows gaming profile with a restore point, registry backup, and activity log.",
+      "long_description": "Choose the Gaming profile changes to apply, follow guided Windows and NVIDIA settings, and restore the settings Toolboks applied.",
+      "publisher": "Toolboks",
+      "category": "System",
+      "icon": "gauge",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "system_tuning"
+      ],
+      "pages": [],
+      "background": false,
+      "kind": "native",
+      "version": "0.2.0",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/system-profiles-v0.2.0/system-profiles.exe",
+      "size": 3355136,
+      "sha256": "1e434abe5524f7dcad77ac800aab1fa7685397f7520f5e353c9f3152f99ab50e",
+      "release_notes": "Release system-profiles-v0.2.0.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

@@ -72,6 +72,9 @@ pub struct Sample {
     pub gpu: Option<GpuSample>,
     /// The biggest users of CPU, memory, GPU and disk.
     pub top: TopProcesses,
+    /// GPU load per process (pid, percent 0 to 100) from the same reading as `gpu`, for the
+    /// Processes page. Only processes using the GPU are listed.
+    pub gpu_pids: Vec<(u32, f32)>,
     /// One entry per drive, for the Details page.
     pub drives: Vec<DriveInfo>,
     /// One entry per network adapter that counts (loopback and tunnel adapters excluded).
@@ -356,6 +359,23 @@ pub(crate) fn refresh_procs(sys: &mut System) {
     );
 }
 
+/// GPU load per exe name (case-insensitive, first-seen casing kept): summed per name, then
+/// clamped to 100, largest first. `count` is the number of processes of that name using the GPU.
+/// The Overview GPU card and the Processes page GPU column both follow this rule.
+pub(crate) fn gpu_by_name(named: impl IntoIterator<Item = (String, f32)>) -> Vec<ProcUse> {
+    let mut rows = top_n(
+        named
+            .into_iter()
+            .map(|(name, load)| (name, f64::from(load))),
+        usize::MAX,
+    );
+    for row in &mut rows {
+        row.value = row.value.min(100.0);
+    }
+    rows.sort_by(|a, b| b.value.total_cmp(&a.value));
+    rows
+}
+
 /// Builds the four top lists from the freshly refreshed process table. `secs` is the real time
 /// since the previous refresh; `gpu_pids` is pid -> GPU percent.
 fn build_top(sys: &System, logical: usize, secs: f64, gpu_pids: &[(u32, f32)]) -> TopProcesses {
@@ -381,34 +401,12 @@ fn build_top(sys: &System, logical: usize, secs: f64, gpu_pids: &[(u32, f32)]) -
         }),
         TOP_ROWS,
     );
-    // Sum per name first (clamped to 100), then rank; `count` counts processes using the GPU.
-    let mut gpu_by_name: HashMap<String, (String, usize, f64)> = HashMap::new();
-    for (pid, load) in gpu_pids {
-        if let Some(p) = sys.process(sysinfo::Pid::from_u32(*pid)) {
-            let name = name_of(p);
-            let e = gpu_by_name
-                .entry(name.to_lowercase())
-                .or_insert((name, 0, 0.0));
-            e.1 += 1;
-            e.2 += *load as f64;
-        }
-    }
-    let mut gpu = top_n(
-        gpu_by_name
-            .into_values()
-            .map(|(name, _, v)| (name, v.min(100.0))),
-        TOP_ROWS,
-    );
-    // top_n counted one per name; restore the real process counts.
-    for row in &mut gpu {
-        row.count = gpu_pids
-            .iter()
-            .filter(|(pid, _)| {
-                sys.process(sysinfo::Pid::from_u32(*pid))
-                    .is_some_and(|p| name_of(p).eq_ignore_ascii_case(&row.name))
-            })
-            .count();
-    }
+    let named = gpu_pids.iter().filter_map(|(pid, load)| {
+        sys.process(sysinfo::Pid::from_u32(*pid))
+            .map(|p| (name_of(p), *load))
+    });
+    let mut gpu = gpu_by_name(named);
+    gpu.truncate(TOP_ROWS);
     TopProcesses {
         cpu,
         memory,
@@ -791,7 +789,7 @@ impl Sampler {
                         .map(|b| std::mem::take(&mut b.per_process))
                         .unwrap_or_default();
                     if let Ok(mut shared) = gpu_pids_shared.lock() {
-                        *shared = gpu_pids;
+                        shared.clone_from(&gpu_pids);
                     }
                     let sample = Sample {
                         cpu: sys.global_cpu_usage(),
@@ -816,6 +814,7 @@ impl Sampler {
                             merge_gpu(basic, nv)
                         }),
                         top: top.lock().map(|t| t.clone()).unwrap_or_default(),
+                        gpu_pids,
                         drives,
                         adapters,
                         counts: read_counts(),
@@ -991,6 +990,23 @@ mod tests {
         assert_eq!(cpu_percent_of_machine(-1.0, 4), 0.0);
         assert_eq!(cpu_percent_of_machine(50.0, 0), 0.0);
         assert_eq!(cpu_percent_of_machine(f32::NAN, 4), 0.0);
+    }
+
+    #[test]
+    fn gpu_by_name_sums_then_caps_and_counts_processes() {
+        let rows = gpu_by_name(vec![
+            ("game.exe".to_string(), 70.0),
+            ("Game.EXE".to_string(), 60.0),
+            ("chrome.exe".to_string(), 5.0),
+            ("chrome.exe".to_string(), 2.5),
+            ("idle.exe".to_string(), 0.0),
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "game.exe");
+        assert_eq!(rows[0].value, 100.0);
+        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[1].value, 7.5);
+        assert_eq!(rows[1].count, 2);
     }
 
     #[test]

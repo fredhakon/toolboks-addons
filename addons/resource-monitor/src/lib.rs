@@ -336,6 +336,7 @@ impl Resources {
             mem_total: self.info.as_ref().map_or(0, |i| i.mem_total),
             disk_active: sample.disk_active,
             disk_bps: sample.disk_read_bps + sample.disk_write_bps,
+            gpu: sample.gpu.as_ref().and_then(|g| g.load),
         })
     }
 
@@ -392,6 +393,8 @@ impl Resources {
                         }
                         None => self.gpu_missing = self.gpu_missing.saturating_add(1),
                     }
+                    let gpu_pids = sample.gpu.as_ref().map(|_| sample.gpu_pids.as_slice());
+                    self.processes.set_gpu(gpu_pids);
                     self.last = Some(*sample);
                     self.last_at = Some(Instant::now());
                 }

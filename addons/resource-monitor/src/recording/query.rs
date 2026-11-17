@@ -992,6 +992,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Prints the breakdown of a recorded period, to compare with Windows' own counters (#43,
+    /// #46). `RM_REPORT_DIR` (a history folder), `RM_REPORT_FROM` and `RM_REPORT_TO` (UTC ms).
+    /// `cargo test --release -p resource-monitor --lib report_from_env -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn report_from_env() {
+        let dir = std::path::PathBuf::from(std::env::var("RM_REPORT_DIR").expect("RM_REPORT_DIR"));
+        let num = |k: &str| -> i64 { std::env::var(k).ok().and_then(|v| v.parse().ok()).expect(k) };
+        let (from, to) = (num("RM_REPORT_FROM"), num("RM_REPORT_TO"));
+        let src = Sources { dir, live: None };
+        let req = Request {
+            from_ms: from,
+            to_ms: to,
+            bins: 10,
+            app: None,
+        };
+        let a = answer(&src, &req, super::super::utc_ms());
+        let b = &a.breakdown;
+        println!(
+            "period {} s, recorded {:.0} s, problems {:?}",
+            (to - from) / 1000,
+            b.recorded_secs,
+            a.problems
+        );
+        for (r, name, i, scale, unit) in [
+            (Resource::Cpu, "CPU", CPU, 1.0, "%"),
+            (Resource::Memory, "Memory", MEM, 1.0 / 1048576.0, "MB"),
+            (Resource::Gpu, "GPU", GPU, 1.0, "%"),
+            (
+                Resource::Disk,
+                "Disk write",
+                DISK_WRITE,
+                1.0 / 1048576.0,
+                "MB/s",
+            ),
+        ] {
+            println!("{name}:");
+            for row in b.ranked(r).into_iter().take(5) {
+                let f = row.figures[i];
+                println!(
+                    "  {:<28} avg {:>9.2} {unit}  peak {:>9.2} {unit}  share {:>5.1} %  active {:>5.0} s",
+                    row.name,
+                    f.avg * scale,
+                    f.peak * scale,
+                    f.share * 100.0,
+                    row.active_secs
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_worker_answers_off_the_calling_thread() {
         let dir = test_dir("query-worker");

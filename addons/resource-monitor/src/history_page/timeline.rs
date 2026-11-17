@@ -121,6 +121,8 @@ pub struct Timeline<'a> {
     pub empty: Option<Empty<'a>>,
     pub now: i64,
     pub lane_h: f32,
+    /// The app drawn over the totals (exe name), with its starts and exits.
+    pub app: Option<&'a str>,
 }
 
 /// The bin of `curve` holding `t`.
@@ -339,6 +341,48 @@ pub fn show(
         let lines = std::iter::once(lane.first).chain(lane.second);
         for (n, (idx, color, _)) in lines.enumerate() {
             paint_line(&painter, plot, bins, idx, max, color, n == 0, &x_of);
+        }
+        if t.app.is_some() && t.empty.is_none() {
+            paint_app(&painter, plot, bins, i, max, &x_of);
+        }
+    }
+
+    // The selected app's starts and exits: a line through the lanes and a mark on the axis.
+    if let (Some(name), Some(ans)) = (t.app, t.curve) {
+        use crate::recording::record::EventKind;
+        for e in ans
+            .events
+            .iter()
+            .filter(|e| e.name.eq_ignore_ascii_case(name))
+        {
+            if !(view.from..view.to).contains(&e.utc_ms) {
+                continue;
+            }
+            let x = x_of(e.utc_ms);
+            let (color, up) = match e.kind {
+                EventKind::Started | EventKind::AlreadyRunning => (DATA_GPU, true),
+                EventKind::Exited => (MUTED, false),
+            };
+            painter.vline(
+                x,
+                lanes.y_range(),
+                Stroke::new(1.0, color.gamma_multiply(0.6)),
+            );
+            let y = axis.top() + 1.0;
+            let tri = if up {
+                vec![
+                    Pos2::new(x - 4.0, y + 7.0),
+                    Pos2::new(x + 4.0, y + 7.0),
+                    Pos2::new(x, y),
+                ]
+            } else {
+                vec![
+                    Pos2::new(x - 4.0, y),
+                    Pos2::new(x + 4.0, y),
+                    Pos2::new(x, y + 7.0),
+                ]
+            };
+            painter.add(egui::Shape::convex_polygon(tri, color, Stroke::NONE));
         }
     }
 
@@ -589,6 +633,54 @@ fn paint_line(
         }
     }
     flush(&mut avg, &mut peak);
+}
+
+/// The selected app in lane `lane` (CPU, memory, GPU, disk read plus write), in white over the
+/// totals. Network is not recorded per app.
+fn paint_app(
+    painter: &egui::Painter,
+    plot: Rect,
+    bins: &[Bin],
+    lane: usize,
+    max: f64,
+    x_of: &dyn Fn(i64) -> f32,
+) {
+    let value = |b: &Bin| -> Option<f32> {
+        let a = b.app.filter(|_| !b.is_gap())?;
+        Some(match lane {
+            0 => a[0].avg,
+            1 => a[1].avg,
+            2 => a[2].avg,
+            3 => a[3].avg + a[4].avg,
+            _ => return None,
+        })
+    };
+    let y = |v: f32| {
+        plot.bottom() - (v as f64 / max.max(f64::EPSILON)).clamp(0.0, 1.0) as f32 * plot.height()
+    };
+    let mut line: Vec<Pos2> = Vec::new();
+    let stroke = Stroke::new(1.5, TEXT);
+    for b in bins {
+        let (x0, x1) = (x_of(b.start_ms), x_of(b.end_ms));
+        if x1 < plot.left() || x0 > plot.right() {
+            continue;
+        }
+        match value(b) {
+            Some(v) => line.push(Pos2::new(
+                (x0.max(plot.left()) + x1.min(plot.right())) / 2.0,
+                y(v),
+            )),
+            None => {
+                if line.len() > 1 {
+                    painter.add(egui::Shape::line(std::mem::take(&mut line), stroke));
+                }
+                line.clear();
+            }
+        }
+    }
+    if line.len() > 1 {
+        painter.add(egui::Shape::line(line, stroke));
+    }
 }
 
 /// Diagonal hatching over `r`.

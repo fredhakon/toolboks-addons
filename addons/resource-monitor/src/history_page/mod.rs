@@ -7,6 +7,7 @@
 //! All reading happens on query workers ([`crate::recording::query::Worker`]); the page only
 //! sends requests and draws answers.
 
+mod breakdown;
 mod time;
 mod timeline;
 mod view;
@@ -14,7 +15,7 @@ mod view;
 use std::time::{Duration, Instant};
 
 use egui::RichText;
-use toolboks_shared::format::{friendly_name, rate, size_plain};
+use toolboks_shared::format::friendly_name;
 use toolboks_shared::ui::{
     pill, ACCENT, AMBER, CARD_PAD, DATA_GPU, DATA_MEMORY, GAP, MUTED, SPACE_L, TEXT_CAPTION,
     TEXT_SECTION,
@@ -27,8 +28,6 @@ use view::{Marks, Preset, View};
 
 /// A live view is read again this often.
 const LIVE_EVERY: Duration = Duration::from_secs(5);
-/// Apps listed.
-const APP_ROWS: usize = 12;
 
 /// What the page needs from the add-on each frame.
 pub(crate) struct Inputs {
@@ -44,6 +43,8 @@ pub(crate) struct Page {
     marks: Marks,
     drag: Drag,
     apps_by: Resource,
+    /// The app drawn on the timeline (exe name).
+    selected_app: Option<String>,
     curve_worker: Option<query::Worker>,
     detail_worker: Option<query::Worker>,
     curve: Option<Answer>,
@@ -68,6 +69,7 @@ impl Page {
             marks: Marks::default(),
             drag: Drag::default(),
             apps_by: Resource::Cpu,
+            selected_app: None,
             curve_worker: None,
             detail_worker: None,
             curve: None,
@@ -130,7 +132,7 @@ impl Page {
             from_ms: self.view.from,
             to_ms: self.view.to,
             bins,
-            app: None,
+            app: self.selected_app.clone(),
         };
         if stale || self.asked_curve.as_ref() != Some(&curve) {
             if self.curve_worker.is_none() {
@@ -198,6 +200,7 @@ impl Page {
             empty: empty.map(|(title, body)| Empty { title, body }),
             now,
             lane_h,
+            app: self.selected_app.as_deref(),
         };
         self.lanes = timeline::show(ui, &t, &mut self.view, &mut self.marks, &mut self.drag);
         if empty.is_some_and(|(title, _)| title == NOTHING.0)
@@ -416,64 +419,74 @@ impl Page {
 
     fn apps_ui(&mut self, ui: &mut egui::Ui, now: i64) {
         let (from, to) = self.focus_period();
-        let title = if self.marks.selection.is_some() {
-            format!(
-                "Apps between {}",
-                time::period(from, to, now, true).replacen(" to ", " and ", 1)
-            )
+        let (title, when) = if self.marks.selection.is_some() {
+            let p = time::period(from, to, now, true).replacen(" to ", " and ", 1);
+            (format!("Apps between {p}"), format!("Between {p}"))
         } else if let Some(c) = self.marks.cursor {
-            format!("Apps at {}", time::moment(c, now, true))
+            let m = time::moment(c, now, true);
+            (format!("Apps at {m}"), format!("At {m}"))
         } else {
-            "Apps in this period".to_string()
+            let p = time::period(from, to, now, false).replacen(" to ", " and ", 1);
+            ("Apps in this period".to_string(), format!("Between {p}"))
         };
+        let ready = self
+            .detail
+            .as_ref()
+            .filter(|d| d.request.as_ref() == self.asked_detail.as_ref());
+        let by = self.apps_by;
+        let rows = ready.map(|d| breakdown::rows(&d.breakdown, by));
+        let sentence = ready.map(|d| breakdown::sentence(&d.breakdown, by, &when, self.mem_total));
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.label(RichText::new(title).size(TEXT_SECTION).strong());
+            ui.label(RichText::new(&title).size(TEXT_SECTION).strong());
             ui.add_space(GAP);
-            for (r, label) in [
-                (Resource::Cpu, "CPU"),
-                (Resource::Memory, "Memory"),
-                (Resource::Gpu, "GPU"),
-                (Resource::Disk, "Disk"),
+            for r in [
+                Resource::Cpu,
+                Resource::Memory,
+                Resource::Gpu,
+                Resource::Disk,
             ] {
-                if pill(ui, label, self.apps_by == r).clicked() {
+                if pill(ui, breakdown::resource_name(r), self.apps_by == r).clicked() {
                     self.apps_by = r;
                 }
             }
+            ui.add_space(GAP);
+            let copy = ui.add_enabled(rows.is_some(), egui::Button::new("Copy table"));
+            if copy
+                .on_hover_text("Copies the sentence and the table as text (tab-separated)")
+                .clicked()
+            {
+                if let (Some(rows), Some(s)) = (&rows, &sentence) {
+                    ui.ctx()
+                        .copy_text(breakdown::copy_text(&title, s, by, rows));
+                }
+            }
         });
-        ui.label(
-            RichText::new("Network use is recorded for the whole PC only, not per app.")
-                .size(TEXT_CAPTION)
-                .weak(),
-        );
-        let Some(d) = self
-            .detail
-            .as_ref()
-            .filter(|d| d.request.as_ref() == self.asked_detail.as_ref())
-        else {
+        let (Some(rows), Some(sentence)) = (rows, sentence) else {
             ui.label(RichText::new("Reading...").weak());
             return;
         };
-        let b = &d.breakdown;
-        if b.recorded_secs <= 0.0 {
-            ui.label(RichText::new("Nothing was recorded here.").weak());
-            return;
+        ui.label(RichText::new(sentence).strong());
+        ui.label(
+            RichText::new(
+                "Network use is recorded for the whole PC only, not per app. Select an app to draw it on the timeline.",
+            )
+            .size(TEXT_CAPTION)
+            .weak(),
+        );
+        if let Some(name) = self.selected_app.clone() {
+            self.app_events_line(ui, &name, now);
         }
-        let rows = b.ranked(self.apps_by);
-        if rows.is_empty() {
-            ui.label(RichText::new("No app used this resource here.").weak());
-            return;
-        }
-        let color = match self.apps_by {
+        let color = match by {
             Resource::Cpu => ACCENT,
             Resource::Memory => DATA_MEMORY,
             Resource::Gpu => DATA_GPU,
             Resource::Disk => AMBER,
         };
-        let by = self.apps_by;
         let width = ui.available_width();
-        let (name_w, num_w, gap) = (170.0, 86.0, 12.0);
+        let (name_w, num_w, gap) = (190.0, 96.0, 12.0);
         let bar_w = (width - name_w - 3.0 * num_w - 4.0 * gap - 2.0 * CARD_PAD).clamp(60.0, 320.0);
+        let mut clicked: Option<String> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .show(ui, |ui| {
@@ -481,70 +494,122 @@ impl Page {
                     .num_columns(5)
                     .spacing([gap, 4.0])
                     .show(ui, |ui| {
-                        for h in ["App", "Share", "Average", "Peak", "Active"] {
+                        let share_head = format!("{} share", breakdown::resource_name(by));
+                        for h in ["App", share_head.as_str(), "Average", "Peak", "Active"] {
                             ui.label(RichText::new(h).size(TEXT_CAPTION).color(MUTED));
                         }
                         ui.end_row();
-                        for a in rows.iter().take(APP_ROWS) {
+                        for r in &rows {
                             ui.allocate_ui_with_layout(
-                                egui::vec2(name_w, 18.0),
+                                egui::vec2(name_w, 20.0),
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     ui.set_width(name_w);
-                                    ui.add(egui::Label::new(friendly_name(&a.name)).truncate())
-                                        .on_hover_text(&a.name);
+                                    match &r.kind {
+                                        breakdown::Kind::App(name) => {
+                                            let on = self
+                                                .selected_app
+                                                .as_deref()
+                                                .is_some_and(|s| s.eq_ignore_ascii_case(name));
+                                            let resp = ui
+                                                .selectable_label(on, friendly_name(name))
+                                                .on_hover_text(format!(
+                                                    "{name}: click to draw it on the timeline"
+                                                ));
+                                            if resp.clicked() {
+                                                clicked = Some(name.clone());
+                                            }
+                                        }
+                                        _ => {
+                                            ui.label(RichText::new(&r.label).weak());
+                                        }
+                                    }
                                 },
                             );
-                            let (avg, peak, share) = figures(by, a);
-                            ui.add(
-                                egui::ProgressBar::new(share as f32)
-                                    .desired_width(bar_w)
-                                    .desired_height(10.0)
-                                    .fill(color),
-                            )
-                            .on_hover_text(format!("{:.0} % of all apps", share * 100.0));
-                            ui.label(avg);
-                            ui.label(RichText::new(peak).weak());
-                            ui.label(RichText::new(time::duration(a.active_secs)).weak());
+                            match r.share {
+                                Some(share) => {
+                                    let fill = if r.kind == breakdown::Kind::Else {
+                                        MUTED
+                                    } else {
+                                        color
+                                    };
+                                    ui.add(
+                                        egui::ProgressBar::new(share as f32)
+                                            .desired_width(bar_w)
+                                            .desired_height(10.0)
+                                            .fill(fill),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{:.1} % of what all apps used",
+                                        share * 100.0
+                                    ));
+                                }
+                                None => {
+                                    ui.label("");
+                                }
+                            }
+                            ui.label(&r.avg);
+                            ui.label(RichText::new(&r.peak).weak());
+                            ui.label(RichText::new(&r.active).weak());
                             ui.end_row();
                         }
                     });
             });
-    }
-}
-
-/// Average, peak and share of one app for a resource, as text.
-fn figures(by: Resource, a: &query::AppRow) -> (String, String, f64) {
-    let f = &a.figures;
-    match by {
-        Resource::Cpu => (
-            format!("{:.1} %", f[query::CPU].avg),
-            format!("{:.0} %", f[query::CPU].peak),
-            f[query::CPU].share,
-        ),
-        Resource::Memory => (
-            size_plain(f[query::MEM].avg as u64),
-            size_plain(f[query::MEM].peak as u64),
-            f[query::MEM].share,
-        ),
-        Resource::Gpu => (
-            format!("{:.1} %", f[query::GPU].avg),
-            format!("{:.0} %", f[query::GPU].peak),
-            f[query::GPU].share,
-        ),
-        Resource::Disk => {
-            if !a.disk_known {
-                return ("unknown".into(), "unknown".into(), 0.0);
-            }
-            let (r, w) = (&f[query::DISK_READ], &f[query::DISK_WRITE]);
-            let total = r.total + w.total;
-            let share = if total > 0.0 {
-                (r.share * r.total + w.share * w.total) / total
-            } else {
-                0.0
-            };
-            (rate(r.avg + w.avg), rate(r.peak.max(w.peak)), share)
+        if let Some(name) = clicked {
+            let same = self
+                .selected_app
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&name));
+            self.selected_app = (!same).then_some(name);
         }
+    }
+
+    /// "chrome.exe on the timeline (white line): started 14:02, exited 14:40."
+    fn app_events_line(&mut self, ui: &mut egui::Ui, name: &str, now: i64) {
+        let mut text = format!("{name} is drawn on the timeline (white line)");
+        if let Some(a) = &self.curve {
+            let mut parts: Vec<String> = Vec::new();
+            for e in a
+                .events
+                .iter()
+                .filter(|e| e.name.eq_ignore_ascii_case(name))
+            {
+                let at = time::moment(e.utc_ms, now, false);
+                let what = match e.kind {
+                    crate::recording::record::EventKind::Started if e.during_gap => {
+                        format!("started while not recorded (seen at {at})")
+                    }
+                    crate::recording::record::EventKind::Started => format!("started {at}"),
+                    crate::recording::record::EventKind::Exited if e.during_gap => {
+                        format!("exited while not recorded (noticed at {at})")
+                    }
+                    crate::recording::record::EventKind::Exited => format!("exited {at}"),
+                    crate::recording::record::EventKind::AlreadyRunning => {
+                        format!("running when recording began {at}")
+                    }
+                };
+                parts.push(what);
+            }
+            if parts.is_empty() {
+                text.push_str(": no start or exit in this view.");
+            } else {
+                let n = parts.len();
+                if n > 6 {
+                    parts.drain(..n - 6);
+                    text.push_str(&format!(": {} more before; ", n - 6));
+                } else {
+                    text.push_str(": ");
+                }
+                text.push_str(&parts.join(", "));
+                text.push('.');
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(text).size(TEXT_CAPTION));
+            if ui.small_button("Hide").clicked() {
+                self.selected_app = None;
+            }
+        });
     }
 }
 
@@ -724,6 +789,34 @@ mod tests {
             egui::Modifiers::NONE,
         );
         assert_eq!(page.marks, Marks::default());
+        // The apps table draws, with an app selected and drawn on the timeline.
+        let row = |name: &str, cpu: f64| query::AppRow {
+            name: name.into(),
+            active_secs: 60.0,
+            peak_procs: 1,
+            disk_known: name != "MsMpEng.exe",
+            figures: [query::Figure {
+                avg: cpu,
+                peak: cpu,
+                total: cpu * 60.0,
+                share: 0.5,
+            }; 5],
+        };
+        page.detail = Some(Answer {
+            breakdown: Breakdown {
+                from_ms: 0,
+                to_ms: 120_000,
+                recorded_secs: 60.0,
+                apps: vec![row("chrome.exe", 20.0), row("MsMpEng.exe", 5.0)],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        page.selected_app = Some("chrome.exe".into());
+        for by in [Resource::Cpu, Resource::Disk] {
+            page.apps_by = by;
+            frame(&ctx, &mut page, vec![], egui::Modifiers::NONE);
+        }
         // Empty states draw.
         page.curve.as_mut().unwrap().breakdown.recorded_secs = 0.0;
         frame(&ctx, &mut page, vec![], egui::Modifiers::NONE);

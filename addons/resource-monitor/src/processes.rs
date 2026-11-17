@@ -1949,6 +1949,36 @@ pub(super) fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.spacing_mut().item_spacing.y = 4.0;
 }
 
+/// A child that waits on its stdin, for the tests that act on a real process.
+///
+/// The path must use backslashes only. With `System32/cmd.exe` (a forward slash) `cmd` reads
+/// part of its own path as a switch, prints "The syntax of the command is incorrect." and exits
+/// about 15 ms after it starts. A test that finished inside that window passed; a test that was
+/// slowed down by a busy PC lost the race (issue #99).
+#[cfg(test)]
+pub(super) fn spawn_idle_child() -> std::process::Child {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32")
+        .join("cmd.exe");
+    let mut child = Command::new(cmd)
+        .args(["/d", "/q", "/c", "set /p toolboks_test_wait="])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .unwrap();
+    // Say so at once if the child is not waiting, instead of failing later in a sampling step.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the test child exited right after it was started"
+    );
+    child
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2550,19 +2580,7 @@ mod tests {
 
     #[test]
     fn process_actions_verify_identity_on_the_handle_they_modify() {
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-
-        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/cmd.exe");
-        let mut child = Command::new(cmd)
-            .args(["/d", "/q", "/c", "set /p toolboks_test_wait="])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .spawn()
-            .unwrap();
+        let mut child = spawn_idle_child();
         let sample_start = snapshot_start();
         let pid = sysinfo::Pid::from_u32(child.id());
         let mut system = System::new().unwrap();

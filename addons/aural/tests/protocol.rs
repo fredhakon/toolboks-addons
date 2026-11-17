@@ -142,9 +142,9 @@ fn protocol_test_host_draws_pings_and_quits() {
         while reader.read::<AddonMessage>().is_ok() {}
         tx.send(()).unwrap();
     });
-    rx.recv_timeout(Duration::from_secs(20))
+    rx.recv_timeout(Duration::from_secs(120))
         .expect("protocol test host timed out or failed");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success());

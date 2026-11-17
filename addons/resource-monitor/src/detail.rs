@@ -262,6 +262,11 @@ impl Resources {
                 note: None,
             },
         );
+        super::memory_breakdown::breakdown_card(
+            ui,
+            width,
+            self.last.as_ref().and_then(|s| s.memory.as_ref()),
+        );
         self.top_card(ui, width, Resource::Memory);
     }
 

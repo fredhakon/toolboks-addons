@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use sysinfo::{DiskRefreshKind, Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
 
 use super::gpu::{GpuBasic, GpuReader};
+use super::memory_breakdown::{self, MemoryBreakdown, Pages};
 use super::nvml::{Nvml, NvmlReading};
 use windows::core::w;
 use windows::Win32::System::Performance::{
@@ -81,6 +82,8 @@ pub struct Sample {
     pub adapters: Vec<AdapterInfo>,
     /// System-wide process, thread and handle counts, if Windows reports them.
     pub counts: Option<SystemCounts>,
+    /// Committed, cached, pools and compressed memory, if Windows reports them.
+    pub memory: Option<MemoryBreakdown>,
 }
 
 /// A drive (disk volume) with its capacity and current throughput.
@@ -153,6 +156,8 @@ pub struct TopProcesses {
     pub memory: Vec<ProcUse>,
     pub gpu: Vec<ProcUse>,
     pub disk: Vec<ProcUse>,
+    /// Working set of the Memory Compression process, if it runs and can be read.
+    pub compressed: Option<u64>,
 }
 
 pub enum Msg {
@@ -296,18 +301,28 @@ fn read_adapters(nets: &Networks, secs: f64) -> Vec<AdapterInfo> {
     build_adapters(&items, secs)
 }
 
-/// System-wide process, thread and handle counts; None if the call fails.
-fn read_counts() -> Option<SystemCounts> {
+/// System-wide process, thread and handle counts and the memory breakdown (without compressed
+/// memory); None if the call fails.
+fn read_counts() -> Option<(SystemCounts, MemoryBreakdown)> {
     let mut info = PERFORMANCE_INFORMATION::default();
     let cb = std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32;
     info.cb = cb;
     // SAFETY: `info` is a valid, writable PERFORMANCE_INFORMATION and `cb` is its exact size.
     unsafe { GetPerformanceInfo(&mut info, cb) }.ok()?;
-    Some(SystemCounts {
+    let counts = SystemCounts {
         processes: info.ProcessCount,
         threads: info.ThreadCount,
         handles: info.HandleCount,
-    })
+    };
+    let memory = MemoryBreakdown::from_pages(Pages {
+        commit_total: info.CommitTotal,
+        commit_limit: info.CommitLimit,
+        system_cache: info.SystemCache,
+        kernel_paged: info.KernelPaged,
+        kernel_nonpaged: info.KernelNonpaged,
+        page_size: info.PageSize,
+    });
+    Some((counts, memory))
 }
 
 /// Per-process CPU is percent of one core; this converts it to percent of the whole machine.
@@ -407,11 +422,19 @@ fn build_top(sys: &System, logical: usize, secs: f64, gpu_pids: &[(u32, f32)]) -
     });
     let mut gpu = gpu_by_name(named);
     gpu.truncate(TOP_ROWS);
+    let compressed = memory_breakdown::compressed_bytes(sys.processes().values().map(|p| {
+        (
+            p.name().to_str().unwrap_or_default(),
+            p.parent().map(|q| q.as_u32()),
+            p.memory(),
+        )
+    }));
     TopProcesses {
         cpu,
         memory,
         gpu,
         disk,
+        compressed,
     }
 }
 
@@ -791,6 +814,8 @@ impl Sampler {
                     if let Ok(mut shared) = gpu_pids_shared.lock() {
                         shared.clone_from(&gpu_pids);
                     }
+                    let top = top.lock().map(|t| t.clone()).unwrap_or_default();
+                    let perf = read_counts();
                     let sample = Sample {
                         cpu: sys.global_cpu_usage(),
                         cores: sys.cpus().iter().map(|c| c.usage()).collect(),
@@ -813,11 +838,15 @@ impl Sampler {
                             };
                             merge_gpu(basic, nv)
                         }),
-                        top: top.lock().map(|t| t.clone()).unwrap_or_default(),
+                        memory: perf.map(|(_, m)| MemoryBreakdown {
+                            compressed: top.compressed,
+                            ..m
+                        }),
+                        top,
                         gpu_pids,
                         drives,
                         adapters,
-                        counts: read_counts(),
+                        counts: perf.map(|(c, _)| c),
                     };
                     if tx.send(Msg::Sample(Box::new(sample))).is_err() {
                         return;
@@ -967,8 +996,10 @@ mod tests {
 
     #[test]
     fn counts_read_on_windows() {
-        let c = read_counts().expect("GetPerformanceInfo");
+        let (c, m) = read_counts().expect("GetPerformanceInfo");
         assert!(c.processes > 0 && c.threads > 0 && c.handles > 0);
+        assert!(m.committed > 0 && m.committed <= m.commit_limit);
+        assert!(m.cached > 0 && m.paged_pool > 0 && m.nonpaged_pool > 0);
     }
 
     #[test]
@@ -1136,6 +1167,7 @@ mod tests {
                         );
                         println!("  gpu {:?}", s.gpu);
                         println!("  counts {:?}", s.counts);
+                        println!("  memory {:?}", s.memory);
                         for d in &s.drives {
                             println!("  drive {d:?}");
                         }

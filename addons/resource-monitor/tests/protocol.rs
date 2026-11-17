@@ -12,7 +12,7 @@ struct Guard(Child);
 #[test]
 fn manifest_matches_the_executable() {
     let package =
-        toolboks_addon_sdk::Package::parse(include_bytes!("../resource-monitor.tbaddon"), "0.12.5")
+        toolboks_addon_sdk::Package::parse(include_bytes!("../resource-monitor.tbaddon"), "0.14.0")
             .unwrap();
     assert_eq!(package.manifest.id, "toolboks.resource-monitor");
     assert_eq!(package.manifest.id, resource_monitor::ID);
@@ -29,7 +29,16 @@ fn manifest_matches_the_executable() {
     );
     assert_eq!(
         package.manifest.capabilities,
-        [toolboks_addon_sdk::Capability::HostMetrics,]
+        [
+            toolboks_addon_sdk::Capability::HostMetrics,
+            toolboks_addon_sdk::Capability::LocalPreferences,
+        ]
+    );
+    // The install review says that resource history is saved on this PC (#40).
+    let note = package.manifest.data_note.as_deref().unwrap();
+    assert!(
+        note.contains("7 days") && note.contains("on this PC"),
+        "{note}"
     );
 }
 impl Drop for Guard {

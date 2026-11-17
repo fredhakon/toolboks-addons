@@ -63,6 +63,15 @@ impl Core {
         }
     }
 
+    /// Recording stops: closes the open buckets (their coverage says how much of the period was
+    /// recorded) and lets the sinks write out what they buffered.
+    pub fn finish(&mut self, store: &mut Store) {
+        store.close_buckets(&mut self.sinks);
+        for sink in &mut self.sinks {
+            sink.finish();
+        }
+    }
+
     pub fn push(
         &mut self,
         store: &mut Store,

@@ -120,9 +120,11 @@ impl Tier {
 /// calls it on its own thread, never on the UI thread.
 pub trait Sink: Send {
     fn step(&mut self, _names: &NameTable, _record: &StepRecord) {}
-    fn bucket(&mut self, _tier: Tier, _bucket: &Bucket) {}
+    fn bucket(&mut self, _names: &NameTable, _tier: Tier, _bucket: &Bucket) {}
     fn event(&mut self, _names: &NameTable, _event: &AppEvent) {}
     fn marker(&mut self, _marker: &Marker) {}
+    /// Recording stops: write out anything buffered.
+    fn finish(&mut self) {}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -361,7 +363,7 @@ impl Store {
             let tier = acc.tier;
             let bucket = acc.close();
             for sink in sinks.iter_mut() {
-                sink.bucket(tier, &bucket);
+                sink.bucket(&self.names, tier, &bucket);
             }
             self.ring_mut(tier).push(bucket);
         }
@@ -551,7 +553,7 @@ mod tests {
         fn step(&mut self, _: &NameTable, _: &StepRecord) {
             self.0.lock().unwrap().0 += 1;
         }
-        fn bucket(&mut self, _: Tier, _: &Bucket) {
+        fn bucket(&mut self, _: &NameTable, _: Tier, _: &Bucket) {
             self.0.lock().unwrap().1 += 1;
         }
     }

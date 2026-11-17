@@ -287,6 +287,10 @@ impl NativeAddon for Resources {
                 &recording::disk::directory(),
                 start_recorder,
             );
+            if self.history_settings.deleted_now(&self.recording) {
+                // The figures, apps and marks it shows came from the deleted files.
+                self.history = history_page::Page::new();
+            }
         }
         self.draw(ui, self.page);
         changed

@@ -36,6 +36,15 @@ while Toolboks runs, also in the tray; quitting Toolboks stops it.";
 pub const OFF_TEXT: &str = "Off: no resource history is recorded or written. Toolboks still \
 saves its own settings, such as this switch.";
 
+/// A size for the settings: "under 1 MB" instead of "0 MB" for a small history.
+pub fn size_label(bytes: u64) -> String {
+    if bytes > 0 && bytes < 1024 * 1024 {
+        "under 1 MB".to_string()
+    } else {
+        size_plain(bytes)
+    }
+}
+
 /// What the size line says. While recording, the files are written once a minute.
 pub fn size_text(bytes: u64, recording: bool) -> String {
     if bytes == 0 && recording {
@@ -43,7 +52,12 @@ pub fn size_text(bytes: u64, recording: bool) -> String {
     } else if bytes == 0 {
         "No history saved".to_string()
     } else {
-        format!("{} saved on this PC", size_plain(bytes))
+        let size = size_label(bytes);
+        let mut chars = size.chars();
+        let size = chars.next().map_or(String::new(), |c| {
+            c.to_uppercase().collect::<String>() + chars.as_str()
+        });
+        format!("{size} saved on this PC")
     }
 }
 
@@ -71,11 +85,27 @@ pub struct Settings {
     /// Size on disk and whether the folder exists, with when it was read.
     size: Option<(Instant, u64, bool)>,
     confirm_delete: bool,
-    /// The note's "Recording settings" link moves keyboard focus to the switch.
+    /// The note's "Go to the switch" link moves keyboard focus to the switch.
     focus_switch: bool,
+    /// ... and outlines it in the accent until then, so the jump is visible.
+    flash_until: Option<Instant>,
+    /// A finished delete was already reported by [`Settings::deleted_now`].
+    delete_reported: bool,
 }
 
+/// How long "Go to the switch" outlines the switch.
+const FLASH: Duration = Duration::from_millis(1500);
+
 impl Settings {
+    /// True once, in the frame after a delete finished without error: the History page then
+    /// drops what it had loaded from the deleted files.
+    pub fn deleted_now(&mut self, control: &Control) -> bool {
+        let done = matches!(control.deleted(), Some(Ok(_)));
+        let first = done && !self.delete_reported;
+        self.delete_reported = done;
+        first
+    }
+
     /// Draws the note (until dismissed) and the group. Returns true when the preferences
     /// changed.
     pub fn ui(
@@ -142,7 +172,7 @@ impl Settings {
         if !fresh {
             self.size = Some((
                 Instant::now(),
-                recording::disk::size_on_disk(dir),
+                recording::disk::saved_bytes(dir),
                 dir.is_dir(),
             ));
         }
@@ -156,6 +186,20 @@ impl Settings {
                 if std::mem::take(&mut self.focus_switch) {
                     r.request_focus();
                     r.scroll_to_me(Some(egui::Align::Center));
+                    self.flash_until = Some(Instant::now() + FLASH);
+                }
+                if let Some(until) = self.flash_until {
+                    if Instant::now() < until {
+                        ui.painter().rect_stroke(
+                            r.rect.expand(3.0),
+                            12,
+                            egui::Stroke::new(2.0, toolboks_shared::ui::ACCENT),
+                            egui::StrokeKind::Outside,
+                        );
+                        ui.ctx().request_repaint_after(Duration::from_millis(100));
+                    } else {
+                        self.flash_until = None;
+                    }
                 }
                 if r.changed() {
                     set_recording(prefs, control, on, start);
@@ -170,7 +214,7 @@ impl Settings {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!(
                         "Delete all saved resource history ({})? This cannot be undone.",
-                        size_plain(bytes)
+                        size_label(bytes)
                     ));
                     if ui.button("Delete").clicked() {
                         control.delete_history(dir.to_path_buf(), start);
@@ -264,6 +308,24 @@ mod tests {
         assert_eq!(size_text(0, false), "No history saved");
         assert!(size_text(0, true).starts_with("Nothing saved yet"));
         assert!(size_text(3 << 20, true).ends_with("saved on this PC"));
+        // A small history never reads "0 MB".
+        assert_eq!(size_text(200_000, true), "Under 1 MB saved on this PC");
+        assert_eq!(size_label(200_000), "under 1 MB");
+        assert!(!size_label(5 << 20).contains("under"));
+    }
+
+    #[test]
+    fn a_finished_delete_is_reported_once() {
+        let dir = std::env::temp_dir().join(format!("rm-settings-delete-{}", std::process::id()));
+        let mut control = Control::default();
+        let mut settings = Settings::default();
+        assert!(!settings.deleted_now(&control));
+        control.delete_history(dir.clone(), || None);
+        assert!(
+            settings.deleted_now(&control),
+            "reported in the frame after"
+        );
+        assert!(!settings.deleted_now(&control), "and only once");
     }
 
     #[test]

@@ -1548,19 +1548,7 @@ mod tests {
 
     #[test]
     fn end_target_is_tied_to_the_sampled_process() {
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-
-        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/cmd.exe");
-        let mut child = Command::new(cmd)
-            .args(["/d", "/q", "/c", "set /p toolboks_test_wait="])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .spawn()
-            .unwrap();
+        let mut child = super::super::processes::spawn_idle_child();
         let child_pid = child.id();
         let sample_start = snapshot_start();
         let mut sys = System::new().unwrap();

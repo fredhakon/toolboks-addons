@@ -286,6 +286,26 @@ pub fn show(
     // Grid and axis labels.
     let min_gap = (span as f64 * 90.0 / lanes.width().max(1.0) as f64) as i64;
     let (ticks, dated) = time::ticks(view.from, view.to, min_gap);
+    // The cursor's time on the axis (drawn further down), kept inside the axis; a tick label
+    // it would cover is left out, so the two never run into each other.
+    let cursor_label = marks
+        .cursor
+        .filter(|c| (view.from..view.to).contains(c))
+        .map(|c| {
+            let galley = painter.layout_no_wrap(time::hms(c), caption.clone(), TEXT);
+            let half = galley.size().x / 2.0 + 4.0;
+            let x = x_of(c);
+            let cx = if axis.width() > 2.0 * half {
+                x.clamp(axis.left() + half, axis.right() - half)
+            } else {
+                x
+            };
+            let rect = Rect::from_center_size(
+                Pos2::new(cx, axis.center().y),
+                galley.size() + Vec2::new(8.0, 2.0),
+            );
+            (rect, galley)
+        });
     for tick in ticks {
         let x = x_of(tick);
         painter.vline(x, lanes.y_range(), Stroke::new(1.0, BAR_DIVIDER));
@@ -294,13 +314,15 @@ pub fn show(
         } else {
             time::hm(tick)
         };
-        painter.text(
-            Pos2::new(x, axis.center().y),
-            egui::Align2::CENTER_CENTER,
-            label,
-            caption.clone(),
-            MUTED,
-        );
+        let galley = painter.layout_no_wrap(label, caption.clone(), MUTED);
+        let rect = Rect::from_center_size(Pos2::new(x, axis.center().y), galley.size());
+        if cursor_label
+            .as_ref()
+            .is_some_and(|(c, _)| c.expand2(Vec2::new(4.0, 0.0)).intersects(rect))
+        {
+            continue;
+        }
+        painter.galley(rect.min, galley, MUTED);
     }
 
     let lane_rect = |i: usize| {
@@ -518,20 +540,10 @@ pub fn show(
     if let Some(c) = marks.cursor.filter(|c| (view.from..view.to).contains(c)) {
         let x = x_of(c);
         painter.vline(x, lanes.y_range(), Stroke::new(1.5, TEXT));
-        // Kept inside the axis, on the axis background, so it never runs into a tick label.
-        let galley = painter.layout_no_wrap(time::hms(c), caption.clone(), TEXT);
-        let half = galley.size().x / 2.0 + 4.0;
-        let cx = if axis.width() > 2.0 * half {
-            x.clamp(axis.left() + half, axis.right() - half)
-        } else {
-            x
-        };
-        let label = Rect::from_center_size(
-            Pos2::new(cx, axis.center().y),
-            galley.size() + Vec2::new(8.0, 2.0),
-        );
-        painter.rect_filled(label, 2, BAR_BG);
-        painter.galley(label.center() - galley.size() / 2.0, galley, TEXT);
+        if let Some((label, galley)) = cursor_label {
+            painter.rect_filled(label, 2, BAR_BG);
+            painter.galley(label.center() - galley.size() / 2.0, galley, TEXT);
+        }
     }
 
     // Hover: a guide line and the values at that moment.

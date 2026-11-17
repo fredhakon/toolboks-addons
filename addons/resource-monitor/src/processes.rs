@@ -1702,16 +1702,17 @@ impl Page {
             .sense(Sense::click())
             .auto_shrink([false, false])
             .column(Column::exact(22.0))
-            .column(Column::remainder().at_least(90.0).clip(true));
+            .column(Column::remainder().at_least(64.0).clip(true));
         if !grouped {
-            table = table.column(Column::exact(52.0));
+            table = table.column(Column::exact(46.0));
         }
-        // Sized so every column fits next to the inspector at the smallest window (1060 px).
+        // Sized so every column fits next to the inspector at the smallest window (1060 px,
+        // which leaves the add-on 788 px; see the test below).
         table
-            .column(Column::exact(56.0))
-            .column(Column::exact(76.0))
-            .column(Column::exact(76.0))
-            .column(Column::exact(52.0))
+            .column(Column::exact(54.0))
+            .column(Column::exact(68.0))
+            .column(Column::exact(70.0))
+            .column(Column::exact(48.0))
             .column(Column::exact(76.0))
             .header(HEADER_HEIGHT, |mut header| {
                 header.col(|_| {});
@@ -2563,7 +2564,9 @@ mod tests {
     /// and the guided tour must still find the toolbar, table and inspector.
     #[test]
     fn the_page_fits_the_smallest_window_and_the_tour_finds_its_regions() {
-        const CONTENT: f32 = 820.0;
+        // The 1060 px window minus the open sidebar (240) and the host's content padding
+        // (16 on each side), as measured in the real window.
+        const CONTENT: f32 = 788.0;
         let ctx = egui::Context::default();
         toolboks_shared::ui::apply_style(&ctx);
         let mut page = Page::new();

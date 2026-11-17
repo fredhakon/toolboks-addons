@@ -20,12 +20,11 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `03f1f5526107aabc08cf06defc8ca3ec938881b5` (host `staging`, PR #214): host
-v0.17.1 plus the Debloater evidence labels in the shared engine. Protocol 5 and the SDK have not changed since
+Host dependencies pin commit `25aaa815197ec16b63cdb9d4b71e01d039fde9ca`, the commit of host release **v0.17.2**: it
+contains the Debloater evidence labels in the shared engine (host PR #214). Protocol 5 and the SDK have not changed since
 the released host **v0.16.0** (`63beeb11`; its SDK still agrees on 4 or 3 with a host that speaks those, and
 sends a protocol 4 host its findings without `why` and `evidence`), and only the statically linked engine crate
-differs, so the add-ons still run on every host they did. Move the pin to a release commit once a host release
-contains #214. `addon-repo` checks manifests as this host would
+differs, so the add-ons still run on every host they did. `addon-repo` checks manifests as this host would
 (`PINNED_HOST` in `tools/repo/src/main.rs`), so move that constant together with the pin.
 
 Every new catalog entry speaks the pinned protocol (5), so `addon-repo catalog-update` gives it

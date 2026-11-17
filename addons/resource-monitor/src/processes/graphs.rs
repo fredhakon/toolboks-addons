@@ -96,9 +96,14 @@ pub(super) fn ui(ui: &mut egui::Ui, graphs: &OwnGraphs) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             let label = RichText::new(format!("{} {}", NAMES[i], value_text(i, newest))).small();
-            ui.add_sized(
+            // Left-aligned in a fixed column (add_sized would centre it).
+            ui.allocate_ui_with_layout(
                 Vec2::new(96.0, SPARK_HEIGHT),
-                egui::Label::new(label).truncate(),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_size(Vec2::new(96.0, SPARK_HEIGHT));
+                    ui.add(egui::Label::new(label).truncate());
+                },
             );
             let width = ui.available_width().max(40.0);
             let (rect, _) = ui.allocate_exact_size(Vec2::new(width, SPARK_HEIGHT), Sense::hover());

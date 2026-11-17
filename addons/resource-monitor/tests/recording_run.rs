@@ -308,6 +308,6 @@ fn record_and_measure() {
         std::thread::sleep(Duration::from_millis(50));
     }
     if let Some((from, to)) = load_period {
-        println!("REPORT: set RM_REPORT_DIR to {}\\addon-data\\toolboks.resource-monitor\\history, RM_REPORT_FROM={from}, RM_REPORT_TO={to}", dir.display());
+        println!("REPORT: set RM_REPORT_DIR to {}\\Toolboks\\addon-data\\toolboks.resource-monitor\\history, RM_REPORT_FROM={from}, RM_REPORT_TO={to}", dir.display());
     }
 }

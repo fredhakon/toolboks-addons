@@ -298,10 +298,16 @@ mod tests {
                 reading(names),
             );
         }
-        // Last hour at full detail, 24 h of minutes (the open one not yet closed).
+        // Last hour at full detail, 24 h of minutes (the last one still open).
         assert_eq!(store.fine().len(), 720);
+        assert_eq!(store.tier(Tier::Minute).len(), 24 * 60 - 1);
+        assert_eq!(store.tier(Tier::FiveMinutes).len(), 24 * 12 - 1);
+        store.close_buckets(&mut Vec::new());
         assert_eq!(store.tier(Tier::Minute).len(), 24 * 60);
-        assert_eq!(store.tier(Tier::FiveMinutes).len(), 24 * 12);
+        assert!(store
+            .tier(Tier::Minute)
+            .iter()
+            .all(|m| m.covered_secs == 60.0));
         let m = store.tier(Tier::Minute).iter().nth(10).unwrap();
         assert_eq!(m.covered_secs, 60.0);
         assert_eq!(m.start_utc_ms.rem_euclid(60_000), 0);

@@ -336,8 +336,10 @@ impl Store {
     /// Adds a step: to the fine ring and to the open bucket of each tier, closing a bucket
     /// when the record falls in another period (forward or, after a clock change, backward).
     pub fn push_step(&mut self, record: StepRecord, sinks: &mut [Box<dyn Sink>]) {
+        // A step covers the time up to its reading: a reading at 12:01:00 belongs to 12:00.
+        let at = record.utc_ms - 1;
         for (i, tier) in TIERS.into_iter().enumerate() {
-            let key = record.utc_ms.div_euclid(tier.period_ms());
+            let key = at.div_euclid(tier.period_ms());
             if self.open[i].as_ref().is_some_and(|a| a.key != key) {
                 self.close(i, sinks);
             }
@@ -470,11 +472,14 @@ mod tests {
             } else {
                 vec![]
             };
-            store.push_step(step(i + 1, i as i64 * 5000, 5.0, cpu, apps), &mut sinks);
+            store.push_step(
+                step(i + 1, (i as i64 + 1) * 5000, 5.0, cpu, apps),
+                &mut sinks,
+            );
         }
         assert!(store.tier(Tier::Minute).last().is_none(), "still open");
         // The first step of minute 1 closes minute 0.
-        store.push_step(step(13, 60_000, 5.0, 10.0, vec![]), &mut sinks);
+        store.push_step(step(13, 65_000, 5.0, 10.0, vec![]), &mut sinks);
         let m = store.tier(Tier::Minute).last().unwrap();
         assert_eq!(m.start_utc_ms, 0);
         assert_eq!((m.first_seq, m.last_seq), (1, 12));
@@ -505,7 +510,10 @@ mod tests {
             let apps = (0..40)
                 .map(|a| app(a + (i as u32 % 3), 1.0 + a as f32))
                 .collect();
-            store.push_step(step(i + 1, i as i64 * 5000, 5.0, 50.0, apps), &mut sinks);
+            store.push_step(
+                step(i + 1, (i as i64 + 1) * 5000, 5.0, 50.0, apps),
+                &mut sinks,
+            );
         }
         store.close_buckets(&mut sinks);
         let m = store.tier(Tier::Minute).last().unwrap();
@@ -564,7 +572,10 @@ mod tests {
         let mut sinks: Vec<Box<dyn Sink>> = vec![Box::new(Count(seen.clone()))];
         let mut store = Store::default();
         for i in 0..3u64 {
-            store.push_step(step(i + 1, i as i64 * 60_000, 5.0, 1.0, vec![]), &mut sinks);
+            store.push_step(
+                step(i + 1, (i as i64 + 1) * 60_000, 5.0, 1.0, vec![]),
+                &mut sinks,
+            );
         }
         store.close_buckets(&mut sinks);
         // 3 steps; 3 minute buckets and 1 five-minute bucket.

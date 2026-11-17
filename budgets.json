@@ -1,4 +1,10 @@
 {
   "first_frame_ms": 1000,
-  "idle_working_set_bytes": 26214400
+  "idle_working_set_bytes": 26214400,
+  "addons": {
+    "resource-monitor": {
+      "idle_working_set_bytes": 52428800,
+      "note": "50 MB = the measured 42.4 MB baseline (2026-11-17, issue #70) plus headroom. It was already 42.3 MB before the Processes page work, and history recording (off in those runs) adds to it. A guard against growth, not a target. See docs/bench-results/2026-11-17-processes-overhead.md."
+    }
+  }
 }

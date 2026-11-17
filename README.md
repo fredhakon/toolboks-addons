@@ -69,7 +69,10 @@ host's `cargo run --example addon_host -- <absolute-hello.exe-path> toolboks.hel
 
 Every add-on is a separate process, so each one has to stay small (host issue #97).
 `budgets.json` holds the limits: the first frame within 1000 ms of starting the exe, and
-under 25 MB of memory when idle.
+under 25 MB of memory when idle. An add-on whose measured baseline is above that can get its
+own idle memory ceiling under `addons.<name>`, with a `note` saying why. That ceiling is the
+baseline plus headroom, a guard against growth, not a target. Resource Monitor has one
+(50 MB; measured 42.4 MB, see `docs/bench-results/2026-11-17-processes-overhead.md`).
 
 ```powershell
 cargo build --locked --release -p hello

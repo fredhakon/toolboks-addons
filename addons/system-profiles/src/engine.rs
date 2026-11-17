@@ -70,8 +70,8 @@ impl Group {
 
 const NO_MEASUREMENT: &str =
     "No controlled measurement found (checked 2026-11); see issue #32 for our own test.";
-const MS_CONNECTIONS: &str = "https://learn.microsoft.com/windows/privacy/manage-connections-from-windows-operating-system-components-to-microsoft-services";
-const NO_SPEED_CLAIM: &str = "No speed claim is made for this setting.";
+pub(crate) const MS_CONNECTIONS: &str = "https://learn.microsoft.com/windows/privacy/manage-connections-from-windows-operating-system-components-to-microsoft-services";
+pub(crate) const NO_SPEED_CLAIM: &str = "No speed claim is made for this setting.";
 
 #[derive(Clone, Copy)]
 pub struct Choice {

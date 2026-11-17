@@ -5,7 +5,7 @@
 use toolboks_addon_sdk::{admin::AdminChange, AdminOutcome, AdminRequest, HostRequest};
 
 use super::memlist::{self, MemListError, StandbyBreakdown};
-use super::style::section;
+use super::style::{section, unproven_note, PURGE_EVIDENCE};
 use super::Memory;
 use toolboks_shared::format::size_plain;
 
@@ -136,6 +136,7 @@ impl Memory {
             self.start_purge();
         }
         ui.label(egui::RichText::new(NEEDS_ADMIN).weak().small());
+        unproven_note(ui, PURGE_EVIDENCE);
         if let Some(text) = &self.last_purge {
             ui.label(egui::RichText::new(text).small());
         }

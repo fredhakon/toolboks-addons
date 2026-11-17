@@ -211,14 +211,23 @@ The built-in copy stays in the host until the final removal and "Restore your to
 the pages Overview, Details, Processes and Connections and the built-in tool's behavior. The
 host's `src/tools/resources/` code moved over with imports changed to the shared crates (and the
 add-on entry point in `src/lib.rs`); 91 of its own unit tests moved with it. It needs no
-administrator rights and stores nothing: the graphs live in memory while the add-on is shown.
+administrator rights. The live graphs live in memory while the add-on is shown.
 
 - **Status bar.** The `CPU nn%` and `GPU nn%` items go through the host's status services.
-- **Suspending** stops the sampler and drops the graphs, as the built-in tool does when it is
-  not shown.
-- **Not in the background yet.** `host-services.json` does not set `background`. Keeping the
-  sampler running while hidden belongs with the history recorder (host #64), which does not
-  exist yet. Today the built-in tool does not record while hidden either.
+- **Suspending** stops the live sampler and drops the graphs, as the built-in tool does when it
+  is not shown.
+- **Background add-on.** `host-services.json` sets `"background": true`, so the host suspends
+  Resource Monitor instead of ending it when another add-on is opened or the window goes to the
+  tray. Only the history recorder keeps working then.
+- **Resource history (#36).** With the `history_recording` preference on, a recorder thread
+  (`src/recording/`) reads the system every 5 s and saves per-app use (exe names, times and
+  figures; never paths, window titles or command lines) to
+  `addon-data/toolboks.resource-monitor/history/` in the Toolboks data folder: every step for the
+  last hour, per-minute buckets for 24 hours, 5-minute buckets, app starts and exits for 7 days.
+  Append-only files split by time, written once a minute, pruned on start and every hour; at
+  most about 7 MB for a full week (budget 20 MB; 6.8 MB in the worst-case test). Nothing is sent anywhere. The manifest's `data_note`
+  says so in the install review. The switch, size, Delete history and Open history folder come
+  with #45; until then recording is off by default.
 - The guided tour has the same 22 steps.
 
 The built-in copy stays in the host until the final removal and "Restore your tools" step (host

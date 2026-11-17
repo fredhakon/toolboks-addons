@@ -1,15 +1,17 @@
-//! Resource history recorder (History part 1: #38 recorder, #39 per-app records and events).
+//! Resource history recorder (#38 recorder, #39 per-app records and events, #40 saved to disk).
 //!
 //! # Off unless switched on
 //!
 //! Recording runs only when the preference [`PREF_KEY`] is `true` in the add-on's own
 //! preferences. The default is OFF until the owner decides (#45, Gusseti/toolboks#52). When it
 //! is off there is no recorder thread, no reading and no stored history: nothing is sampled,
-//! held or written. Switching it off drops everything recorded in this run.
+//! held or written. Switching it off stops recording and drops the in-memory copy of this run;
+//! what was already saved stays on disk until it ages out or is deleted (#45).
 //!
 //! # What is recorded (and what is not)
 //!
-//! Every step (about [`STEP`]), in memory only. Nothing is written to disk yet (#40):
+//! Every step (about [`STEP`]), in memory and saved on this PC only (see [`disk`]; nothing is
+//! ever sent anywhere):
 //! - System totals: processor use, memory in use and installed, main-GPU load, video memory,
 //!   disk read and write, network down and up (all counted adapters together). GPU temperature
 //!   and power have fields but are not read yet (see `source.rs`: the driver library costs
@@ -29,9 +31,13 @@
 //!
 //! # How much is kept
 //!
-//! Bounded rings: the steps of the last hour, per-minute summaries for 24 hours, 5-minute
-//! summaries for 7 days (average and peak, so short spikes stay visible), 20 000 events,
-//! 4096 exe names. A full store is a few MB whatever the number of processes.
+//! In memory, this run only: bounded rings with the steps of the last hour, per-minute
+//! summaries for 24 hours, 5-minute summaries for 7 days (average and peak, so short spikes
+//! stay visible), 20 000 events, 4096 exe names. A full store is a few MB whatever the number
+//! of processes.
+//!
+//! On disk, every run: the same three levels with the same windows (1 hour, 24 hours, 7 days),
+//! in the add-on's data folder. A full week is at most about 7 MB (budget 20 MB, see [`disk`]).
 //!
 //! # Cost and safety
 //!
@@ -39,17 +45,18 @@
 //! the previous one started or, when a reading ran late, a step after it ended. It never blocks
 //! the UI or the live sampler. Reading is read-only (see `source.rs`).
 //!
-//! # Part 2
+//! # Reading it back
 //!
-//! A file writer plugs in as a [`store::Sink`]; a reader reads [`store::Store`] through
-//! [`Control::store`].
+//! The run recording now is read from memory ([`Control::store`]); earlier runs from disk
+//! ([`disk::load`], leaving out [`Control::run`]).
 
-// Readers and the file writer arrive in part 2 (#40, #41); until then some accessors are only
-// used by the tests.
+// The readers and the page arrive in #41 and #42; until then some accessors are only used by
+// the tests.
 #![cfg_attr(not(test), allow(dead_code))]
 
 mod apps;
 mod core;
+pub mod disk;
 mod record;
 mod source;
 pub mod store;
@@ -100,65 +107,108 @@ fn next_start(started: Instant, now: Instant, step: Duration) -> Instant {
     }
 }
 
+/// How long dropping a recorder waits for its thread to write out its buffers (the add-on is
+/// quitting or recording was switched off). A reading in progress is normally about 10 ms.
+const FINISH_WAIT: Duration = Duration::from_secs(1);
+
+/// Makes the sinks of a run on the recorder thread: (run id, wall clock now).
+pub type MakeSinks = Box<dyn FnOnce(u64, i64) -> Vec<Box<dyn store::Sink>> + Send>;
+
 /// A running recorder. Dropping it stops the thread at its next wake-up (at once while it
-/// waits; after the current reading if one is running).
+/// waits; after the current reading if one is running) and waits up to [`FINISH_WAIT`] for it
+/// to close its buckets and write out what is buffered.
 pub struct Recorder {
-    _stop: Sender<()>,
+    stop: Option<Sender<()>>,
+    finished: mpsc::Receiver<()>,
     store: Arc<Mutex<Store>>,
+    run: u64,
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        self.stop.take();
+        let _ = self.finished.recv_timeout(FINISH_WAIT);
+    }
 }
 
 impl Recorder {
-    /// Starts recording the real system at [`STEP`].
+    /// Starts recording the real system at [`STEP`], saving to the history folder.
     pub fn start_system() -> Option<Recorder> {
-        Self::spawn(STEP, || {
-            source::SystemSource::new().map(|s| Box::new(s) as Box<dyn Source>)
-        })
+        Self::spawn_with(
+            STEP,
+            || source::SystemSource::new().map(|s| Box::new(s) as Box<dyn Source>),
+            Box::new(|run, now| {
+                let writer = disk::Writer::new(disk::directory(), run, now);
+                vec![Box::new(writer) as Box<dyn store::Sink>]
+            }),
+        )
     }
 
-    /// Starts the thread. The source is made on the thread, so a slow start never blocks the
-    /// caller. `None` if the thread cannot start.
+    /// Starts the thread without saving anything (tests).
     pub(crate) fn spawn<F>(step: Duration, make: F) -> Option<Recorder>
     where
         F: FnOnce() -> Option<Box<dyn Source>> + Send + 'static,
     {
+        Self::spawn_with(step, make, Box::new(|_, _| Vec::new()))
+    }
+
+    /// Starts the thread. The source and the sinks are made on the thread, so a slow start
+    /// never blocks the caller. `None` if the thread cannot start.
+    pub(crate) fn spawn_with<F>(step: Duration, make: F, sinks: MakeSinks) -> Option<Recorder>
+    where
+        F: FnOnce() -> Option<Box<dyn Source>> + Send + 'static,
+    {
         let (stop, stopped) = mpsc::channel::<()>();
+        let (done, finished) = mpsc::channel::<()>();
         let store = Arc::new(Mutex::new(Store::default()));
         let shared = Arc::clone(&store);
+        let run = disk::new_run_id(utc_ms());
         std::thread::Builder::new()
             .name("resource-history".into())
             .spawn(move || {
+                // Dropped when the thread ends, which wakes a waiting `Recorder::drop`.
+                let _done = done;
                 let Some(mut source) = make() else {
                     return;
                 };
                 let epoch = Instant::now();
+                let sinks = sinks(run, utc_ms());
                 let mut core = match shared.lock() {
-                    Ok(mut s) => Core::new(&mut s, Duration::ZERO, utc_ms(), Vec::new()),
+                    Ok(mut s) => Core::new(&mut s, Duration::ZERO, utc_ms(), sinks),
                     Err(_) => return,
                 };
                 let mut start = epoch + step;
                 loop {
-                    match stopped.recv_timeout(start.saturating_duration_since(Instant::now())) {
-                        Err(RecvTimeoutError::Timeout) => {}
-                        // Stopped, or the recorder was dropped.
-                        _ => return,
-                    }
-                    let started = Instant::now();
-                    let reading = source.read();
-                    if !matches!(stopped.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                    let wait = start.saturating_duration_since(Instant::now());
+                    let go_on =
+                        matches!(stopped.recv_timeout(wait), Err(RecvTimeoutError::Timeout));
+                    let reading = go_on.then(|| (Instant::now(), source.read()));
+                    // Stopped (or the recorder dropped) while waiting or reading.
+                    let go_on =
+                        go_on && matches!(stopped.try_recv(), Err(mpsc::TryRecvError::Empty));
+                    let Ok(mut s) = shared.lock() else {
                         return;
-                    }
-                    let (mono, utc) = (epoch.elapsed(), utc_ms());
-                    match shared.lock() {
-                        Ok(mut s) => {
-                            core.push(&mut s, mono, utc, reading);
+                    };
+                    match reading {
+                        Some((started, reading)) if go_on => {
+                            core.push(&mut s, epoch.elapsed(), utc_ms(), reading);
+                            drop(s);
+                            start = next_start(started, Instant::now(), step);
                         }
-                        Err(_) => return,
+                        _ => {
+                            core.finish(&mut s);
+                            return;
+                        }
                     }
-                    start = next_start(started, Instant::now(), step);
                 }
             })
             .ok()?;
-        Some(Recorder { _stop: stop, store })
+        Some(Recorder {
+            stop: Some(stop),
+            finished,
+            store,
+            run,
+        })
     }
 }
 
@@ -185,6 +235,11 @@ impl Control {
     /// The history recorded in this run, for the readers of part 2.
     pub fn store(&self) -> Option<Arc<Mutex<Store>>> {
         self.recorder.as_ref().map(|r| Arc::clone(&r.store))
+    }
+
+    /// The id of the run recording now; its own files on disk are read from [`Self::store`].
+    pub fn run(&self) -> Option<u64> {
+        self.recorder.as_ref().map(|r| r.run)
     }
 }
 
@@ -282,6 +337,53 @@ mod tests {
         let after = reads.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(reads.load(Ordering::SeqCst), after);
+    }
+
+    #[test]
+    fn switching_off_writes_out_the_run_and_the_next_run_reads_it_back() {
+        let dir = disk::tests::test_dir("thread");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let to = dir.clone();
+        let mut control = Control::default();
+        control.apply(true, || {
+            Recorder::spawn_with(
+                Duration::from_millis(10),
+                fake(&reads),
+                Box::new(move |run, now| {
+                    vec![Box::new(disk::Writer::new(to, run, now)) as Box<dyn store::Sink>]
+                }),
+            )
+        });
+        let run = control.run().unwrap();
+        let store = control.store().unwrap();
+        assert!(wait_for(|| store.lock().unwrap().fine().len() >= 5));
+        // Switching off waits for the thread to close its buckets and write its buffers.
+        control.apply(false, || None);
+        let recorded = store.lock().unwrap().fine().len();
+        let q = disk::Query {
+            from_ms: 0,
+            to_ms: i64::MAX / 2,
+            levels: disk::LEVELS.to_vec(),
+            skip_run: None,
+            now_ms: utc_ms(),
+        };
+        let loaded = disk::load(&dir, &q);
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert_eq!(loaded.steps.len(), recorded);
+        assert!(loaded.steps.iter().all(|s| s.run == run));
+        assert_eq!(
+            loaded.names.name(loaded.steps[0].rec.apps[0].app),
+            Some("a.exe")
+        );
+        assert!(
+            !loaded.minutes.is_empty(),
+            "the open minute was closed and saved"
+        );
+        assert!(matches!(
+            loaded.markers[0].rec.kind,
+            record::MarkerKind::Began
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

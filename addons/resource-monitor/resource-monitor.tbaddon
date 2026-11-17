@@ -5,21 +5,23 @@
     "title": "Resource Monitor",
     "native_provider": "toolboks.resource-monitor",
     "description": "Watch your processor, graphics, memory, disk and network.",
-    "long_description": "Resource Monitor draws live graphs of what your PC is doing and keeps a short history while it is open. It also lists running apps, lets you change a process's priority or end it, and shows network connections. It reads system and process information; it changes something only when you use one of those process actions.",
-    "version": "0.1.0",
+    "long_description": "Resource Monitor draws live graphs of what your PC is doing. It also lists running apps, lets you change a process's priority or end it, and shows network connections. It reads system and process information; it changes something only when you use one of those process actions. With Record resource history on, it saves which apps used the processor, memory, graphics and disk, and when: app names, times and figures, never window titles, file names or what you do in an app. It records while Toolboks runs, also when the window is closed to the tray, and stops when you quit. The history stays on this PC in the add-on's data folder, is kept for 7 days and is never sent anywhere. You can switch recording off and delete the history.",
+    "version": "0.2.0",
     "author": "Toolboks team",
     "publisher": "Toolboks",
     "category": "System tools",
     "icon": "activity",
     "accent": "#A48ACA",
     "api_version": 2,
-    "min_toolboks_version": "0.12.5",
+    "min_toolboks_version": "0.14.0",
     "website": "https://github.com/Gusseti/toolboks",
     "support_url": "https://github.com/Gusseti/toolboks/issues",
     "license": "MIT",
     "capabilities": [
-      "host_metrics"
-    ]
+      "host_metrics",
+      "local_preferences"
+    ],
+    "data_note": "Saves which apps used your PC's resources and when (app names, times, figures) on this PC for 7 days. Can be switched off and deleted."
   },
   "pages": []
 }

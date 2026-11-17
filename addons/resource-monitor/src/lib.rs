@@ -209,6 +209,8 @@ impl Default for Resources {
 /// Page names, in order. They match `host-services.json`.
 pub const PAGES: [&str; 5] = ["Overview", "Details", "Processes", "Connections", "History"];
 pub const ID: &str = "toolboks.resource-monitor";
+/// Index of the History page in [`PAGES`].
+const HISTORY_PAGE: usize = 4;
 
 impl Resources {
     /// The "how far back" switch above the graph pages. `with_rated` adds the processor rated
@@ -373,6 +375,12 @@ impl Resources {
         })
     }
 
+    /// "Open in history" on the Processes page: the History page, showing that app.
+    fn open_in_history(&mut self, app: &str) {
+        self.history.show_app(app);
+        self.page = HISTORY_PAGE;
+    }
+
     /// What the History page reads: the history folder, and the run recording now.
     fn history_inputs(&self) -> history_page::Inputs {
         let live = self.recording.run().zip(self.recording.store());
@@ -458,6 +466,9 @@ impl Resources {
         match page {
             2 => {
                 self.processes.ui(ui, self.process_totals());
+                if let Some(app) = self.processes.take_open_history() {
+                    self.open_in_history(&app);
+                }
                 return;
             }
             3 => {
@@ -582,6 +593,15 @@ mod tests {
         assert_eq!(steps(), after_off, "nothing is recorded once off");
         writer.write(&HostMessage::Quit).unwrap();
         runtime.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn open_in_history_switches_to_the_history_page() {
+        assert_eq!(PAGES[HISTORY_PAGE], "History");
+        let mut addon = Resources::new();
+        addon.navigate("2");
+        addon.open_in_history("chrome.exe");
+        assert_eq!(addon.page_index(), HISTORY_PAGE);
     }
 
     #[test]

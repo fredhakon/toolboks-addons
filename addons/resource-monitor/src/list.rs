@@ -295,7 +295,7 @@ fn draw_row(ui: &mut egui::Ui, width: f32, row: &Row, selected: bool, capacity: 
 }
 
 /// A tiny line graph; the newest point is at the right edge, like the big graphs.
-fn paint_spark(
+pub(crate) fn paint_spark(
     painter: &egui::Painter,
     rect: egui::Rect,
     values: &[f32],

@@ -267,7 +267,7 @@ impl Os for Live {
             return Err(Why::NoCommandLine);
         }
         // The text must lie inside our own buffer.
-        if at < base || at + len * 2 > base + capacity as usize || at % 2 != 0 {
+        if at < base || at + len * 2 > base + capacity as usize || !at.is_multiple_of(2) {
             return Err(Why::Unreadable);
         }
         // SAFETY: checked above: `len` UTF-16 units inside the buffer, correctly aligned.
@@ -541,7 +541,7 @@ mod tests {
             self.user.clone()
         }
         fn handles(&self) -> Result<u32, Why> {
-            self.handles.clone()
+            self.handles
         }
     }
 

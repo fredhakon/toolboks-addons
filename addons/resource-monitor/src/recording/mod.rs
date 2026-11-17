@@ -58,6 +58,7 @@
 mod apps;
 mod core;
 pub mod disk;
+pub mod feed;
 pub mod markers;
 pub mod query;
 pub mod record;

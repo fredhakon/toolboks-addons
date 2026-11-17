@@ -1,5 +1,10 @@
 //! The real reading source: sysinfo plus the GPU counters, read-only.
 //!
+//! While Resource Monitor's page is open its live process worker already refreshes the process
+//! table; the recorder then takes those refreshes from [`super::feed`] and does not refresh the
+//! table itself (#90). It refreshes it only when the page is closed or hidden. The first own
+//! refresh after the page closes averages over the time since its previous own refresh.
+//!
 //! It opens processes only as sysinfo does for the existing Processes and Top lists
 //! (query-information rights, to read times, memory and I/O counters). It never asks for a
 //! right to write to, end or change a process; acting on processes stays behind
@@ -25,6 +30,10 @@ use crate::sampler::{
 
 pub struct SystemSource {
     sys: System,
+    /// Asks the live worker for its refreshes while this source exists.
+    _feed: super::feed::Active,
+    /// Process-table refreshes this source made itself (tests and measurements).
+    pub(crate) own_refreshes: u64,
     disks: Option<Disks>,
     nets: Option<Networks>,
     gpu: GpuReader,
@@ -43,11 +52,15 @@ impl SystemSource {
         sys.refresh_cpu_all();
         sys.refresh_memory();
         refresh_procs(&mut sys);
+        let feed = super::feed::Active::new();
+        super::feed::clear();
         let logical = sys.cpus().len();
         let mut gpu = GpuReader::new();
         let _ = gpu.read();
         Some(Self {
             sys,
+            _feed: feed,
+            own_refreshes: 0,
             disks: Disks::new_with_refreshed_list_specifics(disk_kind()).ok(),
             nets: Networks::new_with_refreshed_list().ok(),
             gpu,
@@ -61,8 +74,13 @@ impl Source for SystemSource {
     fn read(&mut self) -> Reading {
         self.sys.refresh_cpu_all();
         self.sys.refresh_memory();
-        refresh_procs(&mut self.sys);
         let secs = self.last.elapsed().as_secs_f64();
+        // The live worker's refreshes when the page is open; our own otherwise.
+        let fed = super::feed::take(secs);
+        if fed.is_none() {
+            refresh_procs(&mut self.sys);
+            self.own_refreshes += 1;
+        }
         self.last = Instant::now();
         let (read, written) = match self.disks.as_mut() {
             Some(d) => {
@@ -102,6 +120,16 @@ impl Source for SystemSource {
             net_up_bps: bytes_per_second(up, secs) as f32,
         };
         let logical = self.logical;
+        if let Some(fed) = fed {
+            let procs = fed
+                .into_iter()
+                .map(|(pid, mut p)| {
+                    p.gpu = per_pid.get(&pid).copied().unwrap_or(0.0);
+                    p
+                })
+                .collect();
+            return Reading { totals, procs };
+        }
         let procs = self
             .sys
             .processes()
@@ -176,5 +204,39 @@ mod measure {
             minutes * 60.0,
             n as f64 / minutes
         );
+
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// #90: with the page open (the live worker refreshing the table and feeding it), a
+    /// recorder step makes no process-table refresh of its own; with the page closed it does.
+    #[test]
+    fn with_the_page_open_the_recorder_refreshes_no_process_table() {
+        let _l = super::super::feed::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut src = SystemSource::new().expect("source");
+        let mut live = System::new().expect("system");
+        refresh_procs(&mut live);
+        let logical = live.cpus().len().max(1);
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(400));
+            refresh_procs(&mut live);
+            crate::sampler::feed_recorder(&live, logical, 0.4);
+        }
+        let r = src.read();
+        assert_eq!(src.own_refreshes, 0, "the live refreshes were used");
+        let me = std::env::current_exe().unwrap();
+        let me = me.file_name().unwrap().to_string_lossy().to_lowercase();
+        assert!(
+            r.procs.iter().any(|p| p.name.to_lowercase() == me),
+            "this test process is in the reading"
+        );
+        // The page closes: no more live refreshes, so the recorder reads the table itself.
+        std::thread::sleep(Duration::from_millis(300));
+        let r = src.read();
+        assert_eq!(src.own_refreshes, 1);
+        assert!(!r.procs.is_empty());
     }
 }

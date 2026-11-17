@@ -65,3 +65,56 @@ Decided 2026-11-17 for the owner: the unattributed memory is not chased in #70 a
 42.4 MB baseline plus headroom. It was already 42.3 MB before the Processes work, and history
 recording (off in these runs) adds to it. The ceiling is a guard against growth, not a target.
 The first-frame budget (1000 ms) and the CPU numbers are unchanged.
+
+## Final measurement: the whole Processes page (staging 9ab1de2)
+
+Same PC, release exe of staging 9ab1de2: Processes slices 1 to 8 (with tree #71, detail pane #67,
+own graphs #68), the History page with #43, #44 and the #45 settings group, and #90 (the recorder
+takes its per-app figures from the live process worker while a page is shown). History recording
+**on** (the default now), so every phase includes the recorder.
+
+**The harness counts processor cycles now, not CPU time.** Windows charges CPU time in whole
+15.6 ms clock ticks, so threads that wake for a few milliseconds a second were counted as all or
+nothing. Two CPU-time runs of the same exe gave 2.2 % and 0.7 % of one core for the Overview, and
+the live sampler thread read 1.56 % in one run and 0.00 % in the other. The CPU numbers in the
+tables above were taken that way and only tell you the scale. Two cycle-count runs (A and B,
+60 s per phase after 10 s warm-up, 3.79 GHz measured cycle rate) agree to within 0.01 points:
+
+| Phase | CPU (of machine) | CPU (of one core) | Frames/s | Working set | Private bytes |
+|---|---|---|---|---|---|
+| Overview shown | 0.07% | 1.2% | 2.4 | 46.2 to 46.7 MB | 33.2 to 33.6 MB |
+| Processes shown | 0.11% | 1.7% | 3.5 | 48.2 to 48.9 MB | 34.6 to 34.9 MB |
+| History shown | 0.07% | 1.2% | 2.0 | 49.7 to 49.8 MB | 36.0 to 36.2 MB |
+| Hidden (suspended) | 0.02% | 0.2% | 0.0 | 47.2 to 47.3 MB | 33.2 to 33.4 MB |
+
+CPU per thread, % of one core (run A; run B within 0.01):
+
+| Thread | Overview | Processes | History | Hidden |
+|---|---|---|---|---|
+| main (UI) | 0.29% | 0.40% | 0.24% | 0.00% |
+| resource-sampler (live totals, every 1 s) | 0.37% | 0.37% | 0.37% | 0.00% |
+| resource-procs (live process table every 2 s, feeds the recorder) | 0.42% | 0.42% | 0.41% | 0.00% |
+| process-sampler (Processes page worker, every 2 s) | 0.00% | 0.48% | 0.01% | 0.00% |
+| resource-history (recorder, 5 s steps) | 0.07% | 0.07% | 0.07% | 0.24% |
+| resource-history-query (History page reads) | 0.00% | 0.00% | 0.06% | 0.00% |
+| resource-history-moments (#44) | 0.00% | 0.00% | 0.00% | 0.00% |
+
+`addon-repo measure --runs 5 resource-monitor`: first frame 15 ms (budget 1000 ms), idle memory
+42.4 MB (ceiling 50 MB): **met**. `measure` sends no preferences, so the recorder does not run
+there. With recording on and every page visited, the working set stays between 46 and 50 MB.
+
+### Reading
+
+- **The Processes page's second process refresh** (`process-sampler`, every 2 s next to
+  `resource-procs`) costs **0.48 % of one core, 0.03 % of the machine**. That figure also covers
+  the identity checks, the window-owner scan and the row building, which a merge would keep.
+  Merging the two refreshes could save about 0.4 % of one core while the page is open, and
+  nothing at all when it is not. **Not worth it**; left as it is.
+- **The History page** costs the same as the Overview (1.2 % of one core). Its query worker uses
+  0.06 %, the #44 moments thread rounds to 0.00 %, and the #45 settings group (size on disk read
+  every 5 s) shows nothing measurable on the UI thread. It holds about 2.8 MB more private memory
+  than the Overview, for the loaded history.
+- **Hidden**, only the recorder runs: 0.24 % of one core (it refreshes the process table itself
+  every 5 s when no page feeds it, #90). With recording off, hidden is 0 %.
+- No CPU or first-frame regression: the whole add-on stays under 2 % of one core on any page, and
+  the first frame is 15 ms.

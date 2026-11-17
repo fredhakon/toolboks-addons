@@ -19,7 +19,9 @@ use super::memlist::Lists;
 use super::pressure::{limits, Assessment, Verdict};
 use super::report::{self, HonestReport, RunMeasurement, Trigger};
 use super::series::{Range, Series};
-use super::style::{panel, primary_button, section, section_with_note};
+use super::style::{
+    panel, primary_button, section, section_with_note, unproven_note, TRIM_EVIDENCE,
+};
 use super::{commit, scheduler, Memory};
 
 use toolboks_shared::format::size_plain;
@@ -539,6 +541,7 @@ impl Memory {
                     self.start_run(ctx, Trigger::Manual);
                 }
                 ui.label(RichText::new(TRIM_NOTE).weak().small());
+                unproven_note(ui, TRIM_EVIDENCE);
             });
         });
     }

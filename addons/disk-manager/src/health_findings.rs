@@ -1337,6 +1337,12 @@ mod tests {
             assert!(f.iter().all(|f| f.status != FindingStatus::NotChecked));
             by_id(&f, "drive-health-c").status == FindingStatus::Attention
         });
+        // C settling does not mean the other five drives were read again yet: they are read
+        // alongside it. Wait for all six, then check that no extra read follows.
+        wait_until("every drive read again", || {
+            READS.load(Ordering::SeqCst) >= 12
+        });
+        std::thread::sleep(Duration::from_millis(50));
         assert_eq!(READS.load(Ordering::SeqCst), 12);
         assert_eq!(
             by_id(&r.findings(), "drive-health-c").severity,

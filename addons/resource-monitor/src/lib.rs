@@ -7,8 +7,11 @@ mod detail;
 mod details;
 mod gpu;
 mod history;
+mod history_page;
+mod history_settings;
 mod list;
 mod lower_confirm;
+mod memory_breakdown;
 mod nvml;
 mod overview;
 mod power;
@@ -141,11 +144,26 @@ pub struct Resources {
     gpu_missing: u32,
     processes: processes::Page,
     connections: connections::Page,
-    /// Which page is shown: 0 Overview, 1 Details, 2 Processes, 3 Connections.
+    /// Which page is shown: 0 Overview, 1 Details, 2 Processes, 3 Connections, 4 History.
     page: usize,
-    /// Resource history recorder (off unless the preference switches it on). Kept across
+    history: history_page::Page,
+    /// The switch, size, delete and folder group and the one-time note on the History page.
+    history_settings: history_settings::Settings,
+    /// Resource history recorder (on unless the preference switches it off). Kept across
     /// `suspend`, so it records while the page is closed and Toolboks sits in the tray.
     recording: recording::Control,
+}
+
+/// Starts the real recorder, saving to the history folder.
+#[cfg(not(test))]
+fn start_recorder() -> Option<recording::Recorder> {
+    recording::Recorder::start_system()
+}
+
+/// Unit tests never record the real system or write a history folder.
+#[cfg(test)]
+fn start_recorder() -> Option<recording::Recorder> {
+    recording::fake_recorder(Duration::from_secs(3600))
 }
 
 impl Resources {
@@ -175,6 +193,8 @@ impl Resources {
             processes: processes::Page::new(),
             connections: connections::Page::new(),
             page: 0,
+            history: history_page::Page::new(),
+            history_settings: history_settings::Settings::default(),
             recording: recording::Control::default(),
         }
     }
@@ -187,8 +207,10 @@ impl Default for Resources {
 }
 
 /// Page names, in order. They match `host-services.json`.
-pub const PAGES: [&str; 4] = ["Overview", "Details", "Processes", "Connections"];
+pub const PAGES: [&str; 5] = ["Overview", "Details", "Processes", "Connections", "History"];
 pub const ID: &str = "toolboks.resource-monitor";
+/// Index of the History page in [`PAGES`].
+const HISTORY_PAGE: usize = 4;
 
 impl Resources {
     /// The "how far back" switch above the graph pages. `with_rated` adds the processor rated
@@ -241,24 +263,37 @@ fn style_once(ctx: &egui::Context) {
 }
 
 impl NativeAddon for Resources {
-    /// Starts or stops the history recorder from the add-on's own preferences (default off).
+    /// Starts or stops the history recorder from the add-on's own preferences (default on).
     fn load_preferences(
         &mut self,
         preferences: &std::collections::BTreeMap<String, serde_json::Value>,
     ) {
-        self.recording.apply(
-            recording::wanted(preferences),
-            recording::Recorder::start_system,
-        );
+        self.recording
+            .apply(recording::wanted(preferences), start_recorder);
     }
     fn ui(
         &mut self,
         ui: &mut egui::Ui,
-        _preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
+        preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
     ) -> bool {
         style_once(ui.ctx());
+        self.recording.poll(start_recorder);
+        let mut changed = false;
+        if self.page == 4 {
+            changed = self.history_settings.ui(
+                ui,
+                preferences,
+                &mut self.recording,
+                &recording::disk::directory(),
+                start_recorder,
+            );
+            if self.history_settings.deleted_now(&self.recording) {
+                // The figures, apps and marks it shows came from the deleted files.
+                self.history = history_page::Page::new();
+            }
+        }
         self.draw(ui, self.page);
-        false
+        changed
     }
     fn navigate(&mut self, page: &str) {
         self.page = page
@@ -283,10 +318,14 @@ impl NativeAddon for Resources {
         self.page = page;
         self.recording = recording;
     }
-    /// False: the recorder has its own thread and needs no 200 ms background ticks, so a
-    /// suspended Resource Monitor wakes nothing (and does nothing at all with recording off).
+    /// Normally false: the recorder has its own thread and needs no 200 ms background ticks,
+    /// so a suspended Resource Monitor wakes nothing (and does nothing at all with recording
+    /// off). True only while a restart or a delete waits for an old recorder thread to end.
     fn has_background_work(&self) -> bool {
-        false
+        self.recording.pending()
+    }
+    fn tick_background(&mut self) {
+        self.recording.poll(start_recorder);
     }
     fn status_items(&self) -> Vec<StatusItem> {
         let live = self.last_at.is_some_and(|t| t.elapsed() < LIVE_WITHIN);
@@ -336,7 +375,31 @@ impl Resources {
             mem_total: self.info.as_ref().map_or(0, |i| i.mem_total),
             disk_active: sample.disk_active,
             disk_bps: sample.disk_read_bps + sample.disk_write_bps,
+            gpu: sample.gpu.as_ref().and_then(|g| g.load),
         })
+    }
+
+    /// "Open in history" on the Processes page: the History page, showing that app.
+    fn open_in_history(&mut self, app: &str) {
+        self.history.show_app(app);
+        self.page = HISTORY_PAGE;
+    }
+
+    /// What the History page reads: the history folder, and the run recording now.
+    fn history_inputs(&self) -> history_page::Inputs {
+        let live = self.recording.run().zip(self.recording.store());
+        let live_steps = live
+            .as_ref()
+            .and_then(|(_, s)| s.lock().ok().map(|s| s.fine().len()))
+            .unwrap_or(0);
+        history_page::Inputs {
+            sources: Some(recording::query::Sources {
+                dir: recording::disk::directory(),
+                live,
+            }),
+            recording: self.recording.is_on(),
+            live_steps,
+        }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -392,6 +455,8 @@ impl Resources {
                         }
                         None => self.gpu_missing = self.gpu_missing.saturating_add(1),
                     }
+                    let gpu_pids = sample.gpu.as_ref().map(|_| sample.gpu_pids.as_slice());
+                    self.processes.set_gpu(gpu_pids);
                     self.last = Some(*sample);
                     self.last_at = Some(Instant::now());
                 }
@@ -405,10 +470,18 @@ impl Resources {
         match page {
             2 => {
                 self.processes.ui(ui, self.process_totals());
+                if let Some(app) = self.processes.take_open_history() {
+                    self.open_in_history(&app);
+                }
                 return;
             }
             3 => {
                 self.connections.ui(ui);
+                return;
+            }
+            4 => {
+                let inputs = self.history_inputs();
+                self.history.ui(ui, inputs);
                 return;
             }
             _ => {}
@@ -433,13 +506,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recording_is_off_by_default_and_survives_suspend() {
+    fn recording_is_on_by_default_and_survives_suspend() {
         let mut addon = Resources::new();
+        let off = std::collections::BTreeMap::from([(
+            recording::PREF_KEY.to_string(),
+            serde_json::json!(false),
+        )]);
+        addon.load_preferences(&off);
+        assert!(!addon.recording.is_on(), "off when switched off");
         addon.load_preferences(&Default::default());
-        assert!(!addon.recording.is_on(), "off unless switched on");
-        addon.recording.apply(true, || {
-            recording::Recorder::spawn(std::time::Duration::from_secs(3600), || None)
-        });
+        assert!(addon.recording.is_on(), "on by default");
         let store = addon.recording.store().unwrap();
         addon.page = 2;
         addon.suspend();
@@ -450,8 +526,8 @@ mod tests {
         ));
         addon.resume();
         assert!(addon.recording.is_on());
-        // Switched off in the preferences: the recorder goes.
-        addon.load_preferences(&Default::default());
+        // Switched off in the preferences: the recorder goes, and nothing waits to start.
+        addon.load_preferences(&off);
         assert!(!addon.recording.is_on());
         assert!(!addon.has_background_work());
     }
@@ -508,8 +584,9 @@ mod tests {
             Box::new(|| steps() >= at_suspend + 5),
         );
         // Switched off: the recorder thread ends and releases its history.
+        let off = serde_json::json!({ recording::PREF_KEY: false }).to_string();
         writer
-            .write(&HostMessage::LoadPreferences { json: "{}".into() })
+            .write(&HostMessage::LoadPreferences { json: off })
             .unwrap();
         wait_until(
             "recorder thread ended",
@@ -520,6 +597,15 @@ mod tests {
         assert_eq!(steps(), after_off, "nothing is recorded once off");
         writer.write(&HostMessage::Quit).unwrap();
         runtime.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn open_in_history_switches_to_the_history_page() {
+        assert_eq!(PAGES[HISTORY_PAGE], "History");
+        let mut addon = Resources::new();
+        addon.navigate("2");
+        addon.open_in_history("chrome.exe");
+        assert_eq!(addon.page_index(), HISTORY_PAGE);
     }
 
     #[test]

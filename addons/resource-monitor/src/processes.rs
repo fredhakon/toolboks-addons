@@ -27,17 +27,27 @@ use windows::Win32::System::Threading::{
 use protected_processes::Parent;
 use toolboks_shared::format::{friendly_name, rate, size_plain, uptime};
 use toolboks_shared::ui::{
-    body_cell, header_cell, inspector_edge, inspector_frame, row_rule, switch_row, table_style,
-    CARD_PAD, DATA_CPU, DATA_DISK, DATA_MEMORY, GAP, MUTED, RED, SPACE_M, TEXT_SECTION,
+    body_cell, header_cell, inspector_edge, inspector_frame, pill, row_rule, table_style, CARD_PAD,
+    DATA_CPU, DATA_DISK, DATA_GPU, DATA_MEMORY, DATA_NETWORK, GAP, MUTED, RED, SPACE_M,
+    TEXT_SECTION,
 };
 use toolboks_shared::win::Handle;
 
 use crate::lower_confirm::{is_confirmed, lower_text, settle, Pending};
 
+mod facts;
+mod graphs;
+mod groups;
+use groups::Kind;
+
 pub(super) const ROW_HEIGHT: f32 = 28.0;
 /// Header row: the column name above the system total.
 const HEADER_HEIGHT: f32 = 40.0;
 pub(super) const INSPECTOR_WIDTH: f32 = 240.0;
+/// Width of the open/close button in front of a merged row's name.
+const TOGGLE_WIDTH: f32 = 14.0;
+/// Extra step in for a process shown under its opened group.
+const INDENT: f32 = 12.0;
 /// Time between two process refreshes while the page is visible.
 pub(super) const REFRESH: Duration = Duration::from_secs(2);
 /// Wait before the second refresh that makes CPU percentages meaningful.
@@ -85,12 +95,22 @@ struct Proc {
     /// Bytes per second read plus written since the previous refresh; None until this process
     /// has been seen in two refreshes in a row.
     disk: Option<f64>,
+    /// GPU load, percent 0 to 100, from the main sampler's latest GPU reading; None while there
+    /// is no reading (or no usable GPU).
+    gpu: Option<f32>,
+    /// Open TCP and UDP connections owned by the process; None when the tables could not be read.
+    conns: Option<u32>,
     run_secs: u64,
     exe: Option<String>,
     /// The parent this refresh vouched for (to protect children of game launchers). A parent
     /// that has exited, whose pid was reused, or whose creation time could not be read is
     /// unverified, and the process is then protected.
     parent: Parent,
+    /// Apps, Background processes or Windows processes.
+    kind: Kind,
+    /// The parent pid for the tree view: only a parent in the same refresh that started before
+    /// this process (a reused pid is never taken for the parent). None puts it at the top.
+    tree_parent: Option<u32>,
 }
 
 /// One table row: a process, or all processes of one name when grouped.
@@ -106,12 +126,249 @@ struct Row {
     mem: u64,
     /// Sum of the known disk rates in the row; None while none of its processes has one.
     disk: Option<f64>,
+    /// Sum of the GPU loads in the row, capped at 100 (the Overview GPU card's rule).
+    gpu: Option<f32>,
+    /// Open connections of every process in the row.
+    conns: Option<u32>,
     run_secs: u64,
     exe: Option<String>,
     /// Parent of the first process in the row.
     parent: Parent,
     /// True when every process in the row is protected.
     protected: bool,
+    /// The section: the most visible one of its processes ([`groups::merge`]).
+    kind: Kind,
+    /// 0 for a top-level row, 1 for a process shown under its expanded group, the tree level in
+    /// the tree view.
+    depth: u8,
+    /// Tree parent of a one-process row ([`Proc::tree_parent`]).
+    tree_parent: Option<u32>,
+    /// Child rows under it in the tree view (after the filter); 0 elsewhere.
+    kids: u32,
+    /// True when it is opened: its processes or tree children are listed under it.
+    open: bool,
+    /// A process listed under its merged row: the name shows its pid.
+    show_pid: bool,
+}
+
+/// How the table is laid out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum View {
+    /// Apps, Background processes and Windows processes sections, rows merged by name.
+    ByType,
+    /// One row per program name, no sections.
+    ByName,
+    /// One row per process, each under the process that started it.
+    Tree,
+    /// One row per process.
+    Flat,
+}
+
+impl View {
+    const ALL: [View; 4] = [View::ByType, View::ByName, View::Tree, View::Flat];
+
+    fn label(self) -> &'static str {
+        match self {
+            View::ByType => "By type",
+            View::ByName => "By name",
+            View::Tree => "Tree",
+            View::Flat => "Flat",
+        }
+    }
+
+    /// True when rows merge every process of one name.
+    fn grouped(self) -> bool {
+        matches!(self, View::ByType | View::ByName)
+    }
+}
+
+/// One line of the table: a section caption or a row.
+// Nearly every line is a row (at most three are captions), so boxing rows would only add an
+// allocation per line.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
+enum Line {
+    /// Caption with the number of rows under it.
+    Section(Kind, usize),
+    Row(Row),
+}
+
+impl Line {
+    fn key(&self) -> Option<&str> {
+        match self {
+            Line::Section(..) => None,
+            Line::Row(r) => Some(&r.key),
+        }
+    }
+}
+
+/// The rows of one snapshot: the top-level rows of the view and, in the merged views, one row
+/// per process to show under an expanded group.
+#[derive(Default)]
+struct Rows {
+    top: Vec<Row>,
+    children: Vec<Row>,
+}
+
+impl Rows {
+    fn build(procs: &[Proc], view: View, protected: &dyn Fn(&Proc) -> bool) -> Rows {
+        let children = if view.grouped() {
+            let mut flat = build_rows(procs, false, protected);
+            for r in &mut flat {
+                r.depth = 1;
+                r.show_pid = true;
+            }
+            flat
+        } else {
+            Vec::new()
+        };
+        Rows {
+            top: build_rows(procs, view.grouped(), protected),
+            children,
+        }
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Row> {
+        self.top.iter().chain(&self.children)
+    }
+}
+
+/// True when the row can open: a merged row of several processes, or a tree row with children.
+fn expandable(r: &Row) -> bool {
+    r.kids > 0 || (r.depth == 0 && r.pids.len() > 1 && !r.key.starts_with("pid:"))
+}
+
+/// Deepest tree level that is still indented further; deeper levels line up with it.
+const MAX_INDENT_LEVEL: u8 = 8;
+
+/// The tree view's lines: every process under the process that started it, siblings sorted by
+/// the current column, all open except the ones in `collapsed`. With a filter, the matching
+/// processes stay together with every ancestor, so you still see where they came from. Pure.
+fn tree_lines(
+    rows: &[Row],
+    collapsed: &HashSet<String>,
+    filter: &str,
+    sort: SortKey,
+    descending: bool,
+) -> Vec<Line> {
+    let mut all = rows.to_vec();
+    sort_rows(&mut all, sort, descending);
+    let index: std::collections::HashMap<u32, usize> =
+        all.iter().enumerate().map(|(i, r)| (r.pid, i)).collect();
+    let parent_of = |i: usize| {
+        all[i]
+            .tree_parent
+            .filter(|pp| *pp != all[i].pid)
+            .and_then(|pp| index.get(&pp).copied())
+    };
+    let keep: Vec<bool> = if filter.trim().is_empty() {
+        vec![true; all.len()]
+    } else {
+        let matched: HashSet<u32> = filter_rows(all.clone(), filter)
+            .iter()
+            .map(|r| r.pid)
+            .collect();
+        let mut keep = vec![false; all.len()];
+        for start in (0..all.len()).filter(|&i| matched.contains(&all[i].pid)) {
+            // Up to the root; the step limit only guards against a malformed table.
+            let mut at = Some(start);
+            for _ in 0..all.len() {
+                let Some(i) = at else { break };
+                if keep[i] && i != start {
+                    break;
+                }
+                keep[i] = true;
+                at = parent_of(i);
+            }
+        }
+        keep
+    };
+    // `all` is sorted, so every child list and the roots come out sorted too.
+    let mut kids: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    let mut roots = Vec::new();
+    for i in (0..all.len()).filter(|&i| keep[i]) {
+        match parent_of(i).filter(|&pi| keep[pi]) {
+            Some(pi) => kids.entry(pi).or_default().push(i),
+            None => roots.push(i),
+        }
+    }
+    let mut lines = Vec::new();
+    let mut placed = vec![false; all.len()];
+    let mut stack: Vec<(usize, u8)> = roots.into_iter().rev().map(|i| (i, 0)).collect();
+    while let Some((i, depth)) = stack.pop() {
+        if std::mem::replace(&mut placed[i], true) {
+            continue;
+        }
+        let children = kids.get(&i).map_or(&[][..], Vec::as_slice);
+        let mut row = all[i].clone();
+        row.depth = depth;
+        row.kids = children.len() as u32;
+        row.open = !children.is_empty() && !collapsed.contains(&row.key);
+        if row.open {
+            stack.extend(children.iter().rev().map(|&c| (c, depth.saturating_add(1))));
+        }
+        lines.push(Line::Row(row));
+    }
+    lines
+}
+
+/// The table lines for a view: filtered and sorted rows, under section captions in the By type
+/// view, each expanded group followed by its processes (sorted the same way). The filter picks
+/// the top-level rows; an expanded group shows all its processes. In the tree view `expanded`
+/// holds the rows closed instead (the tree starts open), see [`tree_lines`]. Pure.
+fn build_lines(
+    rows: &Rows,
+    view: View,
+    expanded: &HashSet<String>,
+    filter: &str,
+    sort: SortKey,
+    descending: bool,
+) -> Vec<Line> {
+    if view == View::Tree {
+        return tree_lines(&rows.top, expanded, filter, sort, descending);
+    }
+    let mut top = filter_rows(rows.top.clone(), filter);
+    sort_rows(&mut top, sort, descending);
+    let mut children: Vec<Row> = rows
+        .children
+        .iter()
+        .filter(|c| expanded.contains(&c.lower_name))
+        .cloned()
+        .collect();
+    sort_rows(&mut children, sort, descending);
+    let push_row = |lines: &mut Vec<Line>, mut r: Row| {
+        let open = expandable(&r) && expanded.contains(&r.key);
+        r.open = open;
+        let key = r.lower_name.clone();
+        lines.push(Line::Row(r));
+        if open {
+            lines.extend(
+                children
+                    .iter()
+                    .filter(|c| c.lower_name == key)
+                    .cloned()
+                    .map(Line::Row),
+            );
+        }
+    };
+    let mut lines = Vec::new();
+    if view == View::ByType {
+        for kind in Kind::ALL {
+            let section: Vec<Row> = top.iter().filter(|r| r.kind == kind).cloned().collect();
+            if section.is_empty() {
+                continue;
+            }
+            lines.push(Line::Section(kind, section.len()));
+            for r in section {
+                push_row(&mut lines, r);
+            }
+        }
+    } else {
+        for r in top {
+            push_row(&mut lines, r);
+        }
+    }
+    lines
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -121,6 +378,8 @@ enum SortKey {
     Cpu,
     Memory,
     Disk,
+    Gpu,
+    Connections,
 }
 
 /// True for processes Windows needs, this app itself, and game, launcher and anti-cheat
@@ -136,9 +395,29 @@ pub(super) fn is_protected(pid: u32, name: &str, parent: &Parent, own_pid: u32) 
         || protected_processes::protected_reason(name, parent).is_some()
 }
 
+/// True for the processes Windows itself runs (the system part of [`PROTECTED`]); they go under
+/// Windows processes. Toolboks is on that list only to protect it, so it is left out here.
+fn is_system(pid: u32, name: &str) -> bool {
+    pid == 0
+        || pid == 4
+        || PROTECTED
+            .iter()
+            .filter(|n| **n != "toolboks.exe")
+            .any(|n| name.eq_ignore_ascii_case(n))
+}
+
 /// Why a protected process is left alone, for hovers and the inspector.
 pub(super) fn protected_note(name: &str, parent: &Parent) -> &'static str {
     protected_processes::protected_reason(name, parent).map_or(PROTECTED_NOTE, |p| p.describe())
+}
+
+/// Columns after Name: PID (flat view only), CPU, Memory, Disk, GPU and Connections.
+fn data_columns(grouped: bool) -> usize {
+    if grouped {
+        5
+    } else {
+        6
+    }
 }
 
 /// Stable key of a row: lowercase name when grouped, process identity when not.
@@ -170,6 +449,12 @@ fn link_parents(procs: &mut [Proc], parent_pids: &[Option<u32>]) {
             p.identity.map(|id| id.created),
             parent.map(|(name, created)| (name.as_str(), *created)),
         );
+        // The tree uses the same rule: a parent that started after the child holds a reused pid.
+        let child_created = p.identity.map(|id| id.created);
+        p.tree_parent = match (ppid, parent, child_created) {
+            (Some(ppid), Some((_, Some(created))), Some(child)) if *created < child => Some(*ppid),
+            _ => None,
+        };
     }
 }
 
@@ -191,11 +476,20 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     (Some(a), Some(b)) => Some(a + b),
                     (a, b) => a.or(b),
                 };
+                r.gpu = match (r.gpu, p.gpu) {
+                    (Some(a), Some(b)) => Some((a + b).min(100.0)),
+                    (a, b) => a.or(b),
+                };
+                r.conns = match (r.conns, p.conns) {
+                    (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                    (a, b) => a.or(b),
+                };
                 r.run_secs = r.run_secs.max(p.run_secs);
                 if r.exe.is_none() {
                     r.exe = p.exe.clone();
                 }
                 r.protected &= is_prot;
+                r.kind = groups::merge(r.kind, p.kind);
             }
             None => {
                 index.insert(key.clone(), rows.len());
@@ -208,10 +502,18 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     cpu: p.cpu,
                     mem: p.mem,
                     disk: p.disk,
+                    gpu: p.gpu.map(|g| g.min(100.0)),
+                    conns: p.conns,
                     run_secs: p.run_secs,
                     exe: p.exe.clone(),
                     parent: p.parent.clone(),
                     protected: is_prot,
+                    kind: p.kind,
+                    depth: 0,
+                    tree_parent: if grouped { None } else { p.tree_parent },
+                    kids: 0,
+                    open: false,
+                    show_pid: false,
                 });
             }
         }
@@ -228,6 +530,8 @@ fn sort_rows(rows: &mut [Row], key: SortKey, descending: bool) {
             SortKey::Cpu => a.cpu.total_cmp(&b.cpu),
             SortKey::Memory => a.mem.cmp(&b.mem),
             SortKey::Disk => a.disk.unwrap_or(0.0).total_cmp(&b.disk.unwrap_or(0.0)),
+            SortKey::Gpu => a.gpu.unwrap_or(0.0).total_cmp(&b.gpu.unwrap_or(0.0)),
+            SortKey::Connections => a.conns.unwrap_or(0).cmp(&b.conns.unwrap_or(0)),
         };
         let ord = if descending { ord.reverse() } else { ord };
         ord.then_with(|| a.lower_name.cmp(&b.lower_name))
@@ -272,6 +576,28 @@ pub(super) fn confirm_text(label: &str, count: usize) -> String {
     }
 }
 
+/// The selected row's values for its graphs, from the newest snapshot: a name key sums every
+/// process of that name, a pid key is one process. NaN where unknown, all NaN when the row's
+/// processes have exited (a gap in the graphs).
+fn row_values(procs: &[Proc], key: &str, cpu_ready: bool) -> graphs::Values {
+    let merged = !key.starts_with("pid:");
+    let matching: Vec<Proc> = procs
+        .iter()
+        .filter(|p| row_key(merged, p) == key)
+        .cloned()
+        .collect();
+    let Some(r) = build_rows(&matching, merged, &|_| false).into_iter().next() else {
+        return [f32::NAN; 5];
+    };
+    [
+        if cpu_ready { r.cpu } else { f32::NAN },
+        r.mem as f32,
+        r.disk.map_or(f32::NAN, |d| d as f32),
+        r.gpu.unwrap_or(f32::NAN),
+        r.conns.map_or(f32::NAN, |n| n as f32),
+    ]
+}
+
 /// Plain text for the clipboard: one line per row.
 fn copy_text(rows: &[&Row], ready: bool) -> String {
     rows.iter()
@@ -302,6 +628,36 @@ fn cpu_text(cpu: f32, ready: bool) -> String {
 
 fn disk_text(disk: Option<f64>) -> String {
     disk.map_or_else(|| "...".to_string(), rate)
+}
+
+fn gpu_text(gpu: Option<f32>) -> String {
+    gpu.map_or_else(|| "...".to_string(), |g| format!("{g:.1}%"))
+}
+
+fn conns_text(conns: Option<u32>) -> String {
+    conns.map_or_else(|| "...".to_string(), |n| n.to_string())
+}
+
+/// Header hover of the Connections column. Windows has no per-app network speed without admin
+/// rights (#37), so the column counts connections and says so.
+const CONNECTIONS_HINT: &str = "Open network connections (TCP and UDP, every state) per app, \
+     the same list as the Connections page. This is a count, not traffic: Windows does not \
+     report network use per app without administrator rights.";
+
+/// Gives each process its open-connection count; `None` for all when the tables could not be
+/// read. A process missing from the tables has none.
+fn apply_conns(procs: &mut [Proc], by_pid: Option<&std::collections::HashMap<u32, u32>>) {
+    for p in procs {
+        p.conns = by_pid.map(|m| m.get(&p.pid).copied().unwrap_or(0));
+    }
+}
+
+/// Gives each process its GPU load from the newest per-pid reading (`None` while there is no
+/// reading). A process missing from the reading uses no GPU.
+fn apply_gpu(procs: &mut [Proc], by_pid: Option<&std::collections::HashMap<u32, f32>>) {
+    for p in procs {
+        p.gpu = by_pid.map(|m| m.get(&p.pid).copied().unwrap_or(0.0));
+    }
 }
 
 /// Which processes were present in the previous refresh. sysinfo reports a process's disk
@@ -354,6 +710,10 @@ const SHADE_STEPS: usize = 4;
 const CPU_SHADE: [f64; SHADE_STEPS] = [1.0, 10.0, 25.0, 50.0];
 /// Memory: percent of the installed RAM.
 const MEM_SHADE: [f64; SHADE_STEPS] = [1.0, 5.0, 10.0, 25.0];
+/// GPU: percent of the GPU's busiest engine, the same steps as CPU.
+const GPU_SHADE: [f64; SHADE_STEPS] = CPU_SHADE;
+/// Connections: open connections (5, 20, 50 and 100).
+const CONN_SHADE: [f64; SHADE_STEPS] = [5.0, 20.0, 50.0, 100.0];
 /// Disk: bytes per second (0.1, 1, 10 and 100 MB/s).
 const DISK_SHADE: [f64; SHADE_STEPS] = [100_000.0, 1_000_000.0, 10_000_000.0, 100_000_000.0];
 /// Tint opacity per level (of 255). Low enough that the plain text stays readable on top, in a
@@ -392,6 +752,8 @@ pub(super) struct Totals {
     pub disk_active: Option<f32>,
     /// Bytes per second read plus written, used when `disk_active` is missing.
     pub disk_bps: f64,
+    /// Load of the main GPU's busiest engine, 0 to 100; None without a usable GPU.
+    pub gpu: Option<f32>,
 }
 
 impl Totals {
@@ -415,12 +777,19 @@ impl Totals {
             None => rate(self.disk_bps),
         }
     }
+
+    fn gpu_text(&self) -> Option<String> {
+        self.gpu.map(|g| format!("{:.0}%", g.clamp(0.0, 100.0)))
+    }
 }
 
-/// Name for the screen: "Chrome", with the count after it for a group.
+/// Name for the screen: "Chrome", with the count after it for a group, and the pid for a
+/// process shown under its opened group.
 fn display_name(r: &Row) -> String {
     let name = friendly_name(&r.name);
-    if r.pids.len() > 1 {
+    if r.show_pid {
+        format!("{name} (pid {})", r.pid)
+    } else if r.pids.len() > 1 {
         format!("{name} ({})", r.pids.len())
     } else {
         name
@@ -766,6 +1135,8 @@ struct Snapshot {
     procs: Vec<Proc>,
     /// False until the second refresh, when CPU percentages become real.
     cpu_ready: bool,
+    /// Every open TCP and UDP connection on the PC; None when the tables could not be read.
+    conns_total: Option<u32>,
 }
 
 struct Worker {
@@ -800,6 +1171,9 @@ impl Worker {
                 let mut last: Option<Instant> = None;
                 let mut ready = false;
                 let mut disk_baseline = DiskBaseline::default();
+                let windows_dir = toolboks_shared::win::windows_dir()
+                    .ok()
+                    .map(|dir| dir.display().to_string());
                 loop {
                     std::thread::sleep(Duration::from_millis(250));
                     if Arc::strong_count(&ping) == 1 {
@@ -822,11 +1196,20 @@ impl Worker {
                     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
                     let was_primed = last.is_some();
                     last = Some(Instant::now());
+                    let owners = groups::window_owners();
                     let (mut procs, parent_pids): (Vec<Proc>, Vec<Option<u32>>) = sys
                         .processes()
                         .values()
                         .map(|p| {
                             let name = p.name().to_string_lossy().into_owned();
+                            let pid = p.pid().as_u32();
+                            let exe = p.exe().map(|e| e.display().to_string());
+                            let kind = groups::kind_of(
+                                exe.as_deref(),
+                                owners.contains(&pid),
+                                is_system(pid, &name),
+                                windows_dir.as_deref(),
+                            );
                             let u = p.disk_usage();
                             let identity = sampled_identity(p, sample_start);
                             let disk = disk_baseline.rate(
@@ -835,27 +1218,35 @@ impl Worker {
                                 secs,
                             );
                             let proc = Proc {
-                                pid: p.pid().as_u32(),
+                                pid,
                                 identity,
                                 lower_name: name.to_lowercase(),
                                 name,
                                 cpu: (p.cpu_usage() / logical).clamp(0.0, 100.0),
                                 mem: p.memory(),
                                 disk,
+                                gpu: None,
+                                conns: None,
                                 run_secs: p.run_time(),
-                                exe: p.exe().map(|e| e.display().to_string()),
+                                exe,
                                 parent: Parent::Unverified,
+                                kind,
+                                tree_parent: None,
                             };
                             (proc, p.parent().map(|parent| parent.as_u32()))
                         })
                         .unzip();
                     link_parents(&mut procs, &parent_pids);
+                    let conns = crate::connections::count_per_pid().ok();
+                    apply_conns(&mut procs, conns.as_ref());
+                    let conns_total = conns.map(|m| m.values().sum());
                     disk_baseline.commit(procs.iter().filter_map(|p| p.identity));
                     ready = was_primed;
                     if tx
                         .send(Snapshot {
                             procs,
                             cpu_ready: ready,
+                            conns_total,
                         })
                         .is_err()
                     {
@@ -887,7 +1278,13 @@ impl Worker {
 enum Click {
     Row(String, egui::Modifiers),
     Box(String),
+    /// The open/close button of a merged row.
+    Expand(String),
 }
+
+/// The visible lines and what they were built for: filter, sort column, direction, and the
+/// count of open/close clicks so far.
+type LinesCache = (String, SortKey, bool, u64, Arc<Vec<Line>>);
 
 /// What the inspector asked for this frame.
 enum Intent {
@@ -900,18 +1297,29 @@ enum Intent {
     Restore,
     Copy(String),
     Open(String),
+    /// Show this exe name on the History page.
+    OpenHistory(String),
 }
 
 pub(super) struct Page {
     worker: Option<Worker>,
     live: Arc<Vec<Proc>>,
     cpu_ready: bool,
+    /// Connections header total of the newest snapshot.
+    conns_total: Option<u32>,
     frozen: Option<Arc<Vec<Proc>>>,
-    rows: Option<Arc<Vec<Row>>>,
-    visible_rows: Option<(String, SortKey, bool, Arc<Vec<Row>>)>,
+    rows: Option<Arc<Rows>>,
+    line_cache: Option<LinesCache>,
     filter: String,
-    grouped: bool,
-    was_grouped: bool,
+    /// The view picked in the toolbar, and the one the rows were built for.
+    view: View,
+    shown_view: View,
+    /// Merged rows opened to show their processes, by row key. Kept across refreshes.
+    expanded: HashSet<String>,
+    /// Tree rows closed by hand, by row key (the tree starts fully open).
+    collapsed: HashSet<String>,
+    /// Bumped on every open or close, so the cached lines are rebuilt.
+    expanded_gen: u64,
     sort_key: SortKey,
     descending: bool,
     selection: Selection,
@@ -924,6 +1332,21 @@ pub(super) struct Page {
     denied: HashSet<ProcessIdentity>,
     job: Option<Receiver<Done>>,
     lines: Vec<String>,
+    /// Newest per-pid GPU load from the main sampler; None until a reading with a GPU arrives.
+    gpu: Option<std::collections::HashMap<u32, f32>>,
+    /// Graphs of the single selected row; None when no single row is selected.
+    own: Option<graphs::OwnGraphs>,
+    /// An "Open in history" click, waiting for the add-on to switch pages.
+    open_history: Option<String>,
+    /// Command line, user, parent, threads and handles of the one selected process (#67).
+    facts: facts::Reader,
+}
+
+#[cfg(test)]
+impl Page {
+    fn only_for_test(&mut self, key: &str) {
+        self.selection.only(key);
+    }
 }
 
 impl Page {
@@ -932,12 +1355,16 @@ impl Page {
             worker: None,
             live: Arc::default(),
             cpu_ready: false,
+            conns_total: None,
             frozen: None,
             rows: None,
-            visible_rows: None,
+            line_cache: None,
             filter: String::new(),
-            grouped: true,
-            was_grouped: true,
+            view: View::ByType,
+            shown_view: View::ByType,
+            expanded: HashSet::new(),
+            collapsed: HashSet::new(),
+            expanded_gen: 0,
             sort_key: SortKey::Cpu,
             descending: true,
             selection: Selection::default(),
@@ -947,17 +1374,56 @@ impl Page {
             denied: HashSet::new(),
             job: None,
             lines: Vec::new(),
+            gpu: None,
+            own: None,
+            facts: facts::Reader::new(),
+            open_history: None,
         }
+    }
+
+    /// The exe name of an "Open in history" click, once.
+    pub(super) fn take_open_history(&mut self) -> Option<String> {
+        self.open_history.take()
+    }
+
+    /// The key of the selected row when exactly one row is selected.
+    fn single_key(&self) -> Option<String> {
+        match self.selection.keys.len() {
+            1 => self.selection.keys.iter().next().cloned(),
+            _ => None,
+        }
+    }
+
+    /// Starts, keeps or drops the selected row's graphs, and fills new ones with the current
+    /// reading so they never start blank.
+    fn follow_graphs(&mut self) {
+        let key = self.single_key();
+        graphs::follow(&mut self.own, key.as_deref());
+        if let Some(own) = self.own.as_mut().filter(|g| g.is_empty()) {
+            own.push(row_values(&self.live, own.key(), self.cpu_ready));
+        }
+    }
+
+    /// Takes the newest per-process GPU reading (None when the PC has no usable GPU). It is
+    /// applied to the next process snapshot, so a paused list keeps the values it froze with.
+    pub(super) fn set_gpu(&mut self, by_pid: Option<&[(u32, f32)]>) {
+        self.gpu = by_pid.map(|pids| pids.iter().copied().collect());
     }
 
     /// Takes in whatever the workers have produced. Never blocks.
     pub(super) fn tick(&mut self) {
         if let Some(worker) = &self.worker {
             for snap in worker.rx.try_iter() {
-                self.live = Arc::new(snap.procs);
+                let mut procs = snap.procs;
+                apply_gpu(&mut procs, self.gpu.as_ref());
+                self.live = Arc::new(procs);
                 self.cpu_ready = snap.cpu_ready;
+                self.conns_total = snap.conns_total;
                 if self.frozen.is_none() {
                     self.rows = None;
+                }
+                if let Some(own) = self.own.as_mut() {
+                    own.push(row_values(&self.live, own.key(), self.cpu_ready));
                 }
             }
             if self.rows.is_none() && self.frozen.is_none() {
@@ -987,8 +1453,8 @@ impl Page {
         let worker = self.worker.get_or_insert_with(|| Worker::start(ui.ctx()));
         worker.ping();
 
-        if self.was_grouped != self.grouped {
-            self.was_grouped = self.grouped;
+        if self.shown_view != self.view {
+            self.shown_view = self.view;
             self.selection.clear();
             self.confirm = None;
             self.rows = None;
@@ -997,11 +1463,11 @@ impl Page {
         let protected = move |p: &Proc| is_protected(p.pid, &p.name, &p.parent, own_pid);
         let procs = Arc::clone(self.frozen.as_ref().unwrap_or(&self.live));
         if self.rows.is_none() {
-            let rows = build_rows(&procs, self.grouped, &protected);
-            let existing = rows.iter().map(|r| r.key.clone()).collect();
+            let rows = Rows::build(&procs, self.shown_view, &protected);
+            let existing = rows.all().map(|r| r.key.clone()).collect();
             self.selection.prune(&existing);
             self.rows = Some(Arc::new(rows));
-            self.visible_rows = None;
+            self.line_cache = None;
         }
         let all_rows = self.rows.as_ref().unwrap().clone();
 
@@ -1026,15 +1492,20 @@ impl Page {
         egui::CentralPanel::default().frame(side).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.spacing_mut().button_padding = Vec2::new(6.0, 1.0);
-            let rows = self.display_rows(&all_rows);
+            let lines = self.display_lines(&all_rows);
+            let grouped = self.shown_view.grouped();
+            let row_count = lines
+                .iter()
+                .filter(|l| matches!(l, Line::Row(r) if r.depth == 0 || !grouped))
+                .count();
             toolboks_addon_sdk::tutorial::region(ui, "toolbar", |ui| {
-                self.toolbar(ui, procs.len(), rows.len());
+                self.toolbar(ui, procs.len(), row_count);
             });
             ui.add_space(2.0);
             toolboks_addon_sdk::tutorial::region(ui, "table", |ui| {
                 ui.scope(|ui| {
                     table_style(ui);
-                    self.table(ui, &rows, totals);
+                    self.table(ui, &lines, totals);
                 });
             });
         });
@@ -1042,12 +1513,19 @@ impl Page {
         if let Some(intent) = intent {
             self.apply(intent, ui.ctx(), &procs, &protected);
         }
+        self.follow_graphs();
     }
 
+    /// The processes behind the selected rows: a merged row stands for every process of its
+    /// name, a process row (flat view, or opened under its group) for that one process.
     fn selected_procs(&self, procs: &[Proc]) -> Vec<Proc> {
+        let grouped = self.shown_view.grouped();
         procs
             .iter()
-            .filter(|p| self.selection.keys.contains(&row_key(self.was_grouped, p)))
+            .filter(|p| {
+                let keys = &self.selection.keys;
+                (grouped && keys.contains(&row_key(true, p))) || keys.contains(&row_key(false, p))
+            })
             .cloned()
             .collect()
     }
@@ -1113,6 +1591,7 @@ impl Page {
             }
             Intent::Copy(text) => ctx.copy_text(text),
             Intent::Open(path) => open_location(&path),
+            Intent::OpenHistory(name) => self.open_history = Some(name),
         }
     }
 
@@ -1136,25 +1615,39 @@ impl Page {
         }
     }
 
-    fn display_rows(&mut self, rows: &[Row]) -> Arc<Vec<Row>> {
-        if let Some((filter, sort, descending, visible)) = &self.visible_rows {
-            if filter == &self.filter && *sort == self.sort_key && *descending == self.descending {
-                return visible.clone();
+    fn display_lines(&mut self, rows: &Rows) -> Arc<Vec<Line>> {
+        if let Some((filter, sort, descending, gen, lines)) = &self.line_cache {
+            if filter == &self.filter
+                && *sort == self.sort_key
+                && *descending == self.descending
+                && *gen == self.expanded_gen
+            {
+                return lines.clone();
             }
         }
-        let mut filtered = filter_rows(rows.to_vec(), &self.filter);
-        sort_rows(&mut filtered, self.sort_key, self.descending);
-        let visible = Arc::new(filtered);
-        self.visible_rows = Some((
+        let lines = Arc::new(build_lines(
+            rows,
+            self.shown_view,
+            if self.shown_view == View::Tree {
+                &self.collapsed
+            } else {
+                &self.expanded
+            },
+            &self.filter,
+            self.sort_key,
+            self.descending,
+        ));
+        self.line_cache = Some((
             self.filter.clone(),
             self.sort_key,
             self.descending,
-            visible.clone(),
+            self.expanded_gen,
+            lines.clone(),
         ));
-        visible
+        lines
     }
 
-    /// Filter, group, pause and count.
+    /// Filter, view, pause and count.
     fn toolbar(&mut self, ui: &mut egui::Ui, procs_total: usize, row_count: usize) {
         let mut paused = self.frozen.is_some();
         let was_paused = paused;
@@ -1163,14 +1656,21 @@ impl Page {
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .hint_text("Filter by name or pid")
-                    .desired_width(170.0),
+                    .desired_width(150.0),
             );
-            switch_row(ui, &mut self.grouped, "Group by name");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for view in View::ALL {
+                    if pill(ui, view.label(), self.view == view).clicked() {
+                        self.view = view;
+                    }
+                }
+            });
             ui.toggle_value(&mut paused, if was_paused { "Paused" } else { "Pause" })
                 .on_hover_text("Freeze the list so rows stop moving. Sampling carries on.");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let text = if self.grouped {
-                    format!("{row_count} apps, {procs_total} processes")
+                let text = if self.shown_view.grouped() {
+                    format!("{row_count} programs, {procs_total} processes")
                 } else {
                     format!("{row_count} processes")
                 };
@@ -1184,12 +1684,15 @@ impl Page {
         }
     }
 
-    fn table(&mut self, ui: &mut egui::Ui, rows: &[Row], totals: Option<Totals>) {
+    fn table(&mut self, ui: &mut egui::Ui, lines: &[Line], totals: Option<Totals>) {
         let mut sort_click: Option<SortKey> = None;
         let mut click: Option<Click> = None;
-        let (sort_key, descending, grouped) = (self.sort_key, self.descending, self.was_grouped);
+        let (sort_key, descending) = (self.sort_key, self.descending);
+        let grouped = self.shown_view.grouped();
         let selection = &self.selection;
+        let nested = self.shown_view != View::Flat;
         let ready = self.cpu_ready;
+        let conns_total = self.conns_total;
         let mem_total = totals.map_or(0, |t| t.mem_total);
         let modifiers = ui.input(|i| i.modifiers);
 
@@ -1199,14 +1702,18 @@ impl Page {
             .sense(Sense::click())
             .auto_shrink([false, false])
             .column(Column::exact(22.0))
-            .column(Column::remainder().at_least(110.0).clip(true));
+            .column(Column::remainder().at_least(64.0).clip(true));
         if !grouped {
-            table = table.column(Column::exact(56.0));
+            table = table.column(Column::exact(46.0));
         }
+        // Sized so every column fits next to the inspector at the smallest window (1060 px,
+        // which leaves the add-on 788 px; see the test below).
         table
-            .column(Column::exact(64.0))
-            .column(Column::exact(84.0))
-            .column(Column::exact(80.0))
+            .column(Column::exact(54.0))
+            .column(Column::exact(68.0))
+            .column(Column::exact(70.0))
+            .column(Column::exact(48.0))
+            .column(Column::exact(76.0))
             .header(HEADER_HEIGHT, |mut header| {
                 header.col(|_| {});
                 // The caption sorts; the system total sits under it, right-aligned, and is
@@ -1250,11 +1757,40 @@ impl Page {
                     let total = totals.map(|t| t.disk_text());
                     sort_click = with_total(ui, "Disk", SortKey::Disk, total).or(sort_click)
                 });
+                header.col(|ui| {
+                    let total = totals.and_then(|t| t.gpu_text());
+                    sort_click = with_total(ui, "GPU", SortKey::Gpu, total).or(sort_click)
+                });
+                header.col(|ui| {
+                    let total = conns_total.map(|n| n.to_string());
+                    sort_click =
+                        with_total(ui, "Connections", SortKey::Connections, total).or(sort_click);
+                    let cell = ui.response();
+                    if cell.contains_pointer() {
+                        cell.show_tooltip_text(CONNECTIONS_HINT);
+                    }
+                });
             })
             .body(|mut body| {
                 let rule = body.ui_mut().painter().clone();
-                body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                    let r = &rows[row.index()];
+                body.rows(ROW_HEIGHT, lines.len(), |mut row| {
+                    let r = match &lines[row.index()] {
+                        Line::Section(kind, count) => {
+                            // A caption across the row; it cannot be selected.
+                            row.col(|_| {});
+                            row.col(|ui| {
+                                ui.label(
+                                    RichText::new(format!("{} ({count})", kind.title())).strong(),
+                                );
+                            });
+                            for _ in 0..data_columns(grouped) {
+                                row.col(|_| {});
+                            }
+                            row_rule(&rule, row.response().rect);
+                            return;
+                        }
+                        Line::Row(r) => r,
+                    };
                     let is_selected = selection.keys.contains(&r.key);
                     row.set_selected(is_selected);
                     let cell = |ui: &mut egui::Ui, text: String| {
@@ -1270,6 +1806,32 @@ impl Page {
                         }
                     });
                     row.col(|ui| {
+                        if nested {
+                            // Room for the open/close button, so names line up; processes
+                            // under an opened row sit one step further in per level.
+                            let toggle = Vec2::new(TOGGLE_WIDTH, ROW_HEIGHT - 8.0);
+                            let level = r.depth.min(MAX_INDENT_LEVEL);
+                            if level > 0 {
+                                ui.add_space(INDENT * f32::from(level));
+                            }
+                            if expandable(r) {
+                                let open = r.open;
+                                let label = RichText::new(if open { "-" } else { "+" }).strong();
+                                let button = egui::Button::new(label).frame(false);
+                                let hint = match (open, r.kids > 0) {
+                                    (true, true) => "Hide the processes it started",
+                                    (false, true) => "Show the processes it started",
+                                    (true, false) => "Hide its processes",
+                                    (false, false) => "Show its processes",
+                                };
+                                if ui.add_sized(toggle, button).on_hover_text(hint).clicked() {
+                                    click = Some(Click::Expand(r.key.clone()));
+                                }
+                            } else {
+                                // The button is followed by the usual gap; match it.
+                                ui.add_space(toggle.x + ui.spacing().item_spacing.x);
+                            }
+                        }
                         let l = body_cell(ui, display_name(r), false, r.protected);
                         if r.protected {
                             l.on_hover_text(protected_note(&r.name, &r.parent));
@@ -1292,6 +1854,12 @@ impl Page {
                     row.col(|ui| shaded(ui, DATA_CPU, cpu_level, cpu_text(r.cpu, ready)));
                     row.col(|ui| shaded(ui, DATA_MEMORY, mem_level, size_plain(r.mem)));
                     row.col(|ui| shaded(ui, DATA_DISK, disk_level, disk_text(r.disk)));
+                    let gpu_level = r.gpu.map_or(0, |g| shade_level(f64::from(g), &GPU_SHADE));
+                    row.col(|ui| shaded(ui, DATA_GPU, gpu_level, gpu_text(r.gpu)));
+                    let conn_level = r
+                        .conns
+                        .map_or(0, |n| shade_level(f64::from(n), &CONN_SHADE));
+                    row.col(|ui| shaded(ui, DATA_NETWORK, conn_level, conns_text(r.conns)));
                     let response = row.response();
                     row_rule(&rule, response.rect);
                     if response.clicked() && click.is_none() {
@@ -1301,10 +1869,24 @@ impl Page {
             });
 
         let visible: Vec<String> = match click {
-            Some(Click::Row(..)) if modifiers.shift => rows.iter().map(|r| r.key.clone()).collect(),
+            Some(Click::Row(..)) if modifiers.shift => lines
+                .iter()
+                .filter_map(|l| l.key().map(str::to_string))
+                .collect(),
             _ => Vec::new(),
         };
         match click {
+            Some(Click::Expand(key)) => {
+                let set = if self.shown_view == View::Tree {
+                    &mut self.collapsed
+                } else {
+                    &mut self.expanded
+                };
+                if !set.remove(&key) {
+                    set.insert(key);
+                }
+                self.expanded_gen += 1;
+            }
             Some(Click::Box(key)) => self.selection.toggle(&key),
             Some(Click::Row(key, m)) if m.shift => self.selection.range(&key, &visible),
             Some(Click::Row(key, m)) if m.command || m.ctrl => self.selection.toggle(&key),
@@ -1317,7 +1899,14 @@ impl Page {
             } else {
                 self.sort_key = key;
                 // Names and pids read naturally upwards, numbers biggest first.
-                self.descending = matches!(key, SortKey::Cpu | SortKey::Memory | SortKey::Disk);
+                self.descending = matches!(
+                    key,
+                    SortKey::Cpu
+                        | SortKey::Memory
+                        | SortKey::Disk
+                        | SortKey::Gpu
+                        | SortKey::Connections
+                );
             }
         }
     }
@@ -1326,14 +1915,18 @@ impl Page {
         &mut self,
         ui: &mut egui::Ui,
         procs: &[Proc],
-        all_rows: &[Row],
+        all_rows: &Rows,
         protected: &dyn Fn(&Proc) -> bool,
     ) -> Option<Intent> {
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
         let selected: Vec<&Row> = all_rows
-            .iter()
+            .all()
             .filter(|r| self.selection.keys.contains(&r.key))
             .collect();
+        // The facts are read for one selected process only, and dropped when it is not.
+        let only = (selected.len() == 1).then(|| self.selected_procs(procs));
+        let only = only.as_deref().and_then(|p| <&[Proc; 1]>::try_from(p).ok());
+        self.facts.follow(ui.ctx(), only.map(|[p]| p));
         if selected.is_empty() {
             ui.label(RichText::new("Nothing selected.").weak());
             ui.label(
@@ -1368,10 +1961,28 @@ impl Page {
         }
         kv(ui, "CPU", &cpu_text(cpu, ready));
         kv(ui, "Memory", &size_plain(mem));
+        let gpu: Option<f32> = selected
+            .iter()
+            .filter_map(|r| r.gpu)
+            .reduce(|a, b| a + b)
+            .map(|g| g.min(100.0));
+        if let Some(gpu) = gpu {
+            kv(ui, "GPU", &gpu_text(Some(gpu)));
+        }
+        let conns: Option<u32> = selected.iter().filter_map(|r| r.conns).reduce(|a, b| a + b);
+        if let Some(conns) = conns {
+            kv(ui, "Connections", &conns.to_string());
+        }
         if let [one] = selected.as_slice() {
             kv(ui, "Running for", &uptime(one.run_secs));
             if let Some(path) = &one.exe {
                 kv(ui, "Path", path);
+            }
+            let identity = only.and_then(|[p]| p.identity);
+            facts::show(ui, &self.facts, identity);
+            if let Some(own) = self.own.as_ref().filter(|g| g.key() == one.key) {
+                ui.add_space(4.0);
+                graphs::ui(ui, own);
             }
         }
 
@@ -1506,6 +2117,13 @@ impl Page {
                     intent = Some(Intent::Open(path.clone()));
                 }
             }
+            if ui
+                .button("Open in history")
+                .on_hover_text("See what this app used over time on the History page")
+                .clicked()
+            {
+                intent = Some(Intent::OpenHistory(one.name.clone()));
+            }
         }
         if self.job.is_some() {
             ui.label(RichText::new("Working...").weak().small());
@@ -1537,6 +2155,36 @@ pub(super) fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.spacing_mut().item_spacing.y = 4.0;
 }
 
+/// A child that waits on its stdin, for the tests that act on a real process.
+///
+/// The path must use backslashes only. With `System32/cmd.exe` (a forward slash) `cmd` reads
+/// part of its own path as a switch, prints "The syntax of the command is incorrect." and exits
+/// about 15 ms after it starts. A test that finished inside that window passed; a test that was
+/// slowed down by a busy PC lost the race (issue #99).
+#[cfg(test)]
+pub(super) fn spawn_idle_child() -> std::process::Child {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32")
+        .join("cmd.exe");
+    let mut child = Command::new(cmd)
+        .args(["/d", "/q", "/c", "set /p toolboks_test_wait="])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .unwrap();
+    // Say so at once if the child is not waiting, instead of failing later in a sampling step.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the test child exited right after it was started"
+    );
+    child
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1553,10 +2201,438 @@ mod tests {
             cpu,
             mem,
             disk: None,
+            gpu: None,
+            conns: None,
             run_secs: pid as u64,
             exe: None,
             parent: ok(),
+            kind: Kind::Background,
+            tree_parent: None,
         }
+    }
+
+    fn of_kind(mut p: Proc, kind: Kind) -> Proc {
+        p.kind = kind;
+        p
+    }
+
+    /// Chrome (an app through its window process), a background updater, and two Windows
+    /// processes, one of them merged from two svchost processes.
+    fn typed() -> Vec<Proc> {
+        vec![
+            of_kind(p(10, "chrome.exe", 1.0, 100), Kind::App),
+            of_kind(p(11, "chrome.exe", 4.0, 300), Kind::Background),
+            of_kind(p(20, "updater.exe", 2.0, 50), Kind::Background),
+            of_kind(p(30, "svchost.exe", 0.5, 20), Kind::Windows),
+            of_kind(p(31, "svchost.exe", 3.0, 10), Kind::Windows),
+            of_kind(p(40, "lsass.exe", 0.1, 5), Kind::Windows),
+        ]
+    }
+
+    fn line_names(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| match l {
+                Line::Section(kind, n) => format!("# {} ({n})", kind.title()),
+                Line::Row(r) if r.depth > 0 => format!("  {}", r.pid),
+                Line::Row(r) => r.lower_name.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_merged_row_is_an_app_when_any_of_its_processes_is() {
+        let rows = build_rows(&typed(), true, &none);
+        let kind = |name: &str| rows.iter().find(|r| r.lower_name == name).unwrap().kind;
+        assert_eq!(kind("chrome.exe"), Kind::App);
+        assert_eq!(kind("updater.exe"), Kind::Background);
+        assert_eq!(kind("svchost.exe"), Kind::Windows);
+        // The flat rows keep each process's own section.
+        let flat = build_rows(&typed(), false, &none);
+        assert_eq!(
+            flat.iter().find(|r| r.pid == 11).unwrap().kind,
+            Kind::Background
+        );
+    }
+
+    /// A process the refresh saw with `parent` as its parent pid, born at `created`.
+    fn child(pid: u32, name: &str, created: u64, cpu: f32) -> Proc {
+        Proc {
+            identity: Some(ProcessIdentity { pid, created }),
+            cpu,
+            ..p(pid, name, cpu, 0)
+        }
+    }
+
+    fn tree_names(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| match l {
+                Line::Row(r) => format!("{}{}", "  ".repeat(r.depth as usize), r.lower_name),
+                Line::Section(..) => unreachable!("the tree has no sections"),
+            })
+            .collect()
+    }
+
+    /// explorer (1) started chrome (2, 3) and code (4); chrome 2 started its helper 5.
+    fn family() -> Vec<Proc> {
+        let mut procs = vec![
+            child(1, "explorer.exe", 10, 1.0),
+            child(2, "chrome.exe", 20, 5.0),
+            child(3, "chrome.exe", 21, 9.0),
+            child(4, "code.exe", 22, 2.0),
+            child(5, "helper.exe", 30, 0.5),
+            child(6, "lonely.exe", 5, 0.1),
+        ];
+        link_parents(
+            &mut procs,
+            &[None, Some(1), Some(1), Some(1), Some(2), None],
+        );
+        procs
+    }
+
+    #[test]
+    fn the_tree_nests_children_and_sorts_siblings_by_the_column() {
+        let rows = Rows::build(&family(), View::Tree, &none);
+        let none_closed = HashSet::new();
+        let lines = tree_lines(&rows.top, &none_closed, "", SortKey::Cpu, true);
+        assert_eq!(
+            tree_names(&lines),
+            [
+                "explorer.exe",
+                "  chrome.exe",
+                "  chrome.exe",
+                "    helper.exe",
+                "  code.exe",
+                "lonely.exe",
+            ]
+        );
+        // Busiest sibling first: chrome 3 (9 %) before chrome 2 (5 %) before code (2 %).
+        let pids: Vec<u32> = lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Row(r) => Some(r.pid),
+                Line::Section(..) => None,
+            })
+            .collect();
+        assert_eq!(pids, [1, 3, 2, 5, 4, 6]);
+        // By name, ascending, the order of siblings follows.
+        let lines = tree_lines(&rows.top, &none_closed, "", SortKey::Name, false);
+        assert_eq!(
+            tree_names(&lines)[1..4],
+            ["  chrome.exe", "    helper.exe", "  chrome.exe"]
+        );
+        // Closing explorer hides everything under it; it still says it has children.
+        let closed: HashSet<String> = [rows.top[0].key.clone()].into();
+        let lines = tree_lines(&rows.top, &closed, "", SortKey::Cpu, true);
+        assert_eq!(tree_names(&lines), ["explorer.exe", "lonely.exe"]);
+        match &lines[0] {
+            Line::Row(r) => assert!(expandable(r) && !r.open && r.kids == 3),
+            Line::Section(..) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_reused_parent_pid_puts_the_process_at_the_top() {
+        // Pid 1 was explorer, which started 7 at time 15; explorer exited and a new process
+        // (started at 40) got pid 1. It is not 7's parent.
+        let mut procs = vec![
+            child(1, "newcomer.exe", 40, 0.0),
+            child(7, "orphan.exe", 15, 0.0),
+        ];
+        link_parents(&mut procs, &[None, Some(1)]);
+        assert_eq!(procs[1].tree_parent, None);
+        let rows = Rows::build(&procs, View::Tree, &none);
+        let lines = tree_lines(&rows.top, &HashSet::new(), "", SortKey::Name, false);
+        assert_eq!(tree_names(&lines), ["newcomer.exe", "orphan.exe"]);
+        // An unknown start time on either side proves nothing either.
+        let mut procs = vec![born(1, "explorer.exe", None), child(7, "app.exe", 15, 0.0)];
+        link_parents(&mut procs, &[None, Some(1)]);
+        assert_eq!(procs[1].tree_parent, None);
+        // The genuine case: the parent started first.
+        let procs = family();
+        assert_eq!(procs[4].tree_parent, Some(2));
+    }
+
+    #[test]
+    fn the_tree_filter_keeps_the_ancestors_of_a_match() {
+        let rows = Rows::build(&family(), View::Tree, &none);
+        let lines = tree_lines(&rows.top, &HashSet::new(), "helper", SortKey::Cpu, true);
+        assert_eq!(
+            tree_names(&lines),
+            ["explorer.exe", "  chrome.exe", "    helper.exe"]
+        );
+        // A pid matches too; a match with no parent stands alone.
+        let lines = tree_lines(&rows.top, &HashSet::new(), "6", SortKey::Cpu, true);
+        assert_eq!(tree_names(&lines), ["lonely.exe"]);
+        // Matching a parent and its child keeps both once.
+        let lines = tree_lines(&rows.top, &HashSet::new(), "chrome", SortKey::Cpu, true);
+        assert_eq!(
+            tree_names(&lines),
+            ["explorer.exe", "  chrome.exe", "  chrome.exe"]
+        );
+        assert!(tree_lines(&rows.top, &HashSet::new(), "zzz", SortKey::Cpu, true).is_empty());
+    }
+
+    #[test]
+    fn the_tree_view_shows_pids_and_selects_single_processes() {
+        assert!(!View::Tree.grouped());
+        let rows = Rows::build(&family(), View::Tree, &none);
+        assert!(rows.children.is_empty());
+        assert!(rows
+            .top
+            .iter()
+            .all(|r| r.key.starts_with("pid:") && !r.show_pid));
+        let mut page = Page::new();
+        page.shown_view = View::Tree;
+        page.only_for_test(&rows.top[1].key);
+        let pids: Vec<u32> = page
+            .selected_procs(&family())
+            .iter()
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(pids, [2]);
+    }
+
+    #[test]
+    fn the_selected_rows_graphs_follow_the_selection_and_read_its_processes() {
+        let mut page = Page::new();
+        page.live = Arc::new(typed());
+        page.cpu_ready = true;
+        page.only_for_test("chrome.exe");
+        page.follow_graphs();
+        let own = page.own.as_ref().expect("one row selected: graphs");
+        assert_eq!(own.key(), "chrome.exe");
+        // Two chrome processes: 1 + 4 % CPU, 100 + 300 bytes.
+        let v = row_values(&page.live, "chrome.exe", true);
+        assert_eq!((v[0], v[1]), (5.0, 400.0));
+        let one = row_key(false, &page.live[1]);
+        let v = row_values(&page.live, &one, true);
+        assert_eq!((v[0], v[1]), (4.0, 300.0));
+        // Not ready yet, unknown disk, a row whose processes exited: gaps, not zeros.
+        assert!(row_values(&page.live, "chrome.exe", false)[0].is_nan());
+        assert!(row_values(&page.live, "chrome.exe", true)[2].is_nan());
+        assert!(row_values(&page.live, "gone.exe", true)
+            .iter()
+            .all(|v| v.is_nan()));
+        // Two rows selected, or none: nothing is kept.
+        page.selection.toggle("updater.exe");
+        page.follow_graphs();
+        assert!(page.own.is_none());
+        page.selection.clear();
+        page.follow_graphs();
+        assert!(page.own.is_none());
+    }
+
+    #[test]
+    fn open_in_history_hands_the_exe_name_over_once() {
+        let mut page = Page::new();
+        let ctx = egui::Context::default();
+        page.apply(Intent::OpenHistory("chrome.exe".into()), &ctx, &[], &none);
+        assert_eq!(page.take_open_history().as_deref(), Some("chrome.exe"));
+        assert_eq!(page.take_open_history(), None);
+    }
+
+    #[test]
+    fn system_names_are_windows_processes_but_toolboks_is_not() {
+        assert!(is_system(4, "System"));
+        assert!(is_system(900, "csrss.exe"));
+        assert!(is_system(900, "Memory Compression"));
+        assert!(!is_system(900, "Toolboks.exe"));
+        assert!(!is_system(900, "chrome.exe"));
+    }
+
+    #[test]
+    fn by_type_puts_rows_under_sections_in_task_manager_order() {
+        let rows = Rows::build(&typed(), View::ByType, &none);
+        let lines = build_lines(&rows, View::ByType, &HashSet::new(), "", SortKey::Cpu, true);
+        assert_eq!(
+            line_names(&lines),
+            [
+                "# Apps (1)",
+                "chrome.exe",
+                "# Background processes (1)",
+                "updater.exe",
+                "# Windows processes (2)",
+                "svchost.exe",
+                "lsass.exe",
+            ]
+        );
+        // An empty section is left out; the filter counts what is left.
+        let lines = build_lines(
+            &rows,
+            View::ByType,
+            &HashSet::new(),
+            "svc",
+            SortKey::Cpu,
+            true,
+        );
+        assert_eq!(
+            line_names(&lines),
+            ["# Windows processes (1)", "svchost.exe"]
+        );
+    }
+
+    #[test]
+    fn an_opened_group_lists_its_processes_sorted_under_it() {
+        let rows = Rows::build(&typed(), View::ByType, &none);
+        let open: HashSet<String> = ["chrome.exe".to_string()].into();
+        let lines = build_lines(&rows, View::ByType, &open, "", SortKey::Cpu, true);
+        assert_eq!(
+            line_names(&lines)[..4],
+            ["# Apps (1)", "chrome.exe", "  11", "  10"]
+        );
+        let child = match &lines[2] {
+            Line::Row(r) => r,
+            Line::Section(..) => unreachable!(),
+        };
+        assert!(child.key.starts_with("pid:11:"));
+        assert!(!expandable(child));
+        assert_eq!(display_name(child), "Chrome (pid 11)");
+        // By name: same rows and opening, no sections.
+        let rows = Rows::build(&typed(), View::ByName, &none);
+        let lines = build_lines(&rows, View::ByName, &open, "", SortKey::Name, false);
+        assert_eq!(
+            line_names(&lines),
+            [
+                "chrome.exe",
+                "  10",
+                "  11",
+                "lsass.exe",
+                "svchost.exe",
+                "updater.exe"
+            ]
+        );
+        // A single process has nothing to open; the flat view has no merged rows at all.
+        assert!(!expandable(&rows.top[1]));
+        let flat = Rows::build(&typed(), View::Flat, &none);
+        assert!(flat.children.is_empty());
+        let lines = build_lines(&flat, View::Flat, &open, "", SortKey::Pid, false);
+        assert_eq!(lines.len(), 6);
+        assert!(lines
+            .iter()
+            .all(|l| matches!(l, Line::Row(r) if r.depth == 0)));
+    }
+
+    #[test]
+    fn a_process_row_selects_one_process_and_a_group_row_all_of_them() {
+        let mut page = Page::new();
+        let procs = typed();
+        page.only_for_test("chrome.exe");
+        let pids: Vec<u32> = page.selected_procs(&procs).iter().map(|p| p.pid).collect();
+        assert_eq!(pids, [10, 11]);
+        let one = row_key(false, &procs[1]);
+        page.only_for_test(&one);
+        let pids: Vec<u32> = page.selected_procs(&procs).iter().map(|p| p.pid).collect();
+        assert_eq!(pids, [11]);
+        // In the flat view a name key means nothing.
+        page.shown_view = View::Flat;
+        page.only_for_test("chrome.exe");
+        assert!(page.selected_procs(&procs).is_empty());
+    }
+
+    /// Every text drawn in one frame, with where it was drawn.
+    fn frame_texts(ctx: &egui::Context, page: &mut Page, width: f32) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((
+                    t.galley.text().to_owned(),
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 720.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| page.ui(ui, None));
+        output.textures_delta.clear();
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// The page at the smallest window: the add-on gets 820 points next to the open sidebar
+    /// (DESIGN.md). Every column header must be left of the inspector, the sections must show,
+    /// and the guided tour must still find the toolbar, table and inspector.
+    #[test]
+    fn the_page_fits_the_smallest_window_and_the_tour_finds_its_regions() {
+        // The 1060 px window minus the open sidebar (240) and the host's content padding
+        // (16 on each side), as measured in the real window.
+        const CONTENT: f32 = 788.0;
+        let ctx = egui::Context::default();
+        toolboks_shared::ui::apply_style(&ctx);
+        let mut page = Page::new();
+        page.live = Arc::new(typed());
+        page.cpu_ready = true;
+        for view in [View::ByType, View::Tree, View::Flat] {
+            page.view = view;
+            let mut texts = Vec::new();
+            for _ in 0..3 {
+                texts = frame_texts(&ctx, &mut page, CONTENT);
+            }
+            let find = |text: &str| {
+                texts
+                    .iter()
+                    .find(|(t, _)| t.starts_with(text))
+                    .map(|(_, r)| *r)
+                    .unwrap_or_else(|| panic!("{text:?} not drawn in {view:?}"))
+            };
+            let inspector_left = CONTENT - INSPECTOR_WIDTH;
+            for header in ["Name", "CPU", "Memory", "Disk", "GPU", "Connections"] {
+                let rect = find(header);
+                assert!(
+                    rect.right() <= inspector_left,
+                    "{header} {rect:?} in {view:?}"
+                );
+            }
+            let count = find(if view.grouped() {
+                "4 programs"
+            } else {
+                "6 processes"
+            });
+            assert!(count.right() <= inspector_left, "{count:?}");
+            if view == View::ByType {
+                find("Apps (1)");
+                // Names line up whether or not the row has an open button in front.
+                let merged = find("Chrome (2)");
+                let single = find("Updater");
+                assert!(
+                    (merged.left() - single.left()).abs() < 0.5,
+                    "{merged:?} {single:?}"
+                );
+                find("Background processes (1)");
+                find("Windows processes (2)");
+            } else {
+                find("PID");
+            }
+        }
+        let mut anchors = Vec::new();
+        for target in ["toolbar", "table", "inspector"] {
+            toolboks_addon_sdk::tutorial::prepare(&ctx, Some(target), false);
+            frame_texts(&ctx, &mut page, CONTENT);
+            let rect = toolboks_addon_sdk::tutorial::anchor(&ctx)
+                .unwrap_or_else(|| panic!("tour target {target} not marked"));
+            anchors.push(rect);
+        }
+        let [toolbar, table, inspector] = anchors[..] else {
+            unreachable!()
+        };
+        assert!(
+            toolbar.bottom() <= table.top() + 1.0,
+            "{toolbar:?} {table:?}"
+        );
+        assert!(
+            inspector.left() >= table.right() - 1.0,
+            "{inspector:?} {table:?}"
+        );
     }
 
     /// A parent the refresh vouched for that protects nothing.
@@ -1608,6 +2684,105 @@ mod tests {
         let flat = build_rows(&procs, false, &none);
         assert_eq!(flat.len(), 3);
         assert_eq!(flat[0].disk, Some(1_500_000.0));
+    }
+
+    fn with_gpu(mut p: Proc, gpu: f32) -> Proc {
+        p.gpu = Some(gpu);
+        p
+    }
+
+    #[test]
+    fn grouping_sums_gpu_like_the_overview_card() {
+        // The same processes the Overview GPU card gets from the sampler.
+        let readings = [
+            (10, "game.exe", 70.0),
+            (11, "Game.exe", 45.0),
+            (20, "chrome.exe", 3.5),
+            (21, "chrome.exe", 1.0),
+            (30, "code.exe", 0.4),
+        ];
+        let mut procs: Vec<Proc> = readings
+            .iter()
+            .map(|(pid, name, _)| p(*pid, name, 0.0, 0))
+            .chain([p(40, "notepad.exe", 0.0, 0)])
+            .collect();
+        let by_pid: std::collections::HashMap<u32, f32> =
+            readings.iter().map(|(pid, _, g)| (*pid, *g)).collect();
+        apply_gpu(&mut procs, Some(&by_pid));
+        let rows = build_rows(&procs, true, &none);
+        let card =
+            crate::sampler::gpu_by_name(readings.iter().map(|(_, n, g)| (n.to_string(), *g)));
+        assert_eq!(card.len(), 3);
+        for top in &card {
+            let row = rows
+                .iter()
+                .find(|r| r.lower_name == top.name.to_lowercase())
+                .unwrap();
+            assert_eq!(row.gpu, Some(top.value as f32), "{}", top.name);
+            assert_eq!(row.pids.len(), top.count, "{}", top.name);
+        }
+        // Capped at 100 % like the card; a process missing from the reading uses no GPU.
+        assert_eq!(rows[0].gpu, Some(100.0));
+        let notepad = rows.iter().find(|r| r.lower_name == "notepad.exe").unwrap();
+        assert_eq!(notepad.gpu, Some(0.0));
+        // No GPU reading: unknown, not 0.
+        apply_gpu(&mut procs, None);
+        assert!(build_rows(&procs, true, &none)
+            .iter()
+            .all(|r| r.gpu.is_none()));
+    }
+
+    #[test]
+    fn connections_are_counted_per_process_and_summed_per_group() {
+        let mut procs = vec![
+            p(10, "chrome.exe", 0.0, 0),
+            p(11, "Chrome.exe", 0.0, 0),
+            p(20, "code.exe", 0.0, 0),
+            p(30, "notepad.exe", 0.0, 0),
+        ];
+        let by_pid: std::collections::HashMap<u32, u32> =
+            [(10, 12), (11, 3), (20, 1), (999, 40)].into();
+        apply_conns(&mut procs, Some(&by_pid));
+        let rows = build_rows(&procs, true, &none);
+        let get = |name: &str| rows.iter().find(|r| r.lower_name == name).unwrap().conns;
+        assert_eq!(get("chrome.exe"), Some(15));
+        assert_eq!(get("code.exe"), Some(1));
+        // Not in the tables: no connections, not unknown.
+        assert_eq!(get("notepad.exe"), Some(0));
+        let mut flat = build_rows(&procs, false, &none);
+        sort_rows(&mut flat, SortKey::Connections, true);
+        let order: Vec<u32> = flat.iter().map(|r| r.pid).collect();
+        assert_eq!(order, vec![10, 11, 20, 30]);
+        // The tables could not be read: unknown everywhere.
+        apply_conns(&mut procs, None);
+        assert!(build_rows(&procs, true, &none)
+            .iter()
+            .all(|r| r.conns.is_none()));
+        assert_eq!(conns_text(None), "...");
+        assert_eq!(conns_text(Some(7)), "7");
+        assert_eq!(shade_level(4.0, &CONN_SHADE), 0);
+        assert_eq!(shade_level(20.0, &CONN_SHADE), 2);
+        assert_eq!(shade_level(500.0, &CONN_SHADE), 4);
+        // The hover says plainly it is a count, not traffic.
+        assert!(CONNECTIONS_HINT.contains("not traffic"));
+    }
+
+    #[test]
+    fn sorts_by_gpu_and_shades_like_cpu() {
+        let procs = vec![
+            with_gpu(p(3, "b.exe", 1.0, 5), 12.0),
+            p(2, "a.exe", 1.0, 5),
+            with_gpu(p(1, "c.exe", 1.0, 5), 80.0),
+        ];
+        let mut rows = build_rows(&procs, false, &none);
+        sort_rows(&mut rows, SortKey::Gpu, true);
+        let order: Vec<u32> = rows.iter().map(|r| r.pid).collect();
+        assert_eq!(order, vec![1, 3, 2]);
+        assert_eq!(gpu_text(None), "...");
+        assert_eq!(gpu_text(Some(12.04)), "12.0%");
+        assert_eq!(shade_level(0.5, &GPU_SHADE), 0);
+        assert_eq!(shade_level(12.0, &GPU_SHADE), 2);
+        assert_eq!(shade_level(80.0, &GPU_SHADE), 4);
     }
 
     #[test]
@@ -1669,7 +2844,10 @@ mod tests {
             mem_total: 16 * 1024 * 1024 * 1024,
             disk_active: Some(12.6),
             disk_bps: 5_000_000.0,
+            gpu: Some(41.6),
         };
+        assert_eq!(t.gpu_text().as_deref(), Some("42%"));
+        assert_eq!(Totals { gpu: None, ..t }.gpu_text(), None);
         assert_eq!(t.cpu_text(), "34%");
         assert_eq!(t.mem_text().as_deref(), Some("50%"));
         assert_eq!(t.disk_text(), "13%");
@@ -1796,19 +2974,7 @@ mod tests {
 
     #[test]
     fn process_actions_verify_identity_on_the_handle_they_modify() {
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-
-        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/cmd.exe");
-        let mut child = Command::new(cmd)
-            .args(["/d", "/q", "/c", "set /p toolboks_test_wait="])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .spawn()
-            .unwrap();
+        let mut child = spawn_idle_child();
         let sample_start = snapshot_start();
         let pid = sysinfo::Pid::from_u32(child.id());
         let mut system = System::new().unwrap();

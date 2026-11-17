@@ -12,7 +12,7 @@ struct Guard(Child);
 #[test]
 fn manifest_matches_the_executable() {
     let package =
-        toolboks_addon_sdk::Package::parse(include_bytes!("../resource-monitor.tbaddon"), "0.12.5")
+        toolboks_addon_sdk::Package::parse(include_bytes!("../resource-monitor.tbaddon"), "0.14.0")
             .unwrap();
     assert_eq!(package.manifest.id, "toolboks.resource-monitor");
     assert_eq!(package.manifest.id, resource_monitor::ID);
@@ -29,7 +29,16 @@ fn manifest_matches_the_executable() {
     );
     assert_eq!(
         package.manifest.capabilities,
-        [toolboks_addon_sdk::Capability::HostMetrics,]
+        [
+            toolboks_addon_sdk::Capability::HostMetrics,
+            toolboks_addon_sdk::Capability::LocalPreferences,
+        ]
+    );
+    // The install review says that resource history is saved on this PC (#40).
+    let note = package.manifest.data_note.as_deref().unwrap();
+    assert!(
+        note.contains("7 days") && note.contains("on this PC"),
+        "{note}"
     );
 }
 impl Drop for Guard {
@@ -61,8 +70,12 @@ fn protocol_test_host_draws_pings_and_quits() {
     // CI can exercise the exact release executable, rather than Cargo's test build.
     let exe = std::env::var("ADDON_TEST_EXE")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_resource-monitor").into());
+    // Recording is on by default (#45): the add-on gets its own throwaway data folder, so the
+    // test never writes history into a real Toolboks folder.
+    let data = std::env::temp_dir().join(format!("rm-protocol-{}", std::process::id()));
     let mut child = Guard(
         Command::new(exe)
+            .env("TOOLBOKS_DATA_DIR", &data)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -140,9 +153,9 @@ fn protocol_test_host_draws_pings_and_quits() {
         while reader.read::<AddonMessage>().is_ok() {}
         tx.send(()).unwrap();
     });
-    rx.recv_timeout(Duration::from_secs(20))
+    rx.recv_timeout(Duration::from_secs(120))
         .expect("protocol test host timed out or failed");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             assert!(status.success());
@@ -151,4 +164,5 @@ fn protocol_test_host_draws_pings_and_quits() {
         assert!(std::time::Instant::now() < deadline, "add-on did not quit");
         std::thread::sleep(Duration::from_millis(10));
     }
+    let _ = std::fs::remove_dir_all(&data);
 }

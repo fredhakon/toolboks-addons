@@ -20,10 +20,11 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `63beeb11aa8b4b5e4270f0404521f3ae6c173c4c`, the commit of the
-released host **v0.16.0** (protocol 5; its SDK still agrees on 4 or 3 with a host that speaks
-those, and sends a protocol 4 host its findings without `why` and `evidence`). Every add-on is
-built against a host that users can actually have. `addon-repo` checks manifests as this host would
+Host dependencies pin commit `25aaa815197ec16b63cdb9d4b71e01d039fde9ca`, the commit of host release **v0.17.2**: it
+contains the Debloater evidence labels in the shared engine (host PR #214). Protocol 5 and the SDK have not changed since
+the released host **v0.16.0** (`63beeb11`; its SDK still agrees on 4 or 3 with a host that speaks those, and
+sends a protocol 4 host its findings without `why` and `evidence`), and only the statically linked engine crate
+differs, so the add-ons still run on every host they did. `addon-repo` checks manifests as this host would
 (`PINNED_HOST` in `tools/repo/src/main.rs`), so move that constant together with the pin.
 
 Every new catalog entry speaks the pinned protocol (5), so `addon-repo catalog-update` gives it
@@ -67,7 +68,10 @@ host's `cargo run --example addon_host -- <absolute-hello.exe-path> toolboks.hel
 
 Every add-on is a separate process, so each one has to stay small (host issue #97).
 `budgets.json` holds the limits: the first frame within 1000 ms of starting the exe, and
-under 25 MB of memory when idle.
+under 25 MB of memory when idle. An add-on whose measured baseline is above that can get its
+own idle memory ceiling under `addons.<name>`, with a `note` saying why. That ceiling is the
+baseline plus headroom, a guard against growth, not a target. Resource Monitor has one
+(50 MB; measured 42.4 MB, see `docs/bench-results/2026-11-17-processes-overhead.md`).
 
 ```powershell
 cargo build --locked --release -p hello
@@ -211,15 +215,43 @@ The built-in copy stays in the host until the final removal and "Restore your to
 the pages Overview, Details, Processes and Connections and the built-in tool's behavior. The
 host's `src/tools/resources/` code moved over with imports changed to the shared crates (and the
 add-on entry point in `src/lib.rs`); 91 of its own unit tests moved with it. It needs no
-administrator rights and stores nothing: the graphs live in memory while the add-on is shown.
+administrator rights. The live graphs live in memory while the add-on is shown.
 
 - **Status bar.** The `CPU nn%` and `GPU nn%` items go through the host's status services.
-- **Suspending** stops the sampler and drops the graphs, as the built-in tool does when it is
-  not shown.
-- **Not in the background yet.** `host-services.json` does not set `background`. Keeping the
-  sampler running while hidden belongs with the history recorder (host #64), which does not
-  exist yet. Today the built-in tool does not record while hidden either.
-- The guided tour has the same 22 steps.
+- **Suspending** stops the live sampler and drops the graphs, as the built-in tool does when it
+  is not shown.
+- **Background add-on.** `host-services.json` sets `"background": true`, so the host suspends
+  Resource Monitor instead of ending it when another add-on is opened or the window goes to the
+  tray. Only the history recorder keeps working then.
+- **Resource history (#36).** Unless the `history_recording` preference is `false` (it is on by
+  default, owner decision on #45), a recorder thread
+  (`src/recording/`) reads the system every 5 s and saves per-app use (exe names, times and
+  figures; never paths, window titles or command lines) to
+  `addon-data/toolboks.resource-monitor/history/` in the Toolboks data folder: every step for the
+  last hour, per-minute buckets for 24 hours, 5-minute buckets, app starts and exits for 7 days.
+  Append-only files split by time, written once a minute, pruned on start and every hour; at
+  most about 7 MB for a full week (budget 20 MB; 6.8 MB in the worst-case test). Nothing is sent anywhere. The manifest's `data_note`
+  says so in the install review. It records while Toolboks runs, also when the window is closed
+  to the tray, and stops when Toolboks quits.
+- **History settings (#45, `src/history_settings.rs`).** At the top of the History page: a
+  one-time note that says what is saved and where (with a link to the switch), and one compact
+  group with the "Record resource history" switch, the size on disk, "Delete history" (asks
+  first) and "Open history folder". With the switch off no resource history is recorded or
+  written (Toolboks still saves its own settings, this switch among them), and the history saved
+  earlier is offered for deletion. Switching off never blocks the page; a new recorder starts
+  only after the previous one has finished its last reading, so two never write at once.
+- **History page (#42).** A fifth page, History, reads the saved history (`src/history_page/`):
+  presets (last hour, last 24 hours, yesterday, last 7 days), a From and To in local time, Now
+  back to live, one lane per resource in the Overview colours, gaps hatched and labelled
+  ("Toolboks was not running"), hover read-outs, click for a cursor, drag to select, drag the time
+  axis to pan, wheel to zoom, arrow keys and Shift+arrows on the focused timeline, and the apps at
+  the cursor, over the selection or over the whole period. Reading runs on query workers
+  (`recording/query.rs`), never on the UI thread.
+- **Notable moments (#44).** `recording/markers.rs` finds CPU, GPU or disk held near full,
+  memory above 90 %, steady memory growth and gaps, plus your own marks (`marks.rmm` in the
+  history folder). The page lists them under the timeline, marks them along its top, and
+  choosing one selects its period; "Mark this moment" saves a mark at the cursor or now.
+- The guided tour has the built-in tool's 22 steps plus 4 for the History page.
 
 The built-in copy stays in the host until the final removal and "Restore your tools" step (host
 #94). Measure with `cargo run --locked -p addon-repo -- measure resource-monitor`.

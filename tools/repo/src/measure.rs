@@ -3,6 +3,7 @@
 //! It starts the exe the way the headless protocol test does (stdin and stdout as the two
 //! pipes), so it measures the add-on itself: no named pipes, launch token or host window.
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -21,6 +22,9 @@ const SETTLE: Duration = Duration::from_secs(3);
 struct Budgets {
     first_frame_ms: f64,
     idle_working_set_bytes: u64,
+    /// Per-add-on idle memory ceilings from `addons.<name>.idle_working_set_bytes`, for an
+    /// add-on whose measured baseline is above the shared budget (each entry has a `note`).
+    idle_overrides: BTreeMap<String, u64>,
 }
 
 impl Budgets {
@@ -28,6 +32,28 @@ impl Budgets {
         let value: serde_json::Value =
             serde_json::from_slice(&fs::read(path).expect("budgets.json"))
                 .expect("budgets.json is not JSON");
+        Self::from_value(&value)
+    }
+
+    fn from_value(value: &serde_json::Value) -> Self {
+        let idle_overrides = value["addons"]
+            .as_object()
+            .map(|addons| {
+                addons
+                    .iter()
+                    .map(|(name, entry)| {
+                        assert!(
+                            entry["note"].as_str().is_some_and(|n| !n.trim().is_empty()),
+                            "addons.{name} in budgets.json needs a note saying why"
+                        );
+                        let bytes = entry["idle_working_set_bytes"].as_u64().unwrap_or_else(|| {
+                            panic!("addons.{name}.idle_working_set_bytes in budgets.json")
+                        });
+                        (name.clone(), bytes)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             first_frame_ms: value["first_frame_ms"]
                 .as_f64()
@@ -35,7 +61,16 @@ impl Budgets {
             idle_working_set_bytes: value["idle_working_set_bytes"]
                 .as_u64()
                 .expect("idle_working_set_bytes in budgets.json"),
+            idle_overrides,
         }
+    }
+
+    /// The idle memory ceiling for one add-on: its own entry, or the shared budget.
+    fn idle_for(&self, name: &str) -> u64 {
+        self.idle_overrides
+            .get(name)
+            .copied()
+            .unwrap_or(self.idle_working_set_bytes)
     }
 }
 
@@ -236,11 +271,9 @@ pub fn measure(args: &[&str]) {
         if first_frame > budgets.first_frame_ms {
             over.push(format!("first frame over {:.0} ms", budgets.first_frame_ms));
         }
-        if working_set > budgets.idle_working_set_bytes {
-            over.push(format!(
-                "idle memory over {}",
-                megabytes(budgets.idle_working_set_bytes)
-            ));
+        let idle_budget = budgets.idle_for(&name);
+        if working_set > idle_budget {
+            over.push(format!("idle memory over {}", megabytes(idle_budget)));
         }
         println!(
             "| {name} | {} | {handshake:.0} ms | {first_frame:.0} ms | {} | {} | {} |",
@@ -262,6 +295,7 @@ pub fn measure(args: &[&str]) {
             "idle_working_set_bytes": working_set,
             "idle_private_bytes": private,
             "runs": runs,
+            "idle_working_set_budget_bytes": idle_budget,
             "over_budget": over,
         }));
         if !over.is_empty() {
@@ -274,11 +308,18 @@ pub fn measure(args: &[&str]) {
         budgets.first_frame_ms,
         megabytes(budgets.idle_working_set_bytes)
     );
+    for (name, bytes) in &budgets.idle_overrides {
+        println!(
+            "{name} has its own idle memory ceiling of {} (see budgets.json).",
+            megabytes(*bytes)
+        );
+    }
     if let Some(path) = json {
         let report = serde_json::json!({
             "budgets": {
                 "first_frame_ms": budgets.first_frame_ms,
                 "idle_working_set_bytes": budgets.idle_working_set_bytes,
+                "idle_working_set_overrides": budgets.idle_overrides,
             },
             "addons": rows,
         });
@@ -305,5 +346,26 @@ mod tests {
         let budgets = Budgets::load(concat!(env!("CARGO_MANIFEST_DIR"), "/../../budgets.json"));
         assert_eq!(budgets.first_frame_ms, 1000.0);
         assert_eq!(budgets.idle_working_set_bytes, 25 * 1024 * 1024);
+        // Resource Monitor's measured baseline is 42.4 MB (#70); its ceiling guards growth.
+        assert_eq!(budgets.idle_for("resource-monitor"), 50 * 1024 * 1024);
+        assert_eq!(budgets.idle_for("hello"), 25 * 1024 * 1024);
+    }
+
+    #[test]
+    fn per_addon_ceilings_are_optional() {
+        let plain = serde_json::json!({"first_frame_ms": 1000, "idle_working_set_bytes": 10});
+        let budgets = Budgets::from_value(&plain);
+        assert!(budgets.idle_overrides.is_empty());
+        assert_eq!(budgets.idle_for("anything"), 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "needs a note")]
+    fn a_per_addon_ceiling_needs_a_note() {
+        Budgets::from_value(&serde_json::json!({
+            "first_frame_ms": 1000,
+            "idle_working_set_bytes": 10,
+            "addons": {"x": {"idle_working_set_bytes": 20}},
+        }));
     }
 }

@@ -533,6 +533,21 @@ fn read_all() -> Result<Vec<Raw>, String> {
     Ok(raw)
 }
 
+/// Open TCP and UDP sockets per owning pid: every row of the four tables, in any state (the
+/// Connections page's list with every switch off). For the Processes page's Connections column.
+/// Read-only; counts connections, not traffic.
+pub(super) fn count_per_pid() -> Result<HashMap<u32, u32>, String> {
+    read_all().map(|raw| count_by_pid(&raw))
+}
+
+fn count_by_pid(raw: &[Raw]) -> HashMap<u32, u32> {
+    let mut counts = HashMap::new();
+    for row in raw {
+        *counts.entry(row.pid).or_insert(0) += 1;
+    }
+    counts
+}
+
 /// 4-byte aligned socket address storage big enough for IPv6.
 #[repr(C, align(4))]
 struct SockBuf([u8; 28]);
@@ -1198,6 +1213,28 @@ mod tests {
     }
 
     #[test]
+    fn counts_every_socket_per_pid() {
+        let local = (IpAddr::V4(Ipv4Addr::LOCALHOST), 80);
+        let remote = (IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443);
+        let raw = vec![
+            tcp_raw(10, local, remote, TcpState(5)),
+            tcp_raw(
+                10,
+                local,
+                (IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                TcpState(2),
+            ),
+            udp_raw(10, local),
+            udp_raw(20, local),
+        ];
+        let counts = count_by_pid(&raw);
+        assert_eq!(counts.get(&10), Some(&3));
+        assert_eq!(counts.get(&20), Some(&1));
+        assert_eq!(counts.get(&30), None);
+        assert!(count_by_pid(&[]).is_empty());
+    }
+
+    #[test]
     fn listening_has_no_remote_and_short_buffers_are_safe() {
         let mut b = 1u32.to_le_bytes().to_vec();
         for w in [
@@ -1511,19 +1548,7 @@ mod tests {
 
     #[test]
     fn end_target_is_tied_to_the_sampled_process() {
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-
-        let cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/cmd.exe");
-        let mut child = Command::new(cmd)
-            .args(["/d", "/q", "/c", "set /p toolboks_test_wait="])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(0x0800_0000)
-            .spawn()
-            .unwrap();
+        let mut child = super::super::processes::spawn_idle_child();
         let child_pid = child.id();
         let sample_start = snapshot_start();
         let mut sys = System::new().unwrap();

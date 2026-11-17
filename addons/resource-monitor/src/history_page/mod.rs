@@ -8,6 +8,7 @@
 //! sends requests and draws answers.
 
 mod breakdown;
+mod moments;
 mod time;
 mod timeline;
 mod view;
@@ -45,6 +46,11 @@ pub(crate) struct Page {
     apps_by: Resource,
     /// The app drawn on the timeline (exe name).
     selected_app: Option<String>,
+    /// Notable moments (#44): the worker, the newest reply and what was asked.
+    moments_worker: Option<moments::Worker>,
+    moments: Option<moments::Reply>,
+    asked_moments: Option<moments::Ask>,
+    moments_error: Option<String>,
     curve_worker: Option<query::Worker>,
     detail_worker: Option<query::Worker>,
     curve: Option<Answer>,
@@ -70,6 +76,10 @@ impl Page {
             drag: Drag::default(),
             apps_by: Resource::Cpu,
             selected_app: None,
+            moments_worker: None,
+            moments: None,
+            asked_moments: None,
+            moments_error: None,
             curve_worker: None,
             detail_worker: None,
             curve: None,
@@ -176,7 +186,82 @@ impl Page {
         if self.detail.as_ref().and_then(|a| a.request.as_ref()) != self.asked_detail.as_ref() {
             waiting = true;
         }
+        if let Some(r) = self.moments_worker.as_ref().and_then(|w| w.take()) {
+            if r.mark_error.is_some() {
+                self.moments_error = r.mark_error.clone();
+            }
+            self.moments = Some(r);
+        }
+        if self.moments.as_ref().map(|r| &r.ask) != self.asked_moments.as_ref() {
+            waiting = true;
+        }
         waiting
+    }
+
+    /// What the notable moments are asked for: the view, to the whole minute when live (so a
+    /// live view looks again once a minute, not every second).
+    fn moments_ask(&self) -> moments::Ask {
+        let (mut from, mut to) = (self.view.from, self.view.to);
+        if self.view.follow {
+            let up = (to + time::MIN - 1).div_euclid(time::MIN) * time::MIN;
+            from += up - to;
+            to = up;
+        }
+        moments::Ask {
+            from_ms: from,
+            to_ms: to,
+            app: self.selected_app.clone(),
+            mem_total: self.mem_total,
+        }
+    }
+
+    fn ask_moments(&mut self, inputs: &Inputs, now: i64, mark: Option<i64>) {
+        let Some(src) = &inputs.sources else {
+            return;
+        };
+        let ask = self.moments_ask();
+        if mark.is_none() && self.asked_moments.as_ref() == Some(&ask) {
+            return;
+        }
+        if self.moments_worker.is_none() {
+            self.moments_worker = moments::Worker::start();
+        }
+        if let Some(w) = &self.moments_worker {
+            match mark {
+                Some(at) => w.mark(at, ask.clone(), src.clone(), now),
+                None => w.find(ask.clone(), src.clone(), now),
+            }
+            self.asked_moments = Some(ask);
+        }
+    }
+
+    /// The notable moments list; choosing one selects its period.
+    fn moments_ui(&mut self, ui: &mut egui::Ui, inputs: &Inputs, now: i64) {
+        let at = self.marks.cursor.unwrap_or(now).min(now);
+        let found = self
+            .moments
+            .as_ref()
+            .filter(|r| Some(&r.ask) == self.asked_moments.as_ref())
+            .or(self.moments.as_ref())
+            .map(|r| &r.found);
+        let (chosen, mark) = moments::list_ui(
+            ui,
+            found,
+            self.marks.selection,
+            inputs.sources.is_some(),
+            &time::moment(at, now, true),
+            now,
+        );
+        if let Some(e) = &self.moments_error {
+            ui.label(RichText::new(format!("The mark was not saved: {e}.")).color(AMBER));
+        }
+        if let Some(m) = chosen {
+            moments::choose(&m, &mut self.view, &mut self.marks, now);
+        }
+        if mark {
+            self.moments_error = None;
+            self.ask_moments(inputs, now, Some(at));
+        }
     }
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui, inputs: Inputs) {
@@ -191,7 +276,7 @@ impl Page {
         toolboks_addon_sdk::tutorial::region(ui, "history-range", |ui| self.period_bar(ui, now));
         self.status_line(ui, &inputs, now);
 
-        let lane_h = ((ui.available_height() - 220.0) / LANES.len() as f32)
+        let lane_h = ((ui.available_height() - 330.0) / LANES.len() as f32)
             .clamp(timeline::LANE_MIN_H, timeline::LANE_MAX_H);
         let empty = self.empty_state(&inputs);
         let t = Timeline {
@@ -201,6 +286,11 @@ impl Page {
             now,
             lane_h,
             app: self.selected_app.as_deref(),
+            moments: self
+                .moments
+                .as_ref()
+                .map(|r| r.found.moments.as_slice())
+                .unwrap_or(&[]),
         };
         self.lanes = timeline::show(ui, &t, &mut self.view, &mut self.marks, &mut self.drag);
         if empty.is_some_and(|(title, _)| title == NOTHING.0)
@@ -210,10 +300,14 @@ impl Page {
             self.marks.clear();
         }
         self.readout(ui, now);
+        toolboks_addon_sdk::tutorial::region(ui, "history-moments", |ui| {
+            self.moments_ui(ui, &inputs, now)
+        });
         toolboks_addon_sdk::tutorial::region(ui, "history-apps", |ui| self.apps_ui(ui, now));
 
         let bins = ((self.lanes.width() / 2.0).round() as usize).clamp(1, query::MAX_BINS);
         self.ask(&inputs, bins);
+        self.ask_moments(&inputs, now, None);
         if waiting || self.receive() {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         } else if self.view.follow {

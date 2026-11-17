@@ -9,6 +9,7 @@ mod gpu;
 mod history;
 mod list;
 mod lower_confirm;
+mod memory_breakdown;
 mod nvml;
 mod overview;
 mod power;

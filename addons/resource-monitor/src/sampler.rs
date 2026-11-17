@@ -363,7 +363,12 @@ fn top_n(items: impl IntoIterator<Item = (String, f64)>, n: usize) -> Vec<ProcUs
     rows
 }
 
+/// Full process-table refreshes made through [`refresh_procs`] (the live Top lists and the
+/// history recorder), for the #90 measurement. One relaxed add per refresh.
+pub(crate) static PROCESS_TABLE_REFRESHES: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn refresh_procs(sys: &mut System) {
+    PROCESS_TABLE_REFRESHES.fetch_add(1, Ordering::Relaxed);
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
@@ -650,6 +655,31 @@ pub(crate) fn net_totals(nets: &Networks) -> (u64, u64) {
         })
 }
 
+/// Hands this refresh to the history recorder, so it does not refresh the table again (#90).
+pub(crate) fn feed_recorder(sys: &System, logical: usize, secs: f64) {
+    if !crate::recording::feed::wanted() {
+        return;
+    }
+    crate::recording::feed::add(
+        secs,
+        sys.processes()
+            .iter()
+            .filter(|(pid, _)| pid.as_u32() != 0)
+            .map(|(pid, p)| {
+                let io = p.disk_usage();
+                crate::recording::feed::Seen {
+                    pid: pid.as_u32(),
+                    name: p.name().to_string_lossy(),
+                    cpu: cpu_percent_of_machine(p.cpu_usage(), logical),
+                    mem: p.memory(),
+                    read: io.read_bytes,
+                    written: io.written_bytes,
+                    known: io.total_read_bytes > 0 || io.total_written_bytes > 0,
+                }
+            }),
+    );
+}
+
 /// Runs the process table refresh on its own thread, so a slow refresh can never hold back the
 /// CPU and memory samples. It publishes the latest top lists into `top` about every 2 s while
 /// the page is visible, and clears them after a pause. `gpu_pids` is the newest per-process GPU
@@ -699,6 +729,7 @@ fn spawn_process_worker(
                     refresh_procs(&mut sys);
                     let proc_secs = last_proc.elapsed().as_secs_f64();
                     last_proc = Instant::now();
+                    feed_recorder(&sys, logical, proc_secs);
                     let pids = gpu_pids.lock().map(|p| p.clone()).unwrap_or_default();
                     let built = build_top(&sys, logical, proc_secs, &pids);
                     match top.lock() {

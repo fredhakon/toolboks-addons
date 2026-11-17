@@ -160,7 +160,7 @@ fn processes_page_overhead() {
     let mut suspended = false;
     let mut in_flight = false;
     let mut last_frame_sent: Option<Instant> = None;
-    let mut next_repaint: Option<Instant> = None;
+    let mut next_repaint: Option<Instant>;
     let mut next_ping = Instant::now() + PING_INTERVAL;
     let mut nonce = 0u64;
     let mut results = Vec::new();
@@ -267,8 +267,13 @@ fn processes_page_overhead() {
     }
     let _ = writer.write(&HostMessage::Quit);
 
-    println!("\n{exe}\n{secs} s per phase after {} s warm-up, {logical} logical CPUs\n", WARM_UP.as_secs());
-    println!("| Phase | CPU (of machine) | CPU (of one core) | Frames/s | Working set | Private bytes |");
+    println!(
+        "\n{exe}\n{secs} s per phase after {} s warm-up, {logical} logical CPUs\n",
+        WARM_UP.as_secs()
+    );
+    println!(
+        "| Phase | CPU (of machine) | CPU (of one core) | Frames/s | Working set | Private bytes |"
+    );
     println!("|---|---|---|---|---|---|");
     for r in &results {
         println!(

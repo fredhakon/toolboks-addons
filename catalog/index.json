@@ -628,6 +628,38 @@
       "release_notes": "Release resource-monitor-v0.2.0.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.debloater",
+      "title": "Debloater",
+      "short_description": "Tune Windows privacy, apps, startup and background tasks.",
+      "long_description": "Debloater explains optional Windows changes in plain language, so you can turn off what you do not need. Nothing is changed until you choose it, and supported changes can be undone later, also after Toolboks closes or Windows restarts: Debloater keeps a small undo list in its own data folder. It changes your own account's settings: privacy and advertising switches, startup entries and installed apps. Changes that need administrator rights are made by a small separate helper that shows its own Confirm or Cancel window listing exactly what will change; Debloater itself never runs as administrator. The Startup page shows how much slower Windows measured an entry to start, read from Windows' boot performance log; the boot timings are read in memory only and never saved. Windows only lets administrators read that log on a default PC, and an administrator can allow reading in the log's access list (Toolboks never changes it).",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "sliders",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "system_tuning"
+      ],
+      "pages": [
+        "Privacy and ads",
+        "Apps",
+        "Startup",
+        "Tasks",
+        "Services"
+      ],
+      "background": false,
+      "kind": "native",
+      "version": "0.2.0",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/debloater-v0.2.0/debloater.exe",
+      "size": 3665920,
+      "sha256": "7b05480f41ac401345179ae648110010ddeafafe4471d2d90c8957771d2b6a81",
+      "release_notes": "Release debloater-v0.2.0.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

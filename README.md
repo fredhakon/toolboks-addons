@@ -228,7 +228,14 @@ administrator rights. The live graphs live in memory while the add-on is shown.
   most about 7 MB for a full week (budget 20 MB; 6.8 MB in the worst-case test). Nothing is sent anywhere. The manifest's `data_note`
   says so in the install review. The switch, size, Delete history and Open history folder come
   with #45; until then recording is off by default.
-- The guided tour has the same 22 steps.
+- **History page (#42).** A fifth page, History, reads the saved history (`src/history_page/`):
+  presets (last hour, last 24 hours, yesterday, last 7 days), a From and To in local time, Now
+  back to live, one lane per resource in the Overview colours, gaps hatched and labelled
+  ("Toolboks was not running"), hover read-outs, click for a cursor, drag to select, drag the time
+  axis to pan, wheel to zoom, arrow keys and Shift+arrows on the focused timeline, and the apps at
+  the cursor, over the selection or over the whole period. Reading runs on query workers
+  (`recording/query.rs`), never on the UI thread.
+- The guided tour has the built-in tool's 22 steps plus 3 for the History page.
 
 The built-in copy stays in the host until the final removal and "Restore your tools" step (host
 #94). Measure with `cargo run --locked -p addon-repo -- measure resource-monitor`.

@@ -57,3 +57,11 @@ For comparison, the same tool: `hello` 7.8 MB, `aural` 10.7 MB idle memory (both
   `nvml.dll` is the largest loaded module (22 MB image), but skipping it in a diagnostic build saved
   only about 3 MB of working set and no private bytes, so most of the cost is elsewhere (likely
   the sampler's PDH counters and process table, or the UI runtime). Not attributed further here.
+
+## Budget decision
+
+Decided 2026-11-17 for the owner: the unattributed memory is not chased in #70 and not hidden.
+`budgets.json` gives Resource Monitor its own idle memory ceiling of **50 MB**: the measured
+42.4 MB baseline plus headroom. It was already 42.3 MB before the Processes work, and history
+recording (off in these runs) adds to it. The ceiling is a guard against growth, not a target.
+The first-frame budget (1000 ms) and the CPU numbers are unchanged.

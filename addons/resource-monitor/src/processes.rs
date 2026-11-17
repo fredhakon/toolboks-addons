@@ -106,6 +106,9 @@ struct Proc {
     parent: Parent,
     /// Apps, Background processes or Windows processes.
     kind: Kind,
+    /// The parent pid for the tree view: only a parent in the same refresh that started before
+    /// this process (a reused pid is never taken for the parent). None puts it at the top.
+    tree_parent: Option<u32>,
 }
 
 /// One table row: a process, or all processes of one name when grouped.
@@ -133,8 +136,17 @@ struct Row {
     protected: bool,
     /// The section: the most visible one of its processes ([`groups::merge`]).
     kind: Kind,
-    /// 0 for a top-level row, 1 for a process shown under its expanded group.
+    /// 0 for a top-level row, 1 for a process shown under its expanded group, the tree level in
+    /// the tree view.
     depth: u8,
+    /// Tree parent of a one-process row ([`Proc::tree_parent`]).
+    tree_parent: Option<u32>,
+    /// Child rows under it in the tree view (after the filter); 0 elsewhere.
+    kids: u32,
+    /// True when it is opened: its processes or tree children are listed under it.
+    open: bool,
+    /// A process listed under its merged row: the name shows its pid.
+    show_pid: bool,
 }
 
 /// How the table is laid out.
@@ -144,28 +156,34 @@ pub(super) enum View {
     ByType,
     /// One row per program name, no sections.
     ByName,
+    /// One row per process, each under the process that started it.
+    Tree,
     /// One row per process.
     Flat,
 }
 
 impl View {
-    const ALL: [View; 3] = [View::ByType, View::ByName, View::Flat];
+    const ALL: [View; 4] = [View::ByType, View::ByName, View::Tree, View::Flat];
 
     fn label(self) -> &'static str {
         match self {
             View::ByType => "By type",
             View::ByName => "By name",
+            View::Tree => "Tree",
             View::Flat => "Flat",
         }
     }
 
     /// True when rows merge every process of one name.
     fn grouped(self) -> bool {
-        !matches!(self, View::Flat)
+        matches!(self, View::ByType | View::ByName)
     }
 }
 
 /// One line of the table: a section caption or a row.
+// Nearly every line is a row (at most three are captions), so boxing rows would only add an
+// allocation per line.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq)]
 enum Line {
     /// Caption with the number of rows under it.
@@ -196,6 +214,7 @@ impl Rows {
             let mut flat = build_rows(procs, false, protected);
             for r in &mut flat {
                 r.depth = 1;
+                r.show_pid = true;
             }
             flat
         } else {
@@ -212,14 +231,89 @@ impl Rows {
     }
 }
 
-/// True when the row merges several processes and can open to show them.
+/// True when the row can open: a merged row of several processes, or a tree row with children.
 fn expandable(r: &Row) -> bool {
-    r.depth == 0 && r.pids.len() > 1 && !r.key.starts_with("pid:")
+    r.kids > 0 || (r.depth == 0 && r.pids.len() > 1 && !r.key.starts_with("pid:"))
+}
+
+/// Deepest tree level that is still indented further; deeper levels line up with it.
+const MAX_INDENT_LEVEL: u8 = 8;
+
+/// The tree view's lines: every process under the process that started it, siblings sorted by
+/// the current column, all open except the ones in `collapsed`. With a filter, the matching
+/// processes stay together with every ancestor, so you still see where they came from. Pure.
+fn tree_lines(
+    rows: &[Row],
+    collapsed: &HashSet<String>,
+    filter: &str,
+    sort: SortKey,
+    descending: bool,
+) -> Vec<Line> {
+    let mut all = rows.to_vec();
+    sort_rows(&mut all, sort, descending);
+    let index: std::collections::HashMap<u32, usize> =
+        all.iter().enumerate().map(|(i, r)| (r.pid, i)).collect();
+    let parent_of = |i: usize| {
+        all[i]
+            .tree_parent
+            .filter(|pp| *pp != all[i].pid)
+            .and_then(|pp| index.get(&pp).copied())
+    };
+    let keep: Vec<bool> = if filter.trim().is_empty() {
+        vec![true; all.len()]
+    } else {
+        let matched: HashSet<u32> = filter_rows(all.clone(), filter)
+            .iter()
+            .map(|r| r.pid)
+            .collect();
+        let mut keep = vec![false; all.len()];
+        for start in (0..all.len()).filter(|&i| matched.contains(&all[i].pid)) {
+            // Up to the root; the step limit only guards against a malformed table.
+            let mut at = Some(start);
+            for _ in 0..all.len() {
+                let Some(i) = at else { break };
+                if keep[i] && i != start {
+                    break;
+                }
+                keep[i] = true;
+                at = parent_of(i);
+            }
+        }
+        keep
+    };
+    // `all` is sorted, so every child list and the roots come out sorted too.
+    let mut kids: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    let mut roots = Vec::new();
+    for i in (0..all.len()).filter(|&i| keep[i]) {
+        match parent_of(i).filter(|&pi| keep[pi]) {
+            Some(pi) => kids.entry(pi).or_default().push(i),
+            None => roots.push(i),
+        }
+    }
+    let mut lines = Vec::new();
+    let mut placed = vec![false; all.len()];
+    let mut stack: Vec<(usize, u8)> = roots.into_iter().rev().map(|i| (i, 0)).collect();
+    while let Some((i, depth)) = stack.pop() {
+        if std::mem::replace(&mut placed[i], true) {
+            continue;
+        }
+        let children = kids.get(&i).map_or(&[][..], Vec::as_slice);
+        let mut row = all[i].clone();
+        row.depth = depth;
+        row.kids = children.len() as u32;
+        row.open = !children.is_empty() && !collapsed.contains(&row.key);
+        if row.open {
+            stack.extend(children.iter().rev().map(|&c| (c, depth.saturating_add(1))));
+        }
+        lines.push(Line::Row(row));
+    }
+    lines
 }
 
 /// The table lines for a view: filtered and sorted rows, under section captions in the By type
 /// view, each expanded group followed by its processes (sorted the same way). The filter picks
-/// the top-level rows; an expanded group shows all its processes. Pure.
+/// the top-level rows; an expanded group shows all its processes. In the tree view `expanded`
+/// holds the rows closed instead (the tree starts open), see [`tree_lines`]. Pure.
 fn build_lines(
     rows: &Rows,
     view: View,
@@ -228,6 +322,9 @@ fn build_lines(
     sort: SortKey,
     descending: bool,
 ) -> Vec<Line> {
+    if view == View::Tree {
+        return tree_lines(&rows.top, expanded, filter, sort, descending);
+    }
     let mut top = filter_rows(rows.top.clone(), filter);
     sort_rows(&mut top, sort, descending);
     let mut children: Vec<Row> = rows
@@ -237,8 +334,9 @@ fn build_lines(
         .cloned()
         .collect();
     sort_rows(&mut children, sort, descending);
-    let push_row = |lines: &mut Vec<Line>, r: Row| {
+    let push_row = |lines: &mut Vec<Line>, mut r: Row| {
         let open = expandable(&r) && expanded.contains(&r.key);
+        r.open = open;
         let key = r.lower_name.clone();
         lines.push(Line::Row(r));
         if open {
@@ -349,6 +447,12 @@ fn link_parents(procs: &mut [Proc], parent_pids: &[Option<u32>]) {
             p.identity.map(|id| id.created),
             parent.map(|(name, created)| (name.as_str(), *created)),
         );
+        // The tree uses the same rule: a parent that started after the child holds a reused pid.
+        let child_created = p.identity.map(|id| id.created);
+        p.tree_parent = match (ppid, parent, child_created) {
+            (Some(ppid), Some((_, Some(created))), Some(child)) if *created < child => Some(*ppid),
+            _ => None,
+        };
     }
 }
 
@@ -404,6 +508,10 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     protected: is_prot,
                     kind: p.kind,
                     depth: 0,
+                    tree_parent: if grouped { None } else { p.tree_parent },
+                    kids: 0,
+                    open: false,
+                    show_pid: false,
                 });
             }
         }
@@ -655,7 +763,7 @@ impl Totals {
 /// process shown under its opened group.
 fn display_name(r: &Row) -> String {
     let name = friendly_name(&r.name);
-    if r.depth > 0 {
+    if r.show_pid {
         format!("{name} (pid {})", r.pid)
     } else if r.pids.len() > 1 {
         format!("{name} ({})", r.pids.len())
@@ -1099,6 +1207,7 @@ impl Worker {
                                 exe,
                                 parent: Parent::Unverified,
                                 kind,
+                                tree_parent: None,
                             };
                             (proc, p.parent().map(|parent| parent.as_u32()))
                         })
@@ -1181,6 +1290,8 @@ pub(super) struct Page {
     shown_view: View,
     /// Merged rows opened to show their processes, by row key. Kept across refreshes.
     expanded: HashSet<String>,
+    /// Tree rows closed by hand, by row key (the tree starts fully open).
+    collapsed: HashSet<String>,
     /// Bumped on every open or close, so the cached lines are rebuilt.
     expanded_gen: u64,
     sort_key: SortKey,
@@ -1220,6 +1331,7 @@ impl Page {
             view: View::ByType,
             shown_view: View::ByType,
             expanded: HashSet::new(),
+            collapsed: HashSet::new(),
             expanded_gen: 0,
             sort_key: SortKey::Cpu,
             descending: true,
@@ -1320,9 +1432,10 @@ impl Page {
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.spacing_mut().button_padding = Vec2::new(6.0, 1.0);
             let lines = self.display_lines(&all_rows);
+            let grouped = self.shown_view.grouped();
             let row_count = lines
                 .iter()
-                .filter(|l| matches!(l, Line::Row(r) if r.depth == 0))
+                .filter(|l| matches!(l, Line::Row(r) if r.depth == 0 || !grouped))
                 .count();
             toolboks_addon_sdk::tutorial::region(ui, "toolbar", |ui| {
                 self.toolbar(ui, procs.len(), row_count);
@@ -1452,7 +1565,11 @@ impl Page {
         let lines = Arc::new(build_lines(
             rows,
             self.shown_view,
-            &self.expanded,
+            if self.shown_view == View::Tree {
+                &self.collapsed
+            } else {
+                &self.expanded
+            },
             &self.filter,
             self.sort_key,
             self.descending,
@@ -1510,7 +1627,7 @@ impl Page {
         let (sort_key, descending) = (self.sort_key, self.descending);
         let grouped = self.shown_view.grouped();
         let selection = &self.selection;
-        let expanded = &self.expanded;
+        let nested = self.shown_view != View::Flat;
         let ready = self.cpu_ready;
         let conns_total = self.conns_total;
         let mem_total = totals.map_or(0, |t| t.mem_total);
@@ -1625,27 +1742,29 @@ impl Page {
                         }
                     });
                     row.col(|ui| {
-                        if grouped {
+                        if nested {
                             // Room for the open/close button, so names line up; processes
-                            // under an opened group sit one step further in.
+                            // under an opened row sit one step further in per level.
                             let toggle = Vec2::new(TOGGLE_WIDTH, ROW_HEIGHT - 8.0);
+                            let level = r.depth.min(MAX_INDENT_LEVEL);
+                            if level > 0 {
+                                ui.add_space(INDENT * f32::from(level));
+                            }
                             if expandable(r) {
-                                let open = expanded.contains(&r.key);
+                                let open = r.open;
                                 let label = RichText::new(if open { "-" } else { "+" }).strong();
                                 let button = egui::Button::new(label).frame(false);
-                                let hint = if open {
-                                    "Hide its processes"
-                                } else {
-                                    "Show its processes"
+                                let hint = match (open, r.kids > 0) {
+                                    (true, true) => "Hide the processes it started",
+                                    (false, true) => "Show the processes it started",
+                                    (true, false) => "Hide its processes",
+                                    (false, false) => "Show its processes",
                                 };
                                 if ui.add_sized(toggle, button).on_hover_text(hint).clicked() {
                                     click = Some(Click::Expand(r.key.clone()));
                                 }
                             } else {
                                 ui.add_space(toggle.x);
-                            }
-                            if r.depth > 0 {
-                                ui.add_space(INDENT);
                             }
                         }
                         let l = body_cell(ui, display_name(r), false, r.protected);
@@ -1693,8 +1812,13 @@ impl Page {
         };
         match click {
             Some(Click::Expand(key)) => {
-                if !self.expanded.remove(&key) {
-                    self.expanded.insert(key);
+                let set = if self.shown_view == View::Tree {
+                    &mut self.collapsed
+                } else {
+                    &mut self.expanded
+                };
+                if !set.remove(&key) {
+                    set.insert(key);
                 }
                 self.expanded_gen += 1;
             }
@@ -2001,6 +2125,7 @@ mod tests {
             exe: None,
             parent: ok(),
             kind: Kind::Background,
+            tree_parent: None,
         }
     }
 
@@ -2046,6 +2171,145 @@ mod tests {
             flat.iter().find(|r| r.pid == 11).unwrap().kind,
             Kind::Background
         );
+    }
+
+    /// A process the refresh saw with `parent` as its parent pid, born at `created`.
+    fn child(pid: u32, name: &str, created: u64, cpu: f32) -> Proc {
+        Proc {
+            identity: Some(ProcessIdentity { pid, created }),
+            cpu,
+            ..p(pid, name, cpu, 0)
+        }
+    }
+
+    fn tree_names(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| match l {
+                Line::Row(r) => format!("{}{}", "  ".repeat(r.depth as usize), r.lower_name),
+                Line::Section(..) => unreachable!("the tree has no sections"),
+            })
+            .collect()
+    }
+
+    /// explorer (1) started chrome (2, 3) and code (4); chrome 2 started its helper 5.
+    fn family() -> Vec<Proc> {
+        let mut procs = vec![
+            child(1, "explorer.exe", 10, 1.0),
+            child(2, "chrome.exe", 20, 5.0),
+            child(3, "chrome.exe", 21, 9.0),
+            child(4, "code.exe", 22, 2.0),
+            child(5, "helper.exe", 30, 0.5),
+            child(6, "lonely.exe", 5, 0.1),
+        ];
+        link_parents(
+            &mut procs,
+            &[None, Some(1), Some(1), Some(1), Some(2), None],
+        );
+        procs
+    }
+
+    #[test]
+    fn the_tree_nests_children_and_sorts_siblings_by_the_column() {
+        let rows = Rows::build(&family(), View::Tree, &none);
+        let none_closed = HashSet::new();
+        let lines = tree_lines(&rows.top, &none_closed, "", SortKey::Cpu, true);
+        assert_eq!(
+            tree_names(&lines),
+            [
+                "explorer.exe",
+                "  chrome.exe",
+                "  chrome.exe",
+                "    helper.exe",
+                "  code.exe",
+                "lonely.exe",
+            ]
+        );
+        // Busiest sibling first: chrome 3 (9 %) before chrome 2 (5 %) before code (2 %).
+        let pids: Vec<u32> = lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Row(r) => Some(r.pid),
+                Line::Section(..) => None,
+            })
+            .collect();
+        assert_eq!(pids, [1, 3, 2, 5, 4, 6]);
+        // By name, ascending, the order of siblings follows.
+        let lines = tree_lines(&rows.top, &none_closed, "", SortKey::Name, false);
+        assert_eq!(
+            tree_names(&lines)[1..4],
+            ["  chrome.exe", "    helper.exe", "  chrome.exe"]
+        );
+        // Closing explorer hides everything under it; it still says it has children.
+        let closed: HashSet<String> = [rows.top[0].key.clone()].into();
+        let lines = tree_lines(&rows.top, &closed, "", SortKey::Cpu, true);
+        assert_eq!(tree_names(&lines), ["explorer.exe", "lonely.exe"]);
+        match &lines[0] {
+            Line::Row(r) => assert!(expandable(r) && !r.open && r.kids == 3),
+            Line::Section(..) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_reused_parent_pid_puts_the_process_at_the_top() {
+        // Pid 1 was explorer, which started 7 at time 15; explorer exited and a new process
+        // (started at 40) got pid 1. It is not 7's parent.
+        let mut procs = vec![
+            child(1, "newcomer.exe", 40, 0.0),
+            child(7, "orphan.exe", 15, 0.0),
+        ];
+        link_parents(&mut procs, &[None, Some(1)]);
+        assert_eq!(procs[1].tree_parent, None);
+        let rows = Rows::build(&procs, View::Tree, &none);
+        let lines = tree_lines(&rows.top, &HashSet::new(), "", SortKey::Name, false);
+        assert_eq!(tree_names(&lines), ["newcomer.exe", "orphan.exe"]);
+        // An unknown start time on either side proves nothing either.
+        let mut procs = vec![born(1, "explorer.exe", None), child(7, "app.exe", 15, 0.0)];
+        link_parents(&mut procs, &[None, Some(1)]);
+        assert_eq!(procs[1].tree_parent, None);
+        // The genuine case: the parent started first.
+        let procs = family();
+        assert_eq!(procs[4].tree_parent, Some(2));
+    }
+
+    #[test]
+    fn the_tree_filter_keeps_the_ancestors_of_a_match() {
+        let rows = Rows::build(&family(), View::Tree, &none);
+        let lines = tree_lines(&rows.top, &HashSet::new(), "helper", SortKey::Cpu, true);
+        assert_eq!(
+            tree_names(&lines),
+            ["explorer.exe", "  chrome.exe", "    helper.exe"]
+        );
+        // A pid matches too; a match with no parent stands alone.
+        let lines = tree_lines(&rows.top, &HashSet::new(), "6", SortKey::Cpu, true);
+        assert_eq!(tree_names(&lines), ["lonely.exe"]);
+        // Matching a parent and its child keeps both once.
+        let lines = tree_lines(&rows.top, &HashSet::new(), "chrome", SortKey::Cpu, true);
+        assert_eq!(
+            tree_names(&lines),
+            ["explorer.exe", "  chrome.exe", "  chrome.exe"]
+        );
+        assert!(tree_lines(&rows.top, &HashSet::new(), "zzz", SortKey::Cpu, true).is_empty());
+    }
+
+    #[test]
+    fn the_tree_view_shows_pids_and_selects_single_processes() {
+        assert!(!View::Tree.grouped());
+        let rows = Rows::build(&family(), View::Tree, &none);
+        assert!(rows.children.is_empty());
+        assert!(rows
+            .top
+            .iter()
+            .all(|r| r.key.starts_with("pid:") && !r.show_pid));
+        let mut page = Page::new();
+        page.shown_view = View::Tree;
+        page.only_for_test(&rows.top[1].key);
+        let pids: Vec<u32> = page
+            .selected_procs(&family())
+            .iter()
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(pids, [2]);
     }
 
     #[test]
@@ -2185,7 +2449,7 @@ mod tests {
         let mut page = Page::new();
         page.live = Arc::new(typed());
         page.cpu_ready = true;
-        for view in [View::ByType, View::Flat] {
+        for view in [View::ByType, View::Tree, View::Flat] {
             page.view = view;
             let mut texts = Vec::new();
             for _ in 0..3 {
@@ -2206,10 +2470,10 @@ mod tests {
                     "{header} {rect:?} in {view:?}"
                 );
             }
-            let count = find(if view == View::Flat {
-                "6 processes"
-            } else {
+            let count = find(if view.grouped() {
                 "4 programs"
+            } else {
+                "6 processes"
             });
             assert!(count.right() <= inspector_left, "{count:?}");
             if view == View::ByType {

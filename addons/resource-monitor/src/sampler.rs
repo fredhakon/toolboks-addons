@@ -363,7 +363,12 @@ fn top_n(items: impl IntoIterator<Item = (String, f64)>, n: usize) -> Vec<ProcUs
     rows
 }
 
+/// Full process-table refreshes made through [`refresh_procs`] (the live Top lists and the
+/// history recorder), for the #90 measurement. One relaxed add per refresh.
+pub(crate) static PROCESS_TABLE_REFRESHES: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn refresh_procs(sys: &mut System) {
+    PROCESS_TABLE_REFRESHES.fetch_add(1, Ordering::Relaxed);
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,

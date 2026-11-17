@@ -126,3 +126,55 @@ impl Source for SystemSource {
         Reading { totals, procs }
     }
 }
+
+#[cfg(test)]
+mod measure {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::sampler::{Sampler, PROCESS_TABLE_REFRESHES};
+
+    /// #90 measurement, not part of the gate: the live sampler as with the page open (pinged
+    /// every 250 ms) and the history recorder with the real system source at its real 5 s step,
+    /// saving nothing. Prints the process-table refreshes per minute.
+    ///
+    /// `cargo test -p resource-monitor --lib -- --ignored --nocapture process_table_refreshes`
+    /// (`MEASURE_SECS`, default 60).
+    #[test]
+    #[ignore]
+    fn process_table_refreshes_with_the_page_open_and_recording_on() {
+        let secs: u64 = std::env::var("MEASURE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        let ctx = egui::Context::default();
+        let sampler = Sampler::start(&ctx);
+        let recorder = super::super::Recorder::spawn(super::super::STEP, || {
+            SystemSource::new().map(|s| Box::new(s) as Box<dyn Source>)
+        })
+        .expect("recorder");
+        let run_for = |d: Duration| {
+            let until = Instant::now() + d;
+            while Instant::now() < until {
+                sampler.ping();
+                let _ = sampler.drain();
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        };
+        // Warm-up: both threads primed and running at their normal pace.
+        run_for(Duration::from_secs(12));
+        let start = PROCESS_TABLE_REFRESHES.load(Ordering::Relaxed);
+        let steps0 = recorder.store.lock().unwrap().fine().len();
+        let t0 = Instant::now();
+        run_for(Duration::from_secs(secs));
+        let n = PROCESS_TABLE_REFRESHES.load(Ordering::Relaxed) - start;
+        let steps = recorder.store.lock().unwrap().fine().len() - steps0;
+        let minutes = t0.elapsed().as_secs_f64() / 60.0;
+        println!(
+            "process-table refreshes: {n} in {:.0} s = {:.1} per minute; recorder steps: {steps}",
+            minutes * 60.0,
+            n as f64 / minutes
+        );
+    }
+}

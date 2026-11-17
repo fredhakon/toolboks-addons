@@ -58,7 +58,7 @@ mod apps;
 mod core;
 pub mod disk;
 pub mod query;
-mod record;
+pub mod record;
 mod source;
 pub mod store;
 

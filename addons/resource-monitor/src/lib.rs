@@ -7,6 +7,7 @@ mod detail;
 mod details;
 mod gpu;
 mod history;
+mod history_page;
 mod list;
 mod lower_confirm;
 mod memory_breakdown;
@@ -142,8 +143,9 @@ pub struct Resources {
     gpu_missing: u32,
     processes: processes::Page,
     connections: connections::Page,
-    /// Which page is shown: 0 Overview, 1 Details, 2 Processes, 3 Connections.
+    /// Which page is shown: 0 Overview, 1 Details, 2 Processes, 3 Connections, 4 History.
     page: usize,
+    history: history_page::Page,
     /// Resource history recorder (off unless the preference switches it on). Kept across
     /// `suspend`, so it records while the page is closed and Toolboks sits in the tray.
     recording: recording::Control,
@@ -176,6 +178,7 @@ impl Resources {
             processes: processes::Page::new(),
             connections: connections::Page::new(),
             page: 0,
+            history: history_page::Page::new(),
             recording: recording::Control::default(),
         }
     }
@@ -188,7 +191,7 @@ impl Default for Resources {
 }
 
 /// Page names, in order. They match `host-services.json`.
-pub const PAGES: [&str; 4] = ["Overview", "Details", "Processes", "Connections"];
+pub const PAGES: [&str; 5] = ["Overview", "Details", "Processes", "Connections", "History"];
 pub const ID: &str = "toolboks.resource-monitor";
 
 impl Resources {
@@ -341,6 +344,23 @@ impl Resources {
         })
     }
 
+    /// What the History page reads: the history folder, and the run recording now.
+    fn history_inputs(&self) -> history_page::Inputs {
+        let live = self.recording.run().zip(self.recording.store());
+        let live_steps = live
+            .as_ref()
+            .and_then(|(_, s)| s.lock().ok().map(|s| s.fine().len()))
+            .unwrap_or(0);
+        history_page::Inputs {
+            sources: Some(recording::query::Sources {
+                dir: recording::disk::directory(),
+                live,
+            }),
+            recording: self.recording.is_on(),
+            live_steps,
+        }
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
         self.processes.tick();
         self.connections.tick();
@@ -413,6 +433,11 @@ impl Resources {
             }
             3 => {
                 self.connections.ui(ui);
+                return;
+            }
+            4 => {
+                let inputs = self.history_inputs();
+                self.history.ui(ui, inputs);
                 return;
             }
             _ => {}

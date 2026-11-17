@@ -23,6 +23,9 @@ pub(super) fn steps() -> Vec<S> {
         ("3", "toolbar", "Connections · filters and snapshot", "Filter the connection list by application or address, and use quick filters to narrow the view. Pause freezes the displayed snapshot while applications continue running."),
         ("3", "table", "Connections · addresses and states", "Rows show protocol, local and remote endpoints, owning process and connection state. Listening sockets and active connections have different meanings; a connection alone does not establish whether an app is trustworthy."),
         ("3", "inspector", "Connections · inspect an endpoint", "Select a connection for process and address details. Copy actions put text on the clipboard. Resolve host name makes a network lookup only when you request it. Ending the owner process can interrupt the application."),
+        ("4", "history-range", "History · choose a period", "Pick a preset or type a From and To time (your local time). Now returns to a live view that moves with the clock. History is kept for 7 days, on this PC only."),
+        ("4", "history-timeline", "History · the timeline", "One lane per resource, in the Overview colours. Hatched areas were not recorded, for example while Toolboks was closed; they are never drawn as zero. Click to set a cursor, drag to select a period, drag the time axis to move and scroll to zoom. With the timeline focused, arrow keys move the cursor and Shift+arrows extend the selection."),
+        ("4", "history-apps", "History · which apps", "The apps that used the chosen resource at the cursor, over the selection, or over the whole period, with their share, average, peak and how long they were active. Network use is recorded for the whole PC only, not per app."),
     ]
     .into_iter()
     .map(|(p, t, h, d)| S::new(p, t, h, d))

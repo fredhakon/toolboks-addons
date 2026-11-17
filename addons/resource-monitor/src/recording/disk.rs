@@ -165,7 +165,7 @@ pub fn new_run_id(utc_ms: i64) -> u64 {
 // File names: `<level>-YYYYMMDD-HHMM-<run hex>.rmh`, the period start in UTC.
 
 /// Days since 1970-01-01 to (year, month, day). Howard Hinnant's civil-from-days.
-fn civil(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z - era * 146_097;
@@ -178,7 +178,7 @@ fn civil(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = y - i64::from(m <= 2);
     let era = y.div_euclid(400);
     let yoe = y - era * 400;

@@ -27,18 +27,25 @@ use windows::Win32::System::Threading::{
 use protected_processes::Parent;
 use toolboks_shared::format::{friendly_name, rate, size_plain, uptime};
 use toolboks_shared::ui::{
-    body_cell, header_cell, inspector_edge, inspector_frame, row_rule, switch_row, table_style,
-    CARD_PAD, DATA_CPU, DATA_DISK, DATA_GPU, DATA_MEMORY, DATA_NETWORK, GAP, MUTED, RED, SPACE_M,
+    body_cell, header_cell, inspector_edge, inspector_frame, pill, row_rule, table_style, CARD_PAD,
+    DATA_CPU, DATA_DISK, DATA_GPU, DATA_MEMORY, DATA_NETWORK, GAP, MUTED, RED, SPACE_M,
     TEXT_SECTION,
 };
 use toolboks_shared::win::Handle;
 
 use crate::lower_confirm::{is_confirmed, lower_text, settle, Pending};
 
+mod groups;
+use groups::Kind;
+
 pub(super) const ROW_HEIGHT: f32 = 28.0;
 /// Header row: the column name above the system total.
 const HEADER_HEIGHT: f32 = 40.0;
 pub(super) const INSPECTOR_WIDTH: f32 = 240.0;
+/// Width of the open/close button in front of a merged row's name.
+const TOGGLE_WIDTH: f32 = 14.0;
+/// Extra step in for a process shown under its opened group.
+const INDENT: f32 = 12.0;
 /// Time between two process refreshes while the page is visible.
 pub(super) const REFRESH: Duration = Duration::from_secs(2);
 /// Wait before the second refresh that makes CPU percentages meaningful.
@@ -97,6 +104,8 @@ struct Proc {
     /// that has exited, whose pid was reused, or whose creation time could not be read is
     /// unverified, and the process is then protected.
     parent: Parent,
+    /// Apps, Background processes or Windows processes.
+    kind: Kind,
 }
 
 /// One table row: a process, or all processes of one name when grouped.
@@ -122,6 +131,144 @@ struct Row {
     parent: Parent,
     /// True when every process in the row is protected.
     protected: bool,
+    /// The section: the most visible one of its processes ([`groups::merge`]).
+    kind: Kind,
+    /// 0 for a top-level row, 1 for a process shown under its expanded group.
+    depth: u8,
+}
+
+/// How the table is laid out.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum View {
+    /// Apps, Background processes and Windows processes sections, rows merged by name.
+    ByType,
+    /// One row per program name, no sections.
+    ByName,
+    /// One row per process.
+    Flat,
+}
+
+impl View {
+    const ALL: [View; 3] = [View::ByType, View::ByName, View::Flat];
+
+    fn label(self) -> &'static str {
+        match self {
+            View::ByType => "By type",
+            View::ByName => "By name",
+            View::Flat => "Flat",
+        }
+    }
+
+    /// True when rows merge every process of one name.
+    fn grouped(self) -> bool {
+        !matches!(self, View::Flat)
+    }
+}
+
+/// One line of the table: a section caption or a row.
+#[derive(Clone, Debug, PartialEq)]
+enum Line {
+    /// Caption with the number of rows under it.
+    Section(Kind, usize),
+    Row(Row),
+}
+
+impl Line {
+    fn key(&self) -> Option<&str> {
+        match self {
+            Line::Section(..) => None,
+            Line::Row(r) => Some(&r.key),
+        }
+    }
+}
+
+/// The rows of one snapshot: the top-level rows of the view and, in the merged views, one row
+/// per process to show under an expanded group.
+#[derive(Default)]
+struct Rows {
+    top: Vec<Row>,
+    children: Vec<Row>,
+}
+
+impl Rows {
+    fn build(procs: &[Proc], view: View, protected: &dyn Fn(&Proc) -> bool) -> Rows {
+        let children = if view.grouped() {
+            let mut flat = build_rows(procs, false, protected);
+            for r in &mut flat {
+                r.depth = 1;
+            }
+            flat
+        } else {
+            Vec::new()
+        };
+        Rows {
+            top: build_rows(procs, view.grouped(), protected),
+            children,
+        }
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Row> {
+        self.top.iter().chain(&self.children)
+    }
+}
+
+/// True when the row merges several processes and can open to show them.
+fn expandable(r: &Row) -> bool {
+    r.depth == 0 && r.pids.len() > 1 && !r.key.starts_with("pid:")
+}
+
+/// The table lines for a view: filtered and sorted rows, under section captions in the By type
+/// view, each expanded group followed by its processes (sorted the same way). The filter picks
+/// the top-level rows; an expanded group shows all its processes. Pure.
+fn build_lines(
+    rows: &Rows,
+    view: View,
+    expanded: &HashSet<String>,
+    filter: &str,
+    sort: SortKey,
+    descending: bool,
+) -> Vec<Line> {
+    let mut top = filter_rows(rows.top.clone(), filter);
+    sort_rows(&mut top, sort, descending);
+    let mut children: Vec<Row> = rows
+        .children
+        .iter()
+        .filter(|c| expanded.contains(&c.lower_name))
+        .cloned()
+        .collect();
+    sort_rows(&mut children, sort, descending);
+    let push_row = |lines: &mut Vec<Line>, r: Row| {
+        let open = expandable(&r) && expanded.contains(&r.key);
+        let key = r.lower_name.clone();
+        lines.push(Line::Row(r));
+        if open {
+            lines.extend(
+                children
+                    .iter()
+                    .filter(|c| c.lower_name == key)
+                    .cloned()
+                    .map(Line::Row),
+            );
+        }
+    };
+    let mut lines = Vec::new();
+    if view == View::ByType {
+        for kind in Kind::ALL {
+            let section: Vec<Row> = top.iter().filter(|r| r.kind == kind).cloned().collect();
+            if section.is_empty() {
+                continue;
+            }
+            lines.push(Line::Section(kind, section.len()));
+            for r in section {
+                push_row(&mut lines, r);
+            }
+        }
+    } else {
+        for r in top {
+            push_row(&mut lines, r);
+        }
+    }
+    lines
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -148,9 +295,29 @@ pub(super) fn is_protected(pid: u32, name: &str, parent: &Parent, own_pid: u32) 
         || protected_processes::protected_reason(name, parent).is_some()
 }
 
+/// True for the processes Windows itself runs (the system part of [`PROTECTED`]); they go under
+/// Windows processes. Toolboks is on that list only to protect it, so it is left out here.
+fn is_system(pid: u32, name: &str) -> bool {
+    pid == 0
+        || pid == 4
+        || PROTECTED
+            .iter()
+            .filter(|n| **n != "toolboks.exe")
+            .any(|n| name.eq_ignore_ascii_case(n))
+}
+
 /// Why a protected process is left alone, for hovers and the inspector.
 pub(super) fn protected_note(name: &str, parent: &Parent) -> &'static str {
     protected_processes::protected_reason(name, parent).map_or(PROTECTED_NOTE, |p| p.describe())
+}
+
+/// Columns after Name: PID (flat view only), CPU, Memory, Disk, GPU and Connections.
+fn data_columns(grouped: bool) -> usize {
+    if grouped {
+        5
+    } else {
+        6
+    }
 }
 
 /// Stable key of a row: lowercase name when grouped, process identity when not.
@@ -216,6 +383,7 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     r.exe = p.exe.clone();
                 }
                 r.protected &= is_prot;
+                r.kind = groups::merge(r.kind, p.kind);
             }
             None => {
                 index.insert(key.clone(), rows.len());
@@ -234,6 +402,8 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     exe: p.exe.clone(),
                     parent: p.parent.clone(),
                     protected: is_prot,
+                    kind: p.kind,
+                    depth: 0,
                 });
             }
         }
@@ -481,10 +651,13 @@ impl Totals {
     }
 }
 
-/// Name for the screen: "Chrome", with the count after it for a group.
+/// Name for the screen: "Chrome", with the count after it for a group, and the pid for a
+/// process shown under its opened group.
 fn display_name(r: &Row) -> String {
     let name = friendly_name(&r.name);
-    if r.pids.len() > 1 {
+    if r.depth > 0 {
+        format!("{name} (pid {})", r.pid)
+    } else if r.pids.len() > 1 {
         format!("{name} ({})", r.pids.len())
     } else {
         name
@@ -866,6 +1039,9 @@ impl Worker {
                 let mut last: Option<Instant> = None;
                 let mut ready = false;
                 let mut disk_baseline = DiskBaseline::default();
+                let windows_dir = toolboks_shared::win::windows_dir()
+                    .ok()
+                    .map(|dir| dir.display().to_string());
                 loop {
                     std::thread::sleep(Duration::from_millis(250));
                     if Arc::strong_count(&ping) == 1 {
@@ -888,11 +1064,20 @@ impl Worker {
                     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
                     let was_primed = last.is_some();
                     last = Some(Instant::now());
+                    let owners = groups::window_owners();
                     let (mut procs, parent_pids): (Vec<Proc>, Vec<Option<u32>>) = sys
                         .processes()
                         .values()
                         .map(|p| {
                             let name = p.name().to_string_lossy().into_owned();
+                            let pid = p.pid().as_u32();
+                            let exe = p.exe().map(|e| e.display().to_string());
+                            let kind = groups::kind_of(
+                                exe.as_deref(),
+                                owners.contains(&pid),
+                                is_system(pid, &name),
+                                windows_dir.as_deref(),
+                            );
                             let u = p.disk_usage();
                             let identity = sampled_identity(p, sample_start);
                             let disk = disk_baseline.rate(
@@ -901,7 +1086,7 @@ impl Worker {
                                 secs,
                             );
                             let proc = Proc {
-                                pid: p.pid().as_u32(),
+                                pid,
                                 identity,
                                 lower_name: name.to_lowercase(),
                                 name,
@@ -911,8 +1096,9 @@ impl Worker {
                                 gpu: None,
                                 conns: None,
                                 run_secs: p.run_time(),
-                                exe: p.exe().map(|e| e.display().to_string()),
+                                exe,
                                 parent: Parent::Unverified,
+                                kind,
                             };
                             (proc, p.parent().map(|parent| parent.as_u32()))
                         })
@@ -959,7 +1145,13 @@ impl Worker {
 enum Click {
     Row(String, egui::Modifiers),
     Box(String),
+    /// The open/close button of a merged row.
+    Expand(String),
 }
+
+/// The visible lines and what they were built for: filter, sort column, direction, and the
+/// count of open/close clicks so far.
+type LinesCache = (String, SortKey, bool, u64, Arc<Vec<Line>>);
 
 /// What the inspector asked for this frame.
 enum Intent {
@@ -981,11 +1173,16 @@ pub(super) struct Page {
     /// Connections header total of the newest snapshot.
     conns_total: Option<u32>,
     frozen: Option<Arc<Vec<Proc>>>,
-    rows: Option<Arc<Vec<Row>>>,
-    visible_rows: Option<(String, SortKey, bool, Arc<Vec<Row>>)>,
+    rows: Option<Arc<Rows>>,
+    line_cache: Option<LinesCache>,
     filter: String,
-    grouped: bool,
-    was_grouped: bool,
+    /// The view picked in the toolbar, and the one the rows were built for.
+    view: View,
+    shown_view: View,
+    /// Merged rows opened to show their processes, by row key. Kept across refreshes.
+    expanded: HashSet<String>,
+    /// Bumped on every open or close, so the cached lines are rebuilt.
+    expanded_gen: u64,
     sort_key: SortKey,
     descending: bool,
     selection: Selection,
@@ -1002,6 +1199,13 @@ pub(super) struct Page {
     gpu: Option<std::collections::HashMap<u32, f32>>,
 }
 
+#[cfg(test)]
+impl Page {
+    fn only_for_test(&mut self, key: &str) {
+        self.selection.only(key);
+    }
+}
+
 impl Page {
     pub(super) fn new() -> Self {
         Self {
@@ -1011,10 +1215,12 @@ impl Page {
             conns_total: None,
             frozen: None,
             rows: None,
-            visible_rows: None,
+            line_cache: None,
             filter: String::new(),
-            grouped: true,
-            was_grouped: true,
+            view: View::ByType,
+            shown_view: View::ByType,
+            expanded: HashSet::new(),
+            expanded_gen: 0,
             sort_key: SortKey::Cpu,
             descending: true,
             selection: Selection::default(),
@@ -1074,8 +1280,8 @@ impl Page {
         let worker = self.worker.get_or_insert_with(|| Worker::start(ui.ctx()));
         worker.ping();
 
-        if self.was_grouped != self.grouped {
-            self.was_grouped = self.grouped;
+        if self.shown_view != self.view {
+            self.shown_view = self.view;
             self.selection.clear();
             self.confirm = None;
             self.rows = None;
@@ -1084,11 +1290,11 @@ impl Page {
         let protected = move |p: &Proc| is_protected(p.pid, &p.name, &p.parent, own_pid);
         let procs = Arc::clone(self.frozen.as_ref().unwrap_or(&self.live));
         if self.rows.is_none() {
-            let rows = build_rows(&procs, self.grouped, &protected);
-            let existing = rows.iter().map(|r| r.key.clone()).collect();
+            let rows = Rows::build(&procs, self.shown_view, &protected);
+            let existing = rows.all().map(|r| r.key.clone()).collect();
             self.selection.prune(&existing);
             self.rows = Some(Arc::new(rows));
-            self.visible_rows = None;
+            self.line_cache = None;
         }
         let all_rows = self.rows.as_ref().unwrap().clone();
 
@@ -1113,15 +1319,19 @@ impl Page {
         egui::CentralPanel::default().frame(side).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.spacing_mut().button_padding = Vec2::new(6.0, 1.0);
-            let rows = self.display_rows(&all_rows);
+            let lines = self.display_lines(&all_rows);
+            let row_count = lines
+                .iter()
+                .filter(|l| matches!(l, Line::Row(r) if r.depth == 0))
+                .count();
             toolboks_addon_sdk::tutorial::region(ui, "toolbar", |ui| {
-                self.toolbar(ui, procs.len(), rows.len());
+                self.toolbar(ui, procs.len(), row_count);
             });
             ui.add_space(2.0);
             toolboks_addon_sdk::tutorial::region(ui, "table", |ui| {
                 ui.scope(|ui| {
                     table_style(ui);
-                    self.table(ui, &rows, totals);
+                    self.table(ui, &lines, totals);
                 });
             });
         });
@@ -1131,10 +1341,16 @@ impl Page {
         }
     }
 
+    /// The processes behind the selected rows: a merged row stands for every process of its
+    /// name, a process row (flat view, or opened under its group) for that one process.
     fn selected_procs(&self, procs: &[Proc]) -> Vec<Proc> {
+        let grouped = self.shown_view.grouped();
         procs
             .iter()
-            .filter(|p| self.selection.keys.contains(&row_key(self.was_grouped, p)))
+            .filter(|p| {
+                let keys = &self.selection.keys;
+                (grouped && keys.contains(&row_key(true, p))) || keys.contains(&row_key(false, p))
+            })
             .cloned()
             .collect()
     }
@@ -1223,25 +1439,35 @@ impl Page {
         }
     }
 
-    fn display_rows(&mut self, rows: &[Row]) -> Arc<Vec<Row>> {
-        if let Some((filter, sort, descending, visible)) = &self.visible_rows {
-            if filter == &self.filter && *sort == self.sort_key && *descending == self.descending {
-                return visible.clone();
+    fn display_lines(&mut self, rows: &Rows) -> Arc<Vec<Line>> {
+        if let Some((filter, sort, descending, gen, lines)) = &self.line_cache {
+            if filter == &self.filter
+                && *sort == self.sort_key
+                && *descending == self.descending
+                && *gen == self.expanded_gen
+            {
+                return lines.clone();
             }
         }
-        let mut filtered = filter_rows(rows.to_vec(), &self.filter);
-        sort_rows(&mut filtered, self.sort_key, self.descending);
-        let visible = Arc::new(filtered);
-        self.visible_rows = Some((
+        let lines = Arc::new(build_lines(
+            rows,
+            self.shown_view,
+            &self.expanded,
+            &self.filter,
+            self.sort_key,
+            self.descending,
+        ));
+        self.line_cache = Some((
             self.filter.clone(),
             self.sort_key,
             self.descending,
-            visible.clone(),
+            self.expanded_gen,
+            lines.clone(),
         ));
-        visible
+        lines
     }
 
-    /// Filter, group, pause and count.
+    /// Filter, view, pause and count.
     fn toolbar(&mut self, ui: &mut egui::Ui, procs_total: usize, row_count: usize) {
         let mut paused = self.frozen.is_some();
         let was_paused = paused;
@@ -1250,14 +1476,21 @@ impl Page {
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .hint_text("Filter by name or pid")
-                    .desired_width(170.0),
+                    .desired_width(150.0),
             );
-            switch_row(ui, &mut self.grouped, "Group by name");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for view in View::ALL {
+                    if pill(ui, view.label(), self.view == view).clicked() {
+                        self.view = view;
+                    }
+                }
+            });
             ui.toggle_value(&mut paused, if was_paused { "Paused" } else { "Pause" })
                 .on_hover_text("Freeze the list so rows stop moving. Sampling carries on.");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let text = if self.grouped {
-                    format!("{row_count} apps, {procs_total} processes")
+                let text = if self.shown_view.grouped() {
+                    format!("{row_count} programs, {procs_total} processes")
                 } else {
                     format!("{row_count} processes")
                 };
@@ -1271,11 +1504,13 @@ impl Page {
         }
     }
 
-    fn table(&mut self, ui: &mut egui::Ui, rows: &[Row], totals: Option<Totals>) {
+    fn table(&mut self, ui: &mut egui::Ui, lines: &[Line], totals: Option<Totals>) {
         let mut sort_click: Option<SortKey> = None;
         let mut click: Option<Click> = None;
-        let (sort_key, descending, grouped) = (self.sort_key, self.descending, self.was_grouped);
+        let (sort_key, descending) = (self.sort_key, self.descending);
+        let grouped = self.shown_view.grouped();
         let selection = &self.selection;
+        let expanded = &self.expanded;
         let ready = self.cpu_ready;
         let conns_total = self.conns_total;
         let mem_total = totals.map_or(0, |t| t.mem_total);
@@ -1357,8 +1592,24 @@ impl Page {
             })
             .body(|mut body| {
                 let rule = body.ui_mut().painter().clone();
-                body.rows(ROW_HEIGHT, rows.len(), |mut row| {
-                    let r = &rows[row.index()];
+                body.rows(ROW_HEIGHT, lines.len(), |mut row| {
+                    let r = match &lines[row.index()] {
+                        Line::Section(kind, count) => {
+                            // A caption across the row; it cannot be selected.
+                            row.col(|_| {});
+                            row.col(|ui| {
+                                ui.label(
+                                    RichText::new(format!("{} ({count})", kind.title())).strong(),
+                                );
+                            });
+                            for _ in 0..data_columns(grouped) {
+                                row.col(|_| {});
+                            }
+                            row_rule(&rule, row.response().rect);
+                            return;
+                        }
+                        Line::Row(r) => r,
+                    };
                     let is_selected = selection.keys.contains(&r.key);
                     row.set_selected(is_selected);
                     let cell = |ui: &mut egui::Ui, text: String| {
@@ -1374,6 +1625,29 @@ impl Page {
                         }
                     });
                     row.col(|ui| {
+                        if grouped {
+                            // Room for the open/close button, so names line up; processes
+                            // under an opened group sit one step further in.
+                            let toggle = Vec2::new(TOGGLE_WIDTH, ROW_HEIGHT - 8.0);
+                            if expandable(r) {
+                                let open = expanded.contains(&r.key);
+                                let label = RichText::new(if open { "-" } else { "+" }).strong();
+                                let button = egui::Button::new(label).frame(false);
+                                let hint = if open {
+                                    "Hide its processes"
+                                } else {
+                                    "Show its processes"
+                                };
+                                if ui.add_sized(toggle, button).on_hover_text(hint).clicked() {
+                                    click = Some(Click::Expand(r.key.clone()));
+                                }
+                            } else {
+                                ui.add_space(toggle.x);
+                            }
+                            if r.depth > 0 {
+                                ui.add_space(INDENT);
+                            }
+                        }
                         let l = body_cell(ui, display_name(r), false, r.protected);
                         if r.protected {
                             l.on_hover_text(protected_note(&r.name, &r.parent));
@@ -1411,10 +1685,19 @@ impl Page {
             });
 
         let visible: Vec<String> = match click {
-            Some(Click::Row(..)) if modifiers.shift => rows.iter().map(|r| r.key.clone()).collect(),
+            Some(Click::Row(..)) if modifiers.shift => lines
+                .iter()
+                .filter_map(|l| l.key().map(str::to_string))
+                .collect(),
             _ => Vec::new(),
         };
         match click {
+            Some(Click::Expand(key)) => {
+                if !self.expanded.remove(&key) {
+                    self.expanded.insert(key);
+                }
+                self.expanded_gen += 1;
+            }
             Some(Click::Box(key)) => self.selection.toggle(&key),
             Some(Click::Row(key, m)) if m.shift => self.selection.range(&key, &visible),
             Some(Click::Row(key, m)) if m.command || m.ctrl => self.selection.toggle(&key),
@@ -1443,12 +1726,12 @@ impl Page {
         &mut self,
         ui: &mut egui::Ui,
         procs: &[Proc],
-        all_rows: &[Row],
+        all_rows: &Rows,
         protected: &dyn Fn(&Proc) -> bool,
     ) -> Option<Intent> {
         ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
         let selected: Vec<&Row> = all_rows
-            .iter()
+            .all()
             .filter(|r| self.selection.keys.contains(&r.key))
             .collect();
         if selected.is_empty() {
@@ -1687,7 +1970,245 @@ mod tests {
             run_secs: pid as u64,
             exe: None,
             parent: ok(),
+            kind: Kind::Background,
         }
+    }
+
+    fn of_kind(mut p: Proc, kind: Kind) -> Proc {
+        p.kind = kind;
+        p
+    }
+
+    /// Chrome (an app through its window process), a background updater, and two Windows
+    /// processes, one of them merged from two svchost processes.
+    fn typed() -> Vec<Proc> {
+        vec![
+            of_kind(p(10, "chrome.exe", 1.0, 100), Kind::App),
+            of_kind(p(11, "chrome.exe", 4.0, 300), Kind::Background),
+            of_kind(p(20, "updater.exe", 2.0, 50), Kind::Background),
+            of_kind(p(30, "svchost.exe", 0.5, 20), Kind::Windows),
+            of_kind(p(31, "svchost.exe", 3.0, 10), Kind::Windows),
+            of_kind(p(40, "lsass.exe", 0.1, 5), Kind::Windows),
+        ]
+    }
+
+    fn line_names(lines: &[Line]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| match l {
+                Line::Section(kind, n) => format!("# {} ({n})", kind.title()),
+                Line::Row(r) if r.depth > 0 => format!("  {}", r.pid),
+                Line::Row(r) => r.lower_name.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_merged_row_is_an_app_when_any_of_its_processes_is() {
+        let rows = build_rows(&typed(), true, &none);
+        let kind = |name: &str| rows.iter().find(|r| r.lower_name == name).unwrap().kind;
+        assert_eq!(kind("chrome.exe"), Kind::App);
+        assert_eq!(kind("updater.exe"), Kind::Background);
+        assert_eq!(kind("svchost.exe"), Kind::Windows);
+        // The flat rows keep each process's own section.
+        let flat = build_rows(&typed(), false, &none);
+        assert_eq!(
+            flat.iter().find(|r| r.pid == 11).unwrap().kind,
+            Kind::Background
+        );
+    }
+
+    #[test]
+    fn system_names_are_windows_processes_but_toolboks_is_not() {
+        assert!(is_system(4, "System"));
+        assert!(is_system(900, "csrss.exe"));
+        assert!(is_system(900, "Memory Compression"));
+        assert!(!is_system(900, "Toolboks.exe"));
+        assert!(!is_system(900, "chrome.exe"));
+    }
+
+    #[test]
+    fn by_type_puts_rows_under_sections_in_task_manager_order() {
+        let rows = Rows::build(&typed(), View::ByType, &none);
+        let lines = build_lines(&rows, View::ByType, &HashSet::new(), "", SortKey::Cpu, true);
+        assert_eq!(
+            line_names(&lines),
+            [
+                "# Apps (1)",
+                "chrome.exe",
+                "# Background processes (1)",
+                "updater.exe",
+                "# Windows processes (2)",
+                "svchost.exe",
+                "lsass.exe",
+            ]
+        );
+        // An empty section is left out; the filter counts what is left.
+        let lines = build_lines(
+            &rows,
+            View::ByType,
+            &HashSet::new(),
+            "svc",
+            SortKey::Cpu,
+            true,
+        );
+        assert_eq!(
+            line_names(&lines),
+            ["# Windows processes (1)", "svchost.exe"]
+        );
+    }
+
+    #[test]
+    fn an_opened_group_lists_its_processes_sorted_under_it() {
+        let rows = Rows::build(&typed(), View::ByType, &none);
+        let open: HashSet<String> = ["chrome.exe".to_string()].into();
+        let lines = build_lines(&rows, View::ByType, &open, "", SortKey::Cpu, true);
+        assert_eq!(
+            line_names(&lines)[..4],
+            ["# Apps (1)", "chrome.exe", "  11", "  10"]
+        );
+        let child = match &lines[2] {
+            Line::Row(r) => r,
+            Line::Section(..) => unreachable!(),
+        };
+        assert!(child.key.starts_with("pid:11:"));
+        assert!(!expandable(child));
+        assert_eq!(display_name(child), "Chrome (pid 11)");
+        // By name: same rows and opening, no sections.
+        let rows = Rows::build(&typed(), View::ByName, &none);
+        let lines = build_lines(&rows, View::ByName, &open, "", SortKey::Name, false);
+        assert_eq!(
+            line_names(&lines),
+            [
+                "chrome.exe",
+                "  10",
+                "  11",
+                "lsass.exe",
+                "svchost.exe",
+                "updater.exe"
+            ]
+        );
+        // A single process has nothing to open; the flat view has no merged rows at all.
+        assert!(!expandable(&rows.top[1]));
+        let flat = Rows::build(&typed(), View::Flat, &none);
+        assert!(flat.children.is_empty());
+        let lines = build_lines(&flat, View::Flat, &open, "", SortKey::Pid, false);
+        assert_eq!(lines.len(), 6);
+        assert!(lines
+            .iter()
+            .all(|l| matches!(l, Line::Row(r) if r.depth == 0)));
+    }
+
+    #[test]
+    fn a_process_row_selects_one_process_and_a_group_row_all_of_them() {
+        let mut page = Page::new();
+        let procs = typed();
+        page.only_for_test("chrome.exe");
+        let pids: Vec<u32> = page.selected_procs(&procs).iter().map(|p| p.pid).collect();
+        assert_eq!(pids, [10, 11]);
+        let one = row_key(false, &procs[1]);
+        page.only_for_test(&one);
+        let pids: Vec<u32> = page.selected_procs(&procs).iter().map(|p| p.pid).collect();
+        assert_eq!(pids, [11]);
+        // In the flat view a name key means nothing.
+        page.shown_view = View::Flat;
+        page.only_for_test("chrome.exe");
+        assert!(page.selected_procs(&procs).is_empty());
+    }
+
+    /// Every text drawn in one frame, with where it was drawn.
+    fn frame_texts(ctx: &egui::Context, page: &mut Page, width: f32) -> Vec<(String, egui::Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => out.push((
+                    t.galley.text().to_owned(),
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 720.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| page.ui(ui, None));
+        output.textures_delta.clear();
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// The page at the smallest window: the add-on gets 820 points next to the open sidebar
+    /// (DESIGN.md). Every column header must be left of the inspector, the sections must show,
+    /// and the guided tour must still find the toolbar, table and inspector.
+    #[test]
+    fn the_page_fits_the_smallest_window_and_the_tour_finds_its_regions() {
+        const CONTENT: f32 = 820.0;
+        let ctx = egui::Context::default();
+        toolboks_shared::ui::apply_style(&ctx);
+        let mut page = Page::new();
+        page.live = Arc::new(typed());
+        page.cpu_ready = true;
+        for view in [View::ByType, View::Flat] {
+            page.view = view;
+            let mut texts = Vec::new();
+            for _ in 0..3 {
+                texts = frame_texts(&ctx, &mut page, CONTENT);
+            }
+            let find = |text: &str| {
+                texts
+                    .iter()
+                    .find(|(t, _)| t.starts_with(text))
+                    .map(|(_, r)| *r)
+                    .unwrap_or_else(|| panic!("{text:?} not drawn in {view:?}"))
+            };
+            let inspector_left = CONTENT - INSPECTOR_WIDTH;
+            for header in ["Name", "CPU", "Memory", "Disk", "GPU", "Connections"] {
+                let rect = find(header);
+                assert!(
+                    rect.right() <= inspector_left,
+                    "{header} {rect:?} in {view:?}"
+                );
+            }
+            let count = find(if view == View::Flat {
+                "6 processes"
+            } else {
+                "4 programs"
+            });
+            assert!(count.right() <= inspector_left, "{count:?}");
+            if view == View::ByType {
+                find("Apps (1)");
+                find("Background processes (1)");
+                find("Windows processes (2)");
+            } else {
+                find("PID");
+            }
+        }
+        let mut anchors = Vec::new();
+        for target in ["toolbar", "table", "inspector"] {
+            toolboks_addon_sdk::tutorial::prepare(&ctx, Some(target), false);
+            frame_texts(&ctx, &mut page, CONTENT);
+            let rect = toolboks_addon_sdk::tutorial::anchor(&ctx)
+                .unwrap_or_else(|| panic!("tour target {target} not marked"));
+            anchors.push(rect);
+        }
+        let [toolbar, table, inspector] = anchors[..] else {
+            unreachable!()
+        };
+        assert!(
+            toolbar.bottom() <= table.top() + 1.0,
+            "{toolbar:?} {table:?}"
+        );
+        assert!(
+            inspector.left() >= table.right() - 1.0,
+            "{inspector:?} {table:?}"
+        );
     }
 
     /// A parent the refresh vouched for that protects nothing.

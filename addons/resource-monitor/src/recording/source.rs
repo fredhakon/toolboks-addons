@@ -3,7 +3,9 @@
 //! While Resource Monitor's page is open its live process worker already refreshes the process
 //! table; the recorder then takes those refreshes from [`super::feed`] and does not refresh the
 //! table itself (#90). It refreshes it only when the page is closed or hidden. The first own
-//! refresh after the page closes averages over the time since its previous own refresh.
+//! refresh after the page closes covers the whole time since the previous own refresh (the
+//! process counters are deltas against that refresh), so its per-app figures are averages over
+//! that time: per-app disk rates divide by it, never by one step, so they cannot spike.
 //!
 //! It opens processes only as sysinfo does for the existing Processes and Top lists
 //! (query-information rights, to read times, memory and I/O counters). It never asks for a
@@ -34,6 +36,11 @@ pub struct SystemSource {
     _feed: super::feed::Active,
     /// Process-table refreshes this source made itself (tests and measurements).
     pub(crate) own_refreshes: u64,
+    /// When this source last refreshed the process table itself: the per-process counters
+    /// are deltas against that refresh.
+    own_last: Instant,
+    /// Seconds the per-app figures of the newest own refresh cover (tests).
+    pub(crate) own_secs: f64,
     disks: Option<Disks>,
     nets: Option<Networks>,
     gpu: GpuReader,
@@ -61,6 +68,8 @@ impl SystemSource {
             sys,
             _feed: feed,
             own_refreshes: 0,
+            own_last: Instant::now(),
+            own_secs: 0.0,
             disks: Disks::new_with_refreshed_list_specifics(disk_kind()).ok(),
             nets: Networks::new_with_refreshed_list().ok(),
             gpu,
@@ -78,9 +87,12 @@ impl Source for SystemSource {
         // The live worker's refreshes when the page is open; our own otherwise.
         let fed = super::feed::take(secs);
         if fed.is_none() {
+            self.own_secs = self.own_last.elapsed().as_secs_f64();
             refresh_procs(&mut self.sys);
+            self.own_last = Instant::now();
             self.own_refreshes += 1;
         }
+        let own_secs = self.own_secs;
         self.last = Instant::now();
         let (read, written) = match self.disks.as_mut() {
             Some(d) => {
@@ -140,7 +152,7 @@ impl Source for SystemSource {
                 // Windows gives no I/O counters for a process it will not open (protected
                 // processes without admin rights): every total is then 0. Unknown, not zero.
                 let known = io.total_read_bytes > 0 || io.total_written_bytes > 0;
-                let rate = |b: u64| known.then(|| bytes_per_second(b, secs) as f32);
+                let rate = |b: u64| known.then(|| bytes_per_second(b, own_secs) as f32);
                 ProcReading {
                     name: p.name().to_string_lossy().into_owned(),
                     cpu: cpu_percent_of_machine(p.cpu_usage(), logical) as f32,
@@ -172,6 +184,9 @@ mod measure {
     #[test]
     #[ignore]
     fn process_table_refreshes_with_the_page_open_and_recording_on() {
+        let _l = super::super::feed::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let secs: u64 = std::env::var("MEASURE_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -204,7 +219,10 @@ mod measure {
             minutes * 60.0,
             n as f64 / minutes
         );
+    }
+}
 
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -238,5 +256,14 @@ mod tests {
         let r = src.read();
         assert_eq!(src.own_refreshes, 1);
         assert!(!r.procs.is_empty());
+        // Its process counters are deltas since its own refresh at creation (about 1.5 s ago),
+        // so the per-app rates divide by that time, not by the 0.3 s since the last step:
+        // bytes moved while the page was open are never squeezed into one step.
+        assert!(src.own_secs >= 1.4, "{}", src.own_secs);
+        // The next own step covers just its own step again.
+        std::thread::sleep(Duration::from_millis(300));
+        src.read();
+        assert_eq!(src.own_refreshes, 2);
+        assert!(src.own_secs < 1.0, "{}", src.own_secs);
     }
 }

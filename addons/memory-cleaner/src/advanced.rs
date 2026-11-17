@@ -13,7 +13,7 @@ use super::engine::per_hour_text;
 use super::groups::color_for;
 use super::growth::Hint;
 use super::stats::{format_bytes, group_by_name, sort_and_filter, ProcInfo, SortKey};
-use super::style::{panel, section, section_with_note, stat_row};
+use super::style::{panel, section, section_with_note, stat_row, unproven_note, TRIM_EVIDENCE};
 use super::trim::{skip_reason, trim_process, SkipReason, TrimError};
 use super::workbench::{
     legend, list_bar_parts, list_segments, plan_trim, row_key, share_of, trim_summary,
@@ -186,6 +186,7 @@ impl Memory {
                 ui.label(RichText::new(format!("{count} processes")).weak());
             });
         });
+        unproven_note(ui, TRIM_EVIDENCE);
         if trim {
             let ctx = ui.ctx().clone();
             self.start_trim(&ctx);

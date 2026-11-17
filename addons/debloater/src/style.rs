@@ -3,9 +3,10 @@
 
 use egui::{self, Align2, Color32, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
 
+use toolboks_debloat_engine::model::{Evidence, EvidenceInfo};
 use toolboks_shared::ui::{
-    row_rule, BAR_DIVIDER, BORDER, CARD_PAD, CARD_RADIUS, CONTROL_RADIUS, GAP, MUTED, PANEL_BG,
-    SELECTED_BG, SPACE_XS, TEXT, TEXT_CAPTION, TEXT_SECTION,
+    row_rule, AMBER, BAR_DIVIDER, BORDER, CARD_PAD, CARD_RADIUS, CONTROL_RADIUS, GAP, GREEN, MUTED,
+    PANEL_BG, RED, SELECTED_BG, SPACE_XS, TEXT, TEXT_CAPTION, TEXT_SECTION,
 };
 
 pub const ROW_HEIGHT: f32 = 30.0;
@@ -28,6 +29,52 @@ impl Chip {
             color,
         }
     }
+}
+
+/// The colour of an evidence badge. The word carries the meaning, the colour only backs it up.
+pub fn evidence_color(level: Evidence) -> Color32 {
+    match level {
+        Evidence::Measured => GREEN,
+        Evidence::Mixed => AMBER,
+        Evidence::Unproven => RED,
+        Evidence::NotSpeed => MUTED,
+    }
+}
+
+/// The small badge on a list row.
+pub fn evidence_chip(info: &EvidenceInfo) -> Chip {
+    Chip::new(info.level.label(), evidence_color(info.level))
+}
+
+/// What the source line says about how far the source was checked.
+pub fn source_status(info: &EvidenceInfo) -> &'static str {
+    match (info.source, info.source_checked) {
+        (None, _) => "Source: none found.",
+        (Some(_), true) => "We read this source against this claim.",
+        (Some(source), false) if source.starts_with("https://") => {
+            "The link exists; we did not check it against this claim."
+        }
+        (Some(_), false) => "Not checked against this claim.",
+    }
+}
+
+/// The evidence part of an "About this item" panel: badge, one sentence, source.
+pub fn evidence_block(ui: &mut egui::Ui, info: &EvidenceInfo) {
+    field_label(ui, "Evidence");
+    ui.label(
+        RichText::new(info.level.label())
+            .strong()
+            .color(evidence_color(info.level)),
+    );
+    ui.add(egui::Label::new(info.note).wrap());
+    match info.source {
+        Some(source) if source.starts_with("https://") => {
+            ui.hyperlink_to("Open the source", source);
+        }
+        Some(source) => note(ui, &format!("Source: {source}")),
+        None => {}
+    }
+    note(ui, source_status(info));
 }
 
 /// A section heading (14, strong) with an optional one-line muted note below it.
@@ -197,4 +244,60 @@ pub fn page_head(ui: &mut egui::Ui, status: &str, can_refresh: bool) -> bool {
         });
     });
     clicked
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(level: Evidence, source: Option<&'static str>, checked: bool) -> EvidenceInfo {
+        EvidenceInfo {
+            level,
+            note: "A note.",
+            source,
+            source_checked: checked,
+        }
+    }
+
+    #[test]
+    fn the_badge_word_is_the_evidence_label() {
+        for level in [
+            Evidence::Measured,
+            Evidence::Mixed,
+            Evidence::Unproven,
+            Evidence::NotSpeed,
+        ] {
+            assert_eq!(evidence_chip(&info(level, None, false)).text, level.label());
+        }
+        assert_eq!(Evidence::NotSpeed.label(), "Not a speed tweak");
+        assert_ne!(
+            evidence_color(Evidence::Unproven),
+            evidence_color(Evidence::NotSpeed)
+        );
+    }
+
+    #[test]
+    fn the_source_line_never_claims_more_than_was_checked() {
+        let link = "https://learn.microsoft.com/windows/privacy/x";
+        assert_eq!(
+            source_status(&info(Evidence::Unproven, None, false)),
+            "Source: none found."
+        );
+        assert_eq!(
+            source_status(&info(Evidence::NotSpeed, Some(link), false)),
+            "The link exists; we did not check it against this claim."
+        );
+        assert_eq!(
+            source_status(&info(
+                Evidence::NotSpeed,
+                Some("docs/R.md section 4"),
+                false
+            )),
+            "Not checked against this claim."
+        );
+        assert_eq!(
+            source_status(&info(Evidence::NotSpeed, Some(link), true)),
+            "We read this source against this claim."
+        );
+    }
 }

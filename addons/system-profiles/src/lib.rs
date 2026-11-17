@@ -17,7 +17,7 @@ use toolboks_addon_sdk::{
 };
 use windows::{core::PCWSTR, Win32::UI::Shell::ShellExecuteW};
 
-use engine::{Action, Choice, Evidence, CHOICES, GROUPS};
+use engine::{Action, Choice, Evidence, CHOICES, GROUPS, MS_CONNECTIONS, NO_SPEED_CLAIM};
 use toolboks_shared::ui as theme;
 
 pub const ID: &str = "toolboks.system-profiles";
@@ -50,73 +50,120 @@ struct Guide {
     title: &'static str,
     instructions: &'static str,
     link: Option<(&'static str, &'static str)>,
+    /// None means "Not a speed tweak", as for the choices above.
+    evidence: Option<Evidence>,
+    why: &'static str,
+    source: &'static str,
 }
+
+/// For the guides that aim at game speed: nothing measured is recorded in this add-on.
+const NOT_MEASURED: &str = "No measurement of a gain is recorded here, and none is claimed.";
+const RECALL_SUPPORT: &str = "https://support.microsoft.com/en-us/windows/privacy/privacy-and-control-over-your-recall-experience";
 
 const GUIDES: &[Guide] = &[
     Guide {
         title: "Windowed optimizations and GPU scheduling",
         instructions: "Open System → Display → Graphics. Turn on Optimizations for windowed games and Hardware-accelerated GPU scheduling if available. Restart Windows after changing GPU scheduling.",
         link: Some(("Open Graphics settings", "ms-settings:display-advancedgraphics")),
+        evidence: Some(Evidence::Unproven),
+        why: "Aimed at smoother games, but no measurement of a gain is recorded here, and GPU scheduling needs a restart.",
+        source: NOT_MEASURED,
     },
     Guide {
         title: "NVIDIA global graphics settings",
         instructions: "Open NVIDIA Control Panel → Manage 3D Settings → Global Settings. Note your current values. Set Shader Cache Size to 10 GB, Vertical sync to Off, and Power management mode to Prefer maximum performance. Apply. These settings affect other 3D apps too.",
         link: Some(("NVIDIA settings reference", "https://www.nvidia.com/content/Control-Panel-Help/vLatest/en-us/mergedProjects/3D%20Settings/Manage_3D_Settings_%28reference%29.htm")),
+        evidence: Some(Evidence::Unproven),
+        why: "Aimed at game speed, but no measurement of a gain is recorded here, and these settings also change other 3D apps.",
+        source: NOT_MEASURED,
     },
     Guide {
         title: "Memory Integrity",
         instructions: "Windows Security → Device security → Core isolation details. Turning off Memory integrity weakens Windows protection against malicious drivers. If you choose to change it, restart Windows. Return here to turn it back on.",
         link: Some(("Open Windows Security", "windowsdefender:")),
+        evidence: Some(Evidence::Unproven),
+        why: "Turning it off is aimed at game speed, but no measurement of a gain is recorded here, and it weakens protection against malicious drivers.",
+        source: NOT_MEASURED,
     },
     Guide {
         title: "Temporary files and Disk Cleanup",
         instructions: "Open Settings → System → Storage → Temporary files, or search Start for Disk Cleanup. Review the selected categories before deleting. Deleted files cannot be recovered using this profile.",
         link: Some(("Open Storage settings", "ms-settings:storagesense")),
+        evidence: None,
+        why: "Housekeeping that frees disk space; it is not a speed setting.",
+        source: NO_SPEED_CLAIM,
     },
     Guide {
         title: "Storage Sense",
         instructions: "Open Settings → System → Storage and switch Storage Sense off to stop automatic cleanup.",
         link: Some(("Open Storage Sense", "ms-settings:storagepolicies")),
+        evidence: None,
+        why: "Stops automatic cleanup, so disk space may fill sooner; it is not a speed setting.",
+        source: NO_SPEED_CLAIM,
     },
     Guide {
         title: "Location",
         instructions: "Open Privacy & security → Location. Turn off Location services to disable location access for the device.",
         link: Some(("Open Location settings", "ms-settings:privacy-location")),
+        evidence: None,
+        why: "Stops Windows and apps reading this PC's location; a privacy choice, not a speed setting.",
+        source: MS_CONNECTIONS,
     },
     Guide {
         title: "Start and search app-launch tracking",
         instructions: "Under Privacy & security, open General or Recommendations & offers. Turn off the option that improves Start and search results by tracking app launches.",
         link: Some(("Open privacy settings", "ms-settings:privacy-general")),
+        evidence: None,
+        why: "Stops Windows tracking app launches to tune Start and search; a privacy choice, not a speed setting.",
+        source: MS_CONNECTIONS,
     },
     Guide {
         title: "Notifications",
         instructions: "Open System → Notifications and switch Notifications off.",
         link: Some(("Open Notifications settings", "ms-settings:notifications")),
+        evidence: None,
+        why: "Silences pop-ups; a comfort setting, not a speed setting.",
+        source: NO_SPEED_CLAIM,
     },
     Guide {
         title: "Taskbar End Task",
         instructions: "Search Windows Settings for End Task and enable it under Advanced or For developers, depending on your Windows version. Right-click an app in the taskbar to find End task.",
         link: Some(("Open developer settings", "ms-settings:developers")),
+        evidence: None,
+        why: "A convenience for closing stuck apps; it is not a speed setting.",
+        source: NO_SPEED_CLAIM,
     },
     Guide {
         title: "Windows Terminal default profile",
         instructions: "Install PowerShell 7 if needed. In Windows Terminal, open Settings → Startup, select PowerShell as the default profile, and save. Windows PowerShell is the older profile.",
         link: Some(("Windows Terminal setup", "https://learn.microsoft.com/windows/terminal/install")),
+        evidence: None,
+        why: "Picks the newer shell by default; it is not a speed setting.",
+        source: NO_SPEED_CLAIM,
     },
     Guide {
         title: "Recall",
         instructions: "On a Copilot+ PC, open Privacy & security → Recall & snapshots and turn off Save snapshots. Removing Recall through Windows Features also permanently deletes its snapshots.",
         link: Some(("Microsoft Recall settings", "https://support.microsoft.com/en-us/windows/privacy/privacy-and-control-over-your-recall-experience")),
+        evidence: None,
+        why: "Stops Recall saving screen snapshots; a privacy choice, not a speed setting.",
+        source: RECALL_SUPPORT,
     },
     Guide {
         title: "Explorer automatic folder discovery",
         instructions: "To fix the view type of a folder, open its Properties → Customize and choose a template under Optimize this folder for. The global registry override is undocumented.",
         link: None,
+        evidence: None,
+        why: "Fixes the view type of one folder; the global override is undocumented, so no change is offered here, and it is not a speed setting.",
+        source: NO_SPEED_CLAIM,
     },
     Guide {
         title: "HomeGroup and Wi-Fi Sense",
         instructions: "Current Windows versions have removed these features. There is no setting to change.",
         link: None,
+        evidence: None,
+        why: "There is nothing to change because these features are gone; it is not a speed setting.",
+        source: NO_SPEED_CLAIM,
     },
 ];
 
@@ -245,6 +292,19 @@ fn badge(ui: &mut egui::Ui, evidence: Option<Evidence>) {
     );
 }
 
+/// A link, or a plain note. Never a made-up address.
+fn source_line(ui: &mut egui::Ui, source: &str) {
+    if source.starts_with("https://") {
+        ui.hyperlink_to("Source: Microsoft Learn", source);
+    } else {
+        ui.label(
+            RichText::new(source)
+                .size(theme::TEXT_CAPTION)
+                .color(theme::MUTED),
+        );
+    }
+}
+
 fn choice_row(ui: &mut egui::Ui, choice: &Choice, on: &mut bool) -> bool {
     let mut changed = false;
     ui.horizontal_wrapped(|ui| {
@@ -254,15 +314,7 @@ fn choice_row(ui: &mut egui::Ui, choice: &Choice, on: &mut bool) -> bool {
     ui.indent(choice.id, |ui| {
         ui.label(choice.why);
         ui.label(RichText::new(format!("Changes: {}", choice.detail)).color(theme::MUTED));
-        if choice.source.starts_with("https://") {
-            ui.hyperlink_to("Source: Microsoft Learn", choice.source);
-        } else {
-            ui.label(
-                RichText::new(choice.source)
-                    .size(theme::TEXT_CAPTION)
-                    .color(theme::MUTED),
-            );
-        }
+        source_line(ui, choice.source);
     });
     ui.add_space(theme::GAP);
     changed
@@ -525,6 +577,11 @@ impl Gaming {
         ui.label(RichText::new("Follow these steps in Windows or NVIDIA Control Panel. Record your original settings before changing them.").color(theme::MUTED));
         for guide in GUIDES {
             ui.collapsing(guide.title, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    badge(ui, guide.evidence);
+                    ui.label(guide.why);
+                });
+                source_line(ui, guide.source);
                 ui.label(guide.instructions);
                 if let Some((label, link)) = guide.link {
                     if link.starts_with("https://") {
@@ -660,6 +717,31 @@ mod tests {
                 "{} has no source",
                 choice.id
             );
+        }
+    }
+
+    #[test]
+    fn every_guide_has_a_badge_a_reason_and_a_source() {
+        assert!(!GUIDES.is_empty());
+        for guide in GUIDES {
+            assert!(guide.why.ends_with('.'), "{}", guide.title);
+            assert!(guide.why.len() > 20, "{}", guide.title);
+            assert!(!guide.source.is_empty(), "{}", guide.title);
+            if guide.source.starts_with("http") {
+                assert!(guide.source.starts_with("https://"), "{}", guide.title);
+            }
+            // A guide that aims at speed says plainly that nothing is measured; nothing here
+            // claims Measured or Mixed.
+            match guide.evidence {
+                Some(Evidence::Unproven) => assert!(
+                    guide.why.contains("no measurement")
+                        && guide.why.to_lowercase().contains("aimed"),
+                    "{}",
+                    guide.title
+                ),
+                None => assert!(guide.why.contains("not a speed"), "{}", guide.title),
+                Some(other) => panic!("{} claims {other:?}", guide.title),
+            }
         }
     }
 

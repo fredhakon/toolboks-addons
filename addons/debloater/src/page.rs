@@ -583,6 +583,7 @@ impl Debloater {
         let focused = self.focus == Some(item.id);
 
         let chips = [
+            style::evidence_chip(&item.evidence()),
             Chip::new(state_text(status), state_color(status)),
             risk_chip(item.risk, can_tick),
         ];
@@ -623,6 +624,7 @@ impl Debloater {
         ui.label(item.what_changes);
         style::field_label(ui, "What could break");
         ui.label(item.could_break);
+        style::evidence_block(ui, &item.evidence());
         style::note(ui, reversibility(item));
     }
 
@@ -1220,8 +1222,11 @@ impl Debloater {
         let installed = row.installed.is_some();
         let focused = self.apps.focus == Some(id);
 
-        let chip = Chip::new(app_state_text(installed), MUTED);
-        let (response, body) = style::row(ui, focused, &[chip]);
+        let chips = [
+            style::evidence_chip(&row.entry.evidence()),
+            Chip::new(app_state_text(installed), MUTED),
+        ];
+        let (response, body) = style::row(ui, focused, &chips);
         if response.clicked() {
             self.apps.focus = Some(id);
         }
@@ -1260,6 +1265,7 @@ impl Debloater {
         ui.label(entry.what_changes);
         style::field_label(ui, "What could break");
         ui.label(entry.could_break);
+        style::evidence_block(ui, &entry.evidence());
     }
 
     fn apps_inspector(&mut self, ui: &mut egui::Ui) {
@@ -2139,7 +2145,11 @@ impl Debloater {
             };
             Chip::new(task_state_text(state), color)
         };
-        let chips = [state_chip, risk_chip(def.risk, switchable)];
+        let chips = [
+            style::evidence_chip(&def.evidence()),
+            state_chip,
+            risk_chip(def.risk, switchable),
+        ];
         let (response, body) = style::row(ui, focused, &chips);
         if response.clicked() {
             self.tasks.focus = Some(def.id);
@@ -2195,6 +2205,7 @@ impl Debloater {
                 ui.label(def.what_changes);
                 style::field_label(ui, "What could break");
                 ui.label(def.could_break);
+                style::evidence_block(ui, &def.evidence());
                 style::field_label(ui, "Task");
                 ui.add(egui::Label::new(RichText::new(def.path).small()).wrap());
             }
@@ -2549,6 +2560,7 @@ impl Debloater {
         let usable = switchable && !self.services_busy() && can_revert;
 
         let chips = [
+            style::evidence_chip(&def.evidence()),
             Chip::new(service_state_text(state), MUTED),
             risk_chip(def.risk, switchable),
         ];
@@ -2619,6 +2631,7 @@ impl Debloater {
                 ui.label(def.what_changes);
                 style::field_label(ui, "What could break");
                 ui.label(def.could_break);
+                style::evidence_block(ui, &def.evidence());
                 style::field_label(ui, "Service name");
                 ui.add(egui::Label::new(RichText::new(def.name).small()).wrap());
             }
@@ -3298,6 +3311,44 @@ mod tests {
         );
         assert_eq!(steps.len(), 2);
         assert_eq!(undo_for_id(&mut steps, "zzz", |_| StepResult::Done), (0, 0));
+    }
+
+    #[test]
+    fn every_listed_entry_shows_a_badge_and_a_note_and_nothing_is_ticked() {
+        let page = Debloater::default();
+        assert!(page.selected.is_empty());
+        assert!(page.apps.selected.is_empty());
+        let mut infos: Vec<(&str, toolboks_debloat_engine::model::EvidenceInfo)> = Vec::new();
+        infos.extend(catalog::items().iter().map(|i| (i.id, i.evidence())));
+        infos.extend(apps::curated().iter().map(|a| (a.id, a.evidence())));
+        infos.extend(tasks::catalog().iter().map(|t| (t.id, t.evidence())));
+        infos.extend(services::catalog().iter().map(|s| (s.id, s.evidence())));
+        assert_eq!(infos.len(), 27 + 13 + 18 + 20);
+        for (id, info) in infos {
+            assert!(!style::evidence_chip(&info).text.is_empty(), "{id}");
+            assert!(!info.note.is_empty(), "{id}");
+            assert!(!style::source_status(&info).is_empty(), "{id}");
+            // The host says an entry with no recorded evidence is "Unproven" with this note.
+            assert_ne!(
+                info.note, "No evidence has been recorded for this entry.",
+                "{id} has no evidence entry"
+            );
+        }
+    }
+
+    #[test]
+    fn unproven_entries_exist_and_stay_unticked() {
+        let unproven = |level: toolboks_debloat_engine::model::Evidence| {
+            level == toolboks_debloat_engine::model::Evidence::Unproven
+        };
+        let ids: Vec<&str> = catalog::items()
+            .iter()
+            .filter(|i| unproven(i.evidence().level))
+            .map(|i| i.id)
+            .collect();
+        assert!(ids.contains(&"game-bar-capture"));
+        let page = Debloater::default();
+        assert!(ids.iter().all(|id| !page.selected.contains(id)));
     }
 
     fn page_with_store(dir: &std::path::Path) -> Debloater {

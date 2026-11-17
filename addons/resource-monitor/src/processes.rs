@@ -28,7 +28,7 @@ use protected_processes::Parent;
 use toolboks_shared::format::{friendly_name, rate, size_plain, uptime};
 use toolboks_shared::ui::{
     body_cell, header_cell, inspector_edge, inspector_frame, row_rule, switch_row, table_style,
-    CARD_PAD, DATA_CPU, DATA_DISK, DATA_MEMORY, GAP, MUTED, RED, SPACE_M, TEXT_SECTION,
+    CARD_PAD, DATA_CPU, DATA_DISK, DATA_GPU, DATA_MEMORY, GAP, MUTED, RED, SPACE_M, TEXT_SECTION,
 };
 use toolboks_shared::win::Handle;
 
@@ -85,6 +85,9 @@ struct Proc {
     /// Bytes per second read plus written since the previous refresh; None until this process
     /// has been seen in two refreshes in a row.
     disk: Option<f64>,
+    /// GPU load, percent 0 to 100, from the main sampler's latest GPU reading; None while there
+    /// is no reading (or no usable GPU).
+    gpu: Option<f32>,
     run_secs: u64,
     exe: Option<String>,
     /// The parent this refresh vouched for (to protect children of game launchers). A parent
@@ -106,6 +109,8 @@ struct Row {
     mem: u64,
     /// Sum of the known disk rates in the row; None while none of its processes has one.
     disk: Option<f64>,
+    /// Sum of the GPU loads in the row, capped at 100 (the Overview GPU card's rule).
+    gpu: Option<f32>,
     run_secs: u64,
     exe: Option<String>,
     /// Parent of the first process in the row.
@@ -121,6 +126,7 @@ enum SortKey {
     Cpu,
     Memory,
     Disk,
+    Gpu,
 }
 
 /// True for processes Windows needs, this app itself, and game, launcher and anti-cheat
@@ -191,6 +197,10 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     (Some(a), Some(b)) => Some(a + b),
                     (a, b) => a.or(b),
                 };
+                r.gpu = match (r.gpu, p.gpu) {
+                    (Some(a), Some(b)) => Some((a + b).min(100.0)),
+                    (a, b) => a.or(b),
+                };
                 r.run_secs = r.run_secs.max(p.run_secs);
                 if r.exe.is_none() {
                     r.exe = p.exe.clone();
@@ -208,6 +218,7 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     cpu: p.cpu,
                     mem: p.mem,
                     disk: p.disk,
+                    gpu: p.gpu.map(|g| g.min(100.0)),
                     run_secs: p.run_secs,
                     exe: p.exe.clone(),
                     parent: p.parent.clone(),
@@ -228,6 +239,7 @@ fn sort_rows(rows: &mut [Row], key: SortKey, descending: bool) {
             SortKey::Cpu => a.cpu.total_cmp(&b.cpu),
             SortKey::Memory => a.mem.cmp(&b.mem),
             SortKey::Disk => a.disk.unwrap_or(0.0).total_cmp(&b.disk.unwrap_or(0.0)),
+            SortKey::Gpu => a.gpu.unwrap_or(0.0).total_cmp(&b.gpu.unwrap_or(0.0)),
         };
         let ord = if descending { ord.reverse() } else { ord };
         ord.then_with(|| a.lower_name.cmp(&b.lower_name))
@@ -304,6 +316,18 @@ fn disk_text(disk: Option<f64>) -> String {
     disk.map_or_else(|| "...".to_string(), rate)
 }
 
+fn gpu_text(gpu: Option<f32>) -> String {
+    gpu.map_or_else(|| "...".to_string(), |g| format!("{g:.1}%"))
+}
+
+/// Gives each process its GPU load from the newest per-pid reading (`None` while there is no
+/// reading). A process missing from the reading uses no GPU.
+fn apply_gpu(procs: &mut [Proc], by_pid: Option<&std::collections::HashMap<u32, f32>>) {
+    for p in procs {
+        p.gpu = by_pid.map(|m| m.get(&p.pid).copied().unwrap_or(0.0));
+    }
+}
+
 /// Which processes were present in the previous refresh. sysinfo reports a process's disk
 /// bytes as a delta against its previous reading, which is 0 for a process it sees for the
 /// first time, so that first "delta" is the whole lifetime I/O. A rate is only trusted for a
@@ -354,6 +378,8 @@ const SHADE_STEPS: usize = 4;
 const CPU_SHADE: [f64; SHADE_STEPS] = [1.0, 10.0, 25.0, 50.0];
 /// Memory: percent of the installed RAM.
 const MEM_SHADE: [f64; SHADE_STEPS] = [1.0, 5.0, 10.0, 25.0];
+/// GPU: percent of the GPU's busiest engine, the same steps as CPU.
+const GPU_SHADE: [f64; SHADE_STEPS] = CPU_SHADE;
 /// Disk: bytes per second (0.1, 1, 10 and 100 MB/s).
 const DISK_SHADE: [f64; SHADE_STEPS] = [100_000.0, 1_000_000.0, 10_000_000.0, 100_000_000.0];
 /// Tint opacity per level (of 255). Low enough that the plain text stays readable on top, in a
@@ -392,6 +418,8 @@ pub(super) struct Totals {
     pub disk_active: Option<f32>,
     /// Bytes per second read plus written, used when `disk_active` is missing.
     pub disk_bps: f64,
+    /// Load of the main GPU's busiest engine, 0 to 100; None without a usable GPU.
+    pub gpu: Option<f32>,
 }
 
 impl Totals {
@@ -414,6 +442,10 @@ impl Totals {
             Some(active) => format!("{active:.0}%"),
             None => rate(self.disk_bps),
         }
+    }
+
+    fn gpu_text(&self) -> Option<String> {
+        self.gpu.map(|g| format!("{:.0}%", g.clamp(0.0, 100.0)))
     }
 }
 
@@ -842,6 +874,7 @@ impl Worker {
                                 cpu: (p.cpu_usage() / logical).clamp(0.0, 100.0),
                                 mem: p.memory(),
                                 disk,
+                                gpu: None,
                                 run_secs: p.run_time(),
                                 exe: p.exe().map(|e| e.display().to_string()),
                                 parent: Parent::Unverified,
@@ -924,6 +957,8 @@ pub(super) struct Page {
     denied: HashSet<ProcessIdentity>,
     job: Option<Receiver<Done>>,
     lines: Vec<String>,
+    /// Newest per-pid GPU load from the main sampler; None until a reading with a GPU arrives.
+    gpu: Option<std::collections::HashMap<u32, f32>>,
 }
 
 impl Page {
@@ -947,14 +982,23 @@ impl Page {
             denied: HashSet::new(),
             job: None,
             lines: Vec::new(),
+            gpu: None,
         }
+    }
+
+    /// Takes the newest per-process GPU reading (None when the PC has no usable GPU). It is
+    /// applied to the next process snapshot, so a paused list keeps the values it froze with.
+    pub(super) fn set_gpu(&mut self, by_pid: Option<&[(u32, f32)]>) {
+        self.gpu = by_pid.map(|pids| pids.iter().copied().collect());
     }
 
     /// Takes in whatever the workers have produced. Never blocks.
     pub(super) fn tick(&mut self) {
         if let Some(worker) = &self.worker {
             for snap in worker.rx.try_iter() {
-                self.live = Arc::new(snap.procs);
+                let mut procs = snap.procs;
+                apply_gpu(&mut procs, self.gpu.as_ref());
+                self.live = Arc::new(procs);
                 self.cpu_ready = snap.cpu_ready;
                 if self.frozen.is_none() {
                     self.rows = None;
@@ -1207,6 +1251,7 @@ impl Page {
             .column(Column::exact(64.0))
             .column(Column::exact(84.0))
             .column(Column::exact(80.0))
+            .column(Column::exact(60.0))
             .header(HEADER_HEIGHT, |mut header| {
                 header.col(|_| {});
                 // The caption sorts; the system total sits under it, right-aligned, and is
@@ -1250,6 +1295,10 @@ impl Page {
                     let total = totals.map(|t| t.disk_text());
                     sort_click = with_total(ui, "Disk", SortKey::Disk, total).or(sort_click)
                 });
+                header.col(|ui| {
+                    let total = totals.and_then(|t| t.gpu_text());
+                    sort_click = with_total(ui, "GPU", SortKey::Gpu, total).or(sort_click)
+                });
             })
             .body(|mut body| {
                 let rule = body.ui_mut().painter().clone();
@@ -1292,6 +1341,8 @@ impl Page {
                     row.col(|ui| shaded(ui, DATA_CPU, cpu_level, cpu_text(r.cpu, ready)));
                     row.col(|ui| shaded(ui, DATA_MEMORY, mem_level, size_plain(r.mem)));
                     row.col(|ui| shaded(ui, DATA_DISK, disk_level, disk_text(r.disk)));
+                    let gpu_level = r.gpu.map_or(0, |g| shade_level(f64::from(g), &GPU_SHADE));
+                    row.col(|ui| shaded(ui, DATA_GPU, gpu_level, gpu_text(r.gpu)));
                     let response = row.response();
                     row_rule(&rule, response.rect);
                     if response.clicked() && click.is_none() {
@@ -1317,7 +1368,10 @@ impl Page {
             } else {
                 self.sort_key = key;
                 // Names and pids read naturally upwards, numbers biggest first.
-                self.descending = matches!(key, SortKey::Cpu | SortKey::Memory | SortKey::Disk);
+                self.descending = matches!(
+                    key,
+                    SortKey::Cpu | SortKey::Memory | SortKey::Disk | SortKey::Gpu
+                );
             }
         }
     }
@@ -1368,6 +1422,14 @@ impl Page {
         }
         kv(ui, "CPU", &cpu_text(cpu, ready));
         kv(ui, "Memory", &size_plain(mem));
+        let gpu: Option<f32> = selected
+            .iter()
+            .filter_map(|r| r.gpu)
+            .reduce(|a, b| a + b)
+            .map(|g| g.min(100.0));
+        if let Some(gpu) = gpu {
+            kv(ui, "GPU", &gpu_text(Some(gpu)));
+        }
         if let [one] = selected.as_slice() {
             kv(ui, "Running for", &uptime(one.run_secs));
             if let Some(path) = &one.exe {
@@ -1553,6 +1615,7 @@ mod tests {
             cpu,
             mem,
             disk: None,
+            gpu: None,
             run_secs: pid as u64,
             exe: None,
             parent: ok(),
@@ -1608,6 +1671,70 @@ mod tests {
         let flat = build_rows(&procs, false, &none);
         assert_eq!(flat.len(), 3);
         assert_eq!(flat[0].disk, Some(1_500_000.0));
+    }
+
+    fn with_gpu(mut p: Proc, gpu: f32) -> Proc {
+        p.gpu = Some(gpu);
+        p
+    }
+
+    #[test]
+    fn grouping_sums_gpu_like_the_overview_card() {
+        // The same processes the Overview GPU card gets from the sampler.
+        let readings = [
+            (10, "game.exe", 70.0),
+            (11, "Game.exe", 45.0),
+            (20, "chrome.exe", 3.5),
+            (21, "chrome.exe", 1.0),
+            (30, "code.exe", 0.4),
+        ];
+        let mut procs: Vec<Proc> = readings
+            .iter()
+            .map(|(pid, name, _)| p(*pid, name, 0.0, 0))
+            .chain([p(40, "notepad.exe", 0.0, 0)])
+            .collect();
+        let by_pid: std::collections::HashMap<u32, f32> =
+            readings.iter().map(|(pid, _, g)| (*pid, *g)).collect();
+        apply_gpu(&mut procs, Some(&by_pid));
+        let rows = build_rows(&procs, true, &none);
+        let card =
+            crate::sampler::gpu_by_name(readings.iter().map(|(_, n, g)| (n.to_string(), *g)));
+        assert_eq!(card.len(), 3);
+        for top in &card {
+            let row = rows
+                .iter()
+                .find(|r| r.lower_name == top.name.to_lowercase())
+                .unwrap();
+            assert_eq!(row.gpu, Some(top.value as f32), "{}", top.name);
+            assert_eq!(row.pids.len(), top.count, "{}", top.name);
+        }
+        // Capped at 100 % like the card; a process missing from the reading uses no GPU.
+        assert_eq!(rows[0].gpu, Some(100.0));
+        let notepad = rows.iter().find(|r| r.lower_name == "notepad.exe").unwrap();
+        assert_eq!(notepad.gpu, Some(0.0));
+        // No GPU reading: unknown, not 0.
+        apply_gpu(&mut procs, None);
+        assert!(build_rows(&procs, true, &none)
+            .iter()
+            .all(|r| r.gpu.is_none()));
+    }
+
+    #[test]
+    fn sorts_by_gpu_and_shades_like_cpu() {
+        let procs = vec![
+            with_gpu(p(3, "b.exe", 1.0, 5), 12.0),
+            p(2, "a.exe", 1.0, 5),
+            with_gpu(p(1, "c.exe", 1.0, 5), 80.0),
+        ];
+        let mut rows = build_rows(&procs, false, &none);
+        sort_rows(&mut rows, SortKey::Gpu, true);
+        let order: Vec<u32> = rows.iter().map(|r| r.pid).collect();
+        assert_eq!(order, vec![1, 3, 2]);
+        assert_eq!(gpu_text(None), "...");
+        assert_eq!(gpu_text(Some(12.04)), "12.0%");
+        assert_eq!(shade_level(0.5, &GPU_SHADE), 0);
+        assert_eq!(shade_level(12.0, &GPU_SHADE), 2);
+        assert_eq!(shade_level(80.0, &GPU_SHADE), 4);
     }
 
     #[test]
@@ -1669,7 +1796,10 @@ mod tests {
             mem_total: 16 * 1024 * 1024 * 1024,
             disk_active: Some(12.6),
             disk_bps: 5_000_000.0,
+            gpu: Some(41.6),
         };
+        assert_eq!(t.gpu_text().as_deref(), Some("42%"));
+        assert_eq!(Totals { gpu: None, ..t }.gpu_text(), None);
         assert_eq!(t.cpu_text(), "34%");
         assert_eq!(t.mem_text().as_deref(), Some("50%"));
         assert_eq!(t.disk_text(), "13%");

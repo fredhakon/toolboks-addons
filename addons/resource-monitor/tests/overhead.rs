@@ -11,10 +11,17 @@
 //!   cargo test --release -p resource-monitor --test overhead -- --ignored --nocapture
 //! ```
 //!
-//! `OVERHEAD_SECS` (default 60) is the measured time per phase, after a 10 s warm-up.
+//! `OVERHEAD_SECS` (default 60) is the measured time per phase, after a 10 s warm-up. Each
+//! phase also prints the CPU use of every named thread of the add-on. CPU is counted in
+//! processor cycles (`QueryProcessCycleTime`, `QueryThreadCycleTime`), not in CPU time: Windows
+//! charges CPU time in whole 15.6 ms clock ticks, so a thread that wakes for a few milliseconds
+//! a second reads as 0 % in one run and 1.6 % in the next. Cycles are converted to "% of one
+//! core" with the cycle rate measured by spinning one thread for 300 ms at the start. History
+//! recording runs, as by default.
 //! `OVERHEAD_DATA` is the data folder handed to the add-on (`TOOLBOKS_DATA_DIR`), so the history
 //! recorder never writes into a real Toolboks folder.
 
+use std::collections::{BTreeMap, HashMap};
 use std::os::windows::io::AsRawHandle;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -23,9 +30,14 @@ use std::time::{Duration, Instant};
 use toolboks_addon_proto::{
     host_handshake, AddonMessage, FrameReader, FrameWriter, Hello, HostMessage, InputBatch, Theme,
 };
-use windows::Win32::Foundation::{FILETIME, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
-use windows::Win32::System::Threading::GetProcessTimes;
+use windows::Win32::System::Threading::{
+    GetCurrentThread, GetThreadDescription, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
+};
 
 const WARM_UP: Duration = Duration::from_secs(10);
 const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
@@ -43,14 +55,83 @@ fn handle(child: &Child) -> HANDLE {
     HANDLE(child.as_raw_handle())
 }
 
-/// Kernel plus user CPU time of the child.
-fn cpu_time(child: &Child) -> Duration {
-    let (mut c, mut e, mut k, mut u) = Default::default();
-    // SAFETY: the handle belongs to a child this process owns; the four FILETIMEs are writable.
-    unsafe { GetProcessTimes(handle(child), &mut c, &mut e, &mut k, &mut u) }
-        .expect("GetProcessTimes");
-    let t = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
-    Duration::from_nanos((t(k) + t(u)) * 100)
+#[link(name = "kernel32")]
+extern "system" {
+    fn QueryProcessCycleTime(process: HANDLE, cycles: *mut u64) -> i32;
+    fn QueryThreadCycleTime(thread: HANDLE, cycles: *mut u64) -> i32;
+}
+
+/// Processor cycles the child has used, all its threads (also ended ones) together.
+fn cycles(child: &Child) -> u64 {
+    let mut c = 0u64;
+    // SAFETY: the handle belongs to a child this process owns; `c` is writable.
+    assert!(unsafe { QueryProcessCycleTime(handle(child), &mut c) } != 0);
+    c
+}
+
+/// Cycles per second of one busy core, measured by spinning this thread for 300 ms.
+fn cycle_rate() -> f64 {
+    let read = || {
+        let mut c = 0u64;
+        // SAFETY: the pseudo handle of the current thread is always valid.
+        unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
+        c
+    };
+    let (c0, t0) = (read(), Instant::now());
+    while t0.elapsed() < Duration::from_millis(300) {
+        std::hint::spin_loop();
+    }
+    (read() - c0) as f64 / t0.elapsed().as_secs_f64()
+}
+
+/// Thread id -> (name, cycles used) for every thread of process `pid`. Unnamed threads are
+/// "(unnamed)".
+fn threads(pid: u32) -> HashMap<u32, (String, u64)> {
+    let mut out = HashMap::new();
+    // SAFETY: a snapshot handle is closed below; THREADENTRY32 has its size set.
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) else {
+            return out;
+        };
+        let mut e = THREADENTRY32 {
+            dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut more = Thread32First(snap, &mut e).is_ok();
+        while more {
+            if e.th32OwnerProcessID == pid {
+                if let Ok(h) = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, false, e.th32ThreadID) {
+                    let name = GetThreadDescription(h)
+                        .ok()
+                        .and_then(|p| p.to_string().ok())
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| "(unnamed)".into());
+                    let mut c = 0u64;
+                    if QueryThreadCycleTime(h, &mut c) != 0 {
+                        out.insert(e.th32ThreadID, (name, c));
+                    }
+                    let _ = CloseHandle(h);
+                }
+            }
+            more = Thread32Next(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
+}
+
+/// Cycles per thread name between two snapshots (threads that started in between count from
+/// zero; threads that ended in between are missing and show up in the process total only).
+fn per_name(
+    before: &HashMap<u32, (String, u64)>,
+    after: &HashMap<u32, (String, u64)>,
+) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for (id, (name, c)) in after {
+        let was = before.get(id).filter(|(n, _)| n == name).map_or(0, |b| b.1);
+        *out.entry(name.clone()).or_insert(0) += c.saturating_sub(was);
+    }
+    out
 }
 
 /// (working set, private bytes) of the child.
@@ -88,6 +169,8 @@ struct Result {
     frames_per_sec: f64,
     working_set: u64,
     private: u64,
+    threads: BTreeMap<String, u64>,
+    wall: f64,
 }
 
 fn mb(b: u64) -> String {
@@ -105,6 +188,7 @@ fn processes_page_overhead() {
         .unwrap_or(60);
     let measured = Duration::from_secs(secs);
     let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let rate = cycle_rate();
 
     let mut child = Guard(
         Command::new(&exe)
@@ -152,7 +236,11 @@ fn processes_page_overhead() {
             step: Step::Page("Processes"),
         },
         Phase {
-            name: "Hidden (suspended) after Processes",
+            name: "History shown",
+            step: Step::Page("History"),
+        },
+        Phase {
+            name: "Hidden (suspended)",
             step: Step::Suspend,
         },
     ];
@@ -197,7 +285,7 @@ fn processes_page_overhead() {
         loop {
             let now = Instant::now();
             if cpu_start.is_none() && now >= measure_from {
-                cpu_start = Some((cpu_time(&child.0), now));
+                cpu_start = Some((cycles(&child.0), now, threads(child.0.id())));
                 frames = 0;
             }
             if now >= end {
@@ -252,8 +340,9 @@ fn processes_page_overhead() {
                 Err(RecvTimeoutError::Disconnected) => panic!("the add-on exited"),
             }
         }
-        let (cpu0, t0) = cpu_start.expect("measured");
-        let cpu = cpu_time(&child.0).saturating_sub(cpu0).as_secs_f64();
+        let (cpu0, t0, threads0) = cpu_start.expect("measured");
+        let cpu = cycles(&child.0).saturating_sub(cpu0) as f64 / rate;
+        let by_thread = per_name(&threads0, &threads(child.0.id()));
         let wall = t0.elapsed().as_secs_f64();
         let (working_set, private) = memory(&child.0);
         results.push(Result {
@@ -263,13 +352,16 @@ fn processes_page_overhead() {
             frames_per_sec: frames as f64 / wall,
             working_set,
             private,
+            threads: by_thread,
+            wall,
         });
     }
     let _ = writer.write(&HostMessage::Quit);
 
     println!(
-        "\n{exe}\n{secs} s per phase after {} s warm-up, {logical} logical CPUs\n",
-        WARM_UP.as_secs()
+        "\n{exe}\n{secs} s per phase after {} s warm-up, {logical} logical CPUs, {:.2} GHz cycle rate\n",
+        WARM_UP.as_secs(),
+        rate / 1e9
     );
     println!(
         "| Phase | CPU (of machine) | CPU (of one core) | Frames/s | Working set | Private bytes |"
@@ -285,5 +377,21 @@ fn processes_page_overhead() {
             mb(r.working_set),
             mb(r.private)
         );
+    }
+    println!("\nCPU per thread, % of one core:\n");
+    let names: std::collections::BTreeSet<&String> =
+        results.iter().flat_map(|r| r.threads.keys()).collect();
+    let head: Vec<&str> = results.iter().map(|r| r.name).collect();
+    println!("| Thread | {} |", head.join(" | "));
+    println!("|---|{}", "---|".repeat(results.len()));
+    for name in names {
+        let cells: Vec<String> = results
+            .iter()
+            .map(|r| {
+                let c = r.threads.get(name).copied().unwrap_or_default();
+                format!("{:.2}%", c as f64 / rate / r.wall * 100.0)
+            })
+            .collect();
+        println!("| {name} | {} |", cells.join(" | "));
     }
 }

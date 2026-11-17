@@ -28,7 +28,8 @@ use protected_processes::Parent;
 use toolboks_shared::format::{friendly_name, rate, size_plain, uptime};
 use toolboks_shared::ui::{
     body_cell, header_cell, inspector_edge, inspector_frame, row_rule, switch_row, table_style,
-    CARD_PAD, DATA_CPU, DATA_DISK, DATA_GPU, DATA_MEMORY, GAP, MUTED, RED, SPACE_M, TEXT_SECTION,
+    CARD_PAD, DATA_CPU, DATA_DISK, DATA_GPU, DATA_MEMORY, DATA_NETWORK, GAP, MUTED, RED, SPACE_M,
+    TEXT_SECTION,
 };
 use toolboks_shared::win::Handle;
 
@@ -88,6 +89,8 @@ struct Proc {
     /// GPU load, percent 0 to 100, from the main sampler's latest GPU reading; None while there
     /// is no reading (or no usable GPU).
     gpu: Option<f32>,
+    /// Open TCP and UDP connections owned by the process; None when the tables could not be read.
+    conns: Option<u32>,
     run_secs: u64,
     exe: Option<String>,
     /// The parent this refresh vouched for (to protect children of game launchers). A parent
@@ -111,6 +114,8 @@ struct Row {
     disk: Option<f64>,
     /// Sum of the GPU loads in the row, capped at 100 (the Overview GPU card's rule).
     gpu: Option<f32>,
+    /// Open connections of every process in the row.
+    conns: Option<u32>,
     run_secs: u64,
     exe: Option<String>,
     /// Parent of the first process in the row.
@@ -127,6 +132,7 @@ enum SortKey {
     Memory,
     Disk,
     Gpu,
+    Connections,
 }
 
 /// True for processes Windows needs, this app itself, and game, launcher and anti-cheat
@@ -201,6 +207,10 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     (Some(a), Some(b)) => Some((a + b).min(100.0)),
                     (a, b) => a.or(b),
                 };
+                r.conns = match (r.conns, p.conns) {
+                    (Some(a), Some(b)) => Some(a.saturating_add(b)),
+                    (a, b) => a.or(b),
+                };
                 r.run_secs = r.run_secs.max(p.run_secs);
                 if r.exe.is_none() {
                     r.exe = p.exe.clone();
@@ -219,6 +229,7 @@ fn build_rows(procs: &[Proc], grouped: bool, protected: &dyn Fn(&Proc) -> bool) 
                     mem: p.mem,
                     disk: p.disk,
                     gpu: p.gpu.map(|g| g.min(100.0)),
+                    conns: p.conns,
                     run_secs: p.run_secs,
                     exe: p.exe.clone(),
                     parent: p.parent.clone(),
@@ -240,6 +251,7 @@ fn sort_rows(rows: &mut [Row], key: SortKey, descending: bool) {
             SortKey::Memory => a.mem.cmp(&b.mem),
             SortKey::Disk => a.disk.unwrap_or(0.0).total_cmp(&b.disk.unwrap_or(0.0)),
             SortKey::Gpu => a.gpu.unwrap_or(0.0).total_cmp(&b.gpu.unwrap_or(0.0)),
+            SortKey::Connections => a.conns.unwrap_or(0).cmp(&b.conns.unwrap_or(0)),
         };
         let ord = if descending { ord.reverse() } else { ord };
         ord.then_with(|| a.lower_name.cmp(&b.lower_name))
@@ -320,6 +332,24 @@ fn gpu_text(gpu: Option<f32>) -> String {
     gpu.map_or_else(|| "...".to_string(), |g| format!("{g:.1}%"))
 }
 
+fn conns_text(conns: Option<u32>) -> String {
+    conns.map_or_else(|| "...".to_string(), |n| n.to_string())
+}
+
+/// Header hover of the Connections column. Windows has no per-app network speed without admin
+/// rights (#37), so the column counts connections and says so.
+const CONNECTIONS_HINT: &str = "Open network connections (TCP and UDP, every state) per app, \
+     the same list as the Connections page. This is a count, not traffic: Windows does not \
+     report network use per app without administrator rights.";
+
+/// Gives each process its open-connection count; `None` for all when the tables could not be
+/// read. A process missing from the tables has none.
+fn apply_conns(procs: &mut [Proc], by_pid: Option<&std::collections::HashMap<u32, u32>>) {
+    for p in procs {
+        p.conns = by_pid.map(|m| m.get(&p.pid).copied().unwrap_or(0));
+    }
+}
+
 /// Gives each process its GPU load from the newest per-pid reading (`None` while there is no
 /// reading). A process missing from the reading uses no GPU.
 fn apply_gpu(procs: &mut [Proc], by_pid: Option<&std::collections::HashMap<u32, f32>>) {
@@ -380,6 +410,8 @@ const CPU_SHADE: [f64; SHADE_STEPS] = [1.0, 10.0, 25.0, 50.0];
 const MEM_SHADE: [f64; SHADE_STEPS] = [1.0, 5.0, 10.0, 25.0];
 /// GPU: percent of the GPU's busiest engine, the same steps as CPU.
 const GPU_SHADE: [f64; SHADE_STEPS] = CPU_SHADE;
+/// Connections: open connections (5, 20, 50 and 100).
+const CONN_SHADE: [f64; SHADE_STEPS] = [5.0, 20.0, 50.0, 100.0];
 /// Disk: bytes per second (0.1, 1, 10 and 100 MB/s).
 const DISK_SHADE: [f64; SHADE_STEPS] = [100_000.0, 1_000_000.0, 10_000_000.0, 100_000_000.0];
 /// Tint opacity per level (of 255). Low enough that the plain text stays readable on top, in a
@@ -798,6 +830,8 @@ struct Snapshot {
     procs: Vec<Proc>,
     /// False until the second refresh, when CPU percentages become real.
     cpu_ready: bool,
+    /// Every open TCP and UDP connection on the PC; None when the tables could not be read.
+    conns_total: Option<u32>,
 }
 
 struct Worker {
@@ -875,6 +909,7 @@ impl Worker {
                                 mem: p.memory(),
                                 disk,
                                 gpu: None,
+                                conns: None,
                                 run_secs: p.run_time(),
                                 exe: p.exe().map(|e| e.display().to_string()),
                                 parent: Parent::Unverified,
@@ -883,12 +918,16 @@ impl Worker {
                         })
                         .unzip();
                     link_parents(&mut procs, &parent_pids);
+                    let conns = crate::connections::count_per_pid().ok();
+                    apply_conns(&mut procs, conns.as_ref());
+                    let conns_total = conns.map(|m| m.values().sum());
                     disk_baseline.commit(procs.iter().filter_map(|p| p.identity));
                     ready = was_primed;
                     if tx
                         .send(Snapshot {
                             procs,
                             cpu_ready: ready,
+                            conns_total,
                         })
                         .is_err()
                     {
@@ -939,6 +978,8 @@ pub(super) struct Page {
     worker: Option<Worker>,
     live: Arc<Vec<Proc>>,
     cpu_ready: bool,
+    /// Connections header total of the newest snapshot.
+    conns_total: Option<u32>,
     frozen: Option<Arc<Vec<Proc>>>,
     rows: Option<Arc<Vec<Row>>>,
     visible_rows: Option<(String, SortKey, bool, Arc<Vec<Row>>)>,
@@ -967,6 +1008,7 @@ impl Page {
             worker: None,
             live: Arc::default(),
             cpu_ready: false,
+            conns_total: None,
             frozen: None,
             rows: None,
             visible_rows: None,
@@ -1000,6 +1042,7 @@ impl Page {
                 apply_gpu(&mut procs, self.gpu.as_ref());
                 self.live = Arc::new(procs);
                 self.cpu_ready = snap.cpu_ready;
+                self.conns_total = snap.conns_total;
                 if self.frozen.is_none() {
                     self.rows = None;
                 }
@@ -1234,6 +1277,7 @@ impl Page {
         let (sort_key, descending, grouped) = (self.sort_key, self.descending, self.was_grouped);
         let selection = &self.selection;
         let ready = self.cpu_ready;
+        let conns_total = self.conns_total;
         let mem_total = totals.map_or(0, |t| t.mem_total);
         let modifiers = ui.input(|i| i.modifiers);
 
@@ -1243,15 +1287,17 @@ impl Page {
             .sense(Sense::click())
             .auto_shrink([false, false])
             .column(Column::exact(22.0))
-            .column(Column::remainder().at_least(110.0).clip(true));
+            .column(Column::remainder().at_least(90.0).clip(true));
         if !grouped {
-            table = table.column(Column::exact(56.0));
+            table = table.column(Column::exact(52.0));
         }
+        // Sized so every column fits next to the inspector at the smallest window (1060 px).
         table
-            .column(Column::exact(64.0))
-            .column(Column::exact(84.0))
-            .column(Column::exact(80.0))
-            .column(Column::exact(60.0))
+            .column(Column::exact(56.0))
+            .column(Column::exact(76.0))
+            .column(Column::exact(76.0))
+            .column(Column::exact(52.0))
+            .column(Column::exact(76.0))
             .header(HEADER_HEIGHT, |mut header| {
                 header.col(|_| {});
                 // The caption sorts; the system total sits under it, right-aligned, and is
@@ -1299,6 +1345,15 @@ impl Page {
                     let total = totals.and_then(|t| t.gpu_text());
                     sort_click = with_total(ui, "GPU", SortKey::Gpu, total).or(sort_click)
                 });
+                header.col(|ui| {
+                    let total = conns_total.map(|n| n.to_string());
+                    sort_click =
+                        with_total(ui, "Connections", SortKey::Connections, total).or(sort_click);
+                    let cell = ui.response();
+                    if cell.contains_pointer() {
+                        cell.show_tooltip_text(CONNECTIONS_HINT);
+                    }
+                });
             })
             .body(|mut body| {
                 let rule = body.ui_mut().painter().clone();
@@ -1343,6 +1398,10 @@ impl Page {
                     row.col(|ui| shaded(ui, DATA_DISK, disk_level, disk_text(r.disk)));
                     let gpu_level = r.gpu.map_or(0, |g| shade_level(f64::from(g), &GPU_SHADE));
                     row.col(|ui| shaded(ui, DATA_GPU, gpu_level, gpu_text(r.gpu)));
+                    let conn_level = r
+                        .conns
+                        .map_or(0, |n| shade_level(f64::from(n), &CONN_SHADE));
+                    row.col(|ui| shaded(ui, DATA_NETWORK, conn_level, conns_text(r.conns)));
                     let response = row.response();
                     row_rule(&rule, response.rect);
                     if response.clicked() && click.is_none() {
@@ -1370,7 +1429,11 @@ impl Page {
                 // Names and pids read naturally upwards, numbers biggest first.
                 self.descending = matches!(
                     key,
-                    SortKey::Cpu | SortKey::Memory | SortKey::Disk | SortKey::Gpu
+                    SortKey::Cpu
+                        | SortKey::Memory
+                        | SortKey::Disk
+                        | SortKey::Gpu
+                        | SortKey::Connections
                 );
             }
         }
@@ -1429,6 +1492,10 @@ impl Page {
             .map(|g| g.min(100.0));
         if let Some(gpu) = gpu {
             kv(ui, "GPU", &gpu_text(Some(gpu)));
+        }
+        let conns: Option<u32> = selected.iter().filter_map(|r| r.conns).reduce(|a, b| a + b);
+        if let Some(conns) = conns {
+            kv(ui, "Connections", &conns.to_string());
         }
         if let [one] = selected.as_slice() {
             kv(ui, "Running for", &uptime(one.run_secs));
@@ -1616,6 +1683,7 @@ mod tests {
             mem,
             disk: None,
             gpu: None,
+            conns: None,
             run_secs: pid as u64,
             exe: None,
             parent: ok(),
@@ -1717,6 +1785,41 @@ mod tests {
         assert!(build_rows(&procs, true, &none)
             .iter()
             .all(|r| r.gpu.is_none()));
+    }
+
+    #[test]
+    fn connections_are_counted_per_process_and_summed_per_group() {
+        let mut procs = vec![
+            p(10, "chrome.exe", 0.0, 0),
+            p(11, "Chrome.exe", 0.0, 0),
+            p(20, "code.exe", 0.0, 0),
+            p(30, "notepad.exe", 0.0, 0),
+        ];
+        let by_pid: std::collections::HashMap<u32, u32> =
+            [(10, 12), (11, 3), (20, 1), (999, 40)].into();
+        apply_conns(&mut procs, Some(&by_pid));
+        let rows = build_rows(&procs, true, &none);
+        let get = |name: &str| rows.iter().find(|r| r.lower_name == name).unwrap().conns;
+        assert_eq!(get("chrome.exe"), Some(15));
+        assert_eq!(get("code.exe"), Some(1));
+        // Not in the tables: no connections, not unknown.
+        assert_eq!(get("notepad.exe"), Some(0));
+        let mut flat = build_rows(&procs, false, &none);
+        sort_rows(&mut flat, SortKey::Connections, true);
+        let order: Vec<u32> = flat.iter().map(|r| r.pid).collect();
+        assert_eq!(order, vec![10, 11, 20, 30]);
+        // The tables could not be read: unknown everywhere.
+        apply_conns(&mut procs, None);
+        assert!(build_rows(&procs, true, &none)
+            .iter()
+            .all(|r| r.conns.is_none()));
+        assert_eq!(conns_text(None), "...");
+        assert_eq!(conns_text(Some(7)), "7");
+        assert_eq!(shade_level(4.0, &CONN_SHADE), 0);
+        assert_eq!(shade_level(20.0, &CONN_SHADE), 2);
+        assert_eq!(shade_level(500.0, &CONN_SHADE), 4);
+        // The hover says plainly it is a count, not traffic.
+        assert!(CONNECTIONS_HINT.contains("not traffic"));
     }
 
     #[test]

@@ -224,8 +224,8 @@ administrator rights. The live graphs live in memory while the add-on is shown.
   figures; never paths, window titles or command lines) to
   `addon-data/toolboks.resource-monitor/history/` in the Toolboks data folder: every step for the
   last hour, per-minute buckets for 24 hours, 5-minute buckets, app starts and exits for 7 days.
-  Append-only files split by time, written once a minute, pruned on start and every hour; about
-  8 MB for a full week (budget 20 MB). Nothing is sent anywhere. The manifest's `data_note`
+  Append-only files split by time, written once a minute, pruned on start and every hour; at
+  most about 7 MB for a full week (budget 20 MB; 6.8 MB in the worst-case test). Nothing is sent anywhere. The manifest's `data_note`
   says so in the install review. The switch, size, Delete history and Open history folder come
   with #45; until then recording is off by default.
 - The guided tour has the same 22 steps.

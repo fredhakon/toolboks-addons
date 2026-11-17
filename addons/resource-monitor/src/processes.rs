@@ -35,6 +35,7 @@ use toolboks_shared::win::Handle;
 
 use crate::lower_confirm::{is_confirmed, lower_text, settle, Pending};
 
+mod graphs;
 mod groups;
 use groups::Kind;
 
@@ -572,6 +573,28 @@ pub(super) fn confirm_text(label: &str, count: usize) -> String {
     } else {
         format!("End {count} processes of {label}? Unsaved work in them will be lost.")
     }
+}
+
+/// The selected row's values for its graphs, from the newest snapshot: a name key sums every
+/// process of that name, a pid key is one process. NaN where unknown, all NaN when the row's
+/// processes have exited (a gap in the graphs).
+fn row_values(procs: &[Proc], key: &str, cpu_ready: bool) -> graphs::Values {
+    let merged = !key.starts_with("pid:");
+    let matching: Vec<Proc> = procs
+        .iter()
+        .filter(|p| row_key(merged, p) == key)
+        .cloned()
+        .collect();
+    let Some(r) = build_rows(&matching, merged, &|_| false).into_iter().next() else {
+        return [f32::NAN; 5];
+    };
+    [
+        if cpu_ready { r.cpu } else { f32::NAN },
+        r.mem as f32,
+        r.disk.map_or(f32::NAN, |d| d as f32),
+        r.gpu.unwrap_or(f32::NAN),
+        r.conns.map_or(f32::NAN, |n| n as f32),
+    ]
 }
 
 /// Plain text for the clipboard: one line per row.
@@ -1273,6 +1296,8 @@ enum Intent {
     Restore,
     Copy(String),
     Open(String),
+    /// Show this exe name on the History page.
+    OpenHistory(String),
 }
 
 pub(super) struct Page {
@@ -1308,6 +1333,10 @@ pub(super) struct Page {
     lines: Vec<String>,
     /// Newest per-pid GPU load from the main sampler; None until a reading with a GPU arrives.
     gpu: Option<std::collections::HashMap<u32, f32>>,
+    /// Graphs of the single selected row; None when no single row is selected.
+    own: Option<graphs::OwnGraphs>,
+    /// An "Open in history" click, waiting for the add-on to switch pages.
+    open_history: Option<String>,
 }
 
 #[cfg(test)]
@@ -1343,6 +1372,31 @@ impl Page {
             job: None,
             lines: Vec::new(),
             gpu: None,
+            own: None,
+            open_history: None,
+        }
+    }
+
+    /// The exe name of an "Open in history" click, once.
+    pub(super) fn take_open_history(&mut self) -> Option<String> {
+        self.open_history.take()
+    }
+
+    /// The key of the selected row when exactly one row is selected.
+    fn single_key(&self) -> Option<String> {
+        match self.selection.keys.len() {
+            1 => self.selection.keys.iter().next().cloned(),
+            _ => None,
+        }
+    }
+
+    /// Starts, keeps or drops the selected row's graphs, and fills new ones with the current
+    /// reading so they never start blank.
+    fn follow_graphs(&mut self) {
+        let key = self.single_key();
+        graphs::follow(&mut self.own, key.as_deref());
+        if let Some(own) = self.own.as_mut().filter(|g| g.is_empty()) {
+            own.push(row_values(&self.live, own.key(), self.cpu_ready));
         }
     }
 
@@ -1363,6 +1417,9 @@ impl Page {
                 self.conns_total = snap.conns_total;
                 if self.frozen.is_none() {
                     self.rows = None;
+                }
+                if let Some(own) = self.own.as_mut() {
+                    own.push(row_values(&self.live, own.key(), self.cpu_ready));
                 }
             }
             if self.rows.is_none() && self.frozen.is_none() {
@@ -1452,6 +1509,7 @@ impl Page {
         if let Some(intent) = intent {
             self.apply(intent, ui.ctx(), &procs, &protected);
         }
+        self.follow_graphs();
     }
 
     /// The processes behind the selected rows: a merged row stands for every process of its
@@ -1529,6 +1587,7 @@ impl Page {
             }
             Intent::Copy(text) => ctx.copy_text(text),
             Intent::Open(path) => open_location(&path),
+            Intent::OpenHistory(name) => self.open_history = Some(name),
         }
     }
 
@@ -1764,7 +1823,8 @@ impl Page {
                                     click = Some(Click::Expand(r.key.clone()));
                                 }
                             } else {
-                                ui.add_space(toggle.x);
+                                // The button is followed by the usual gap; match it.
+                                ui.add_space(toggle.x + ui.spacing().item_spacing.x);
                             }
                         }
                         let l = body_cell(ui, display_name(r), false, r.protected);
@@ -1909,6 +1969,10 @@ impl Page {
             if let Some(path) = &one.exe {
                 kv(ui, "Path", path);
             }
+            if let Some(own) = self.own.as_ref().filter(|g| g.key() == one.key) {
+                ui.add_space(4.0);
+                graphs::ui(ui, own);
+            }
         }
 
         let chosen = self.selected_procs(procs);
@@ -2041,6 +2105,13 @@ impl Page {
                 if ui.button("Open file location").clicked() {
                     intent = Some(Intent::Open(path.clone()));
                 }
+            }
+            if ui
+                .button("Open in history")
+                .on_hover_text("See what this app used over time on the History page")
+                .clicked()
+            {
+                intent = Some(Intent::OpenHistory(one.name.clone()));
             }
         }
         if self.job.is_some() {
@@ -2313,6 +2384,45 @@ mod tests {
     }
 
     #[test]
+    fn the_selected_rows_graphs_follow_the_selection_and_read_its_processes() {
+        let mut page = Page::new();
+        page.live = Arc::new(typed());
+        page.cpu_ready = true;
+        page.only_for_test("chrome.exe");
+        page.follow_graphs();
+        let own = page.own.as_ref().expect("one row selected: graphs");
+        assert_eq!(own.key(), "chrome.exe");
+        // Two chrome processes: 1 + 4 % CPU, 100 + 300 bytes.
+        let v = row_values(&page.live, "chrome.exe", true);
+        assert_eq!((v[0], v[1]), (5.0, 400.0));
+        let one = row_key(false, &page.live[1]);
+        let v = row_values(&page.live, &one, true);
+        assert_eq!((v[0], v[1]), (4.0, 300.0));
+        // Not ready yet, unknown disk, a row whose processes exited: gaps, not zeros.
+        assert!(row_values(&page.live, "chrome.exe", false)[0].is_nan());
+        assert!(row_values(&page.live, "chrome.exe", true)[2].is_nan());
+        assert!(row_values(&page.live, "gone.exe", true)
+            .iter()
+            .all(|v| v.is_nan()));
+        // Two rows selected, or none: nothing is kept.
+        page.selection.toggle("updater.exe");
+        page.follow_graphs();
+        assert!(page.own.is_none());
+        page.selection.clear();
+        page.follow_graphs();
+        assert!(page.own.is_none());
+    }
+
+    #[test]
+    fn open_in_history_hands_the_exe_name_over_once() {
+        let mut page = Page::new();
+        let ctx = egui::Context::default();
+        page.apply(Intent::OpenHistory("chrome.exe".into()), &ctx, &[], &none);
+        assert_eq!(page.take_open_history().as_deref(), Some("chrome.exe"));
+        assert_eq!(page.take_open_history(), None);
+    }
+
+    #[test]
     fn system_names_are_windows_processes_but_toolboks_is_not() {
         assert!(is_system(4, "System"));
         assert!(is_system(900, "csrss.exe"));
@@ -2478,6 +2588,13 @@ mod tests {
             assert!(count.right() <= inspector_left, "{count:?}");
             if view == View::ByType {
                 find("Apps (1)");
+                // Names line up whether or not the row has an open button in front.
+                let merged = find("Chrome (2)");
+                let single = find("Updater");
+                assert!(
+                    (merged.left() - single.left()).abs() < 0.5,
+                    "{merged:?} {single:?}"
+                );
                 find("Background processes (1)");
                 find("Windows processes (2)");
             } else {

@@ -95,6 +95,12 @@ impl Page {
             lanes: egui::Rect::NOTHING,
         }
     }
+
+    /// Selects an app as if it was picked in the apps table, so the timeline draws it. Used by
+    /// the Processes page's "Open in history"; Hide clears it as usual.
+    pub(crate) fn show_app(&mut self, name: &str) {
+        self.selected_app = Some(name.to_string());
+    }
 }
 
 /// Wall clock, UTC ms, rounded down to whole seconds so a live view asks once per period.
@@ -906,7 +912,8 @@ mod tests {
             },
             ..Default::default()
         });
-        page.selected_app = Some("chrome.exe".into());
+        page.show_app("chrome.exe");
+        assert_eq!(page.selected_app.as_deref(), Some("chrome.exe"));
         for by in [Resource::Cpu, Resource::Disk] {
             page.apps_by = by;
             frame(&ctx, &mut page, vec![], egui::Modifiers::NONE);

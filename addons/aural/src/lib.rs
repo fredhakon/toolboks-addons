@@ -2,7 +2,7 @@
 mod routing;
 mod settings;
 mod timeline;
-use settings::{AudioPreferences, DeviceIdentity, Discovery};
+use settings::{AudioPreferences, DeviceIdentity, Discovery, Recovery};
 
 use std::collections::BTreeMap;
 use std::sync::{
@@ -249,6 +249,20 @@ impl Device {
         Self { device, name }
     }
 
+    /// The same endpoint, looked up again without opening it. Listed devices can be hours old
+    /// and still hold the audio client CPAL activated while sorting inputs from outputs; after
+    /// a format change or driver reset that client is invalid and every open would fail.
+    /// A fresh device activates a new client when the stream is built.
+    fn fresh(&self) -> cpal::Device {
+        cpal::default_host()
+            .devices()
+            .ok()
+            .and_then(|devices| {
+                fresh_match(self, devices.map(Device::listed), Device::same_endpoint)
+            })
+            .map_or_else(|| self.device.clone(), |device| device.device)
+    }
+
     fn same_endpoint(&self, other: &Self) -> bool {
         #[cfg(windows)]
         {
@@ -266,6 +280,17 @@ impl Device {
         // ambiguous names rather than switching to an arbitrary microphone.
         self.name == other.name
     }
+}
+
+/// The single current entry for `listed`'s endpoint, if there is exactly one.
+fn fresh_match<T>(
+    listed: &T,
+    current: impl Iterator<Item = T>,
+    same: impl Fn(&T, &T) -> bool,
+) -> Option<T> {
+    let mut matches = current.filter(|item| same(listed, item));
+    let found = matches.next()?;
+    matches.next().is_none().then_some(found)
 }
 
 fn refreshed_selection<T>(
@@ -307,6 +332,8 @@ pub struct Aural {
     manual_disabled: bool,
     default_was_available: bool,
     route_intent: [bool; 2],
+    recovery: Recovery,
+    discovery_restart: Recovery,
     settings_update_requested: bool,
     loaded: bool,
     inputs: Vec<Device>,
@@ -342,6 +369,8 @@ impl Default for Aural {
             manual_disabled: false,
             default_was_available: false,
             route_intent: [false; 2],
+            recovery: Recovery::default(),
+            discovery_restart: Recovery::default(),
             settings_update_requested: false,
             loaded: false,
             inputs: Vec::new(),
@@ -461,7 +490,7 @@ impl Aural {
             .selected_input
             .and_then(|i| self.inputs.get(i))
             .ok_or("Choose a microphone first.")?;
-        self.input = Some(Input::open(&device.device, self.gain_db).map_err(|e| {
+        self.input = Some(Input::open(&device.fresh(), self.gain_db).map_err(|e| {
             Fault::new(
                 "Could not open the microphone. Check the device and Windows microphone access.",
                 &e,
@@ -506,7 +535,7 @@ impl Aural {
                 "Choose your physical microphone before sending audio to a virtual cable.".into(),
             );
         }
-        let device = output.device.clone();
+        let device = output.fresh();
         let started_input = self.input.is_none();
         if started_input {
             self.enable_input()?;
@@ -538,6 +567,20 @@ impl Aural {
             error,
         });
         Ok(())
+    }
+
+    /// Discovery no longer sends an unchanged device list every pass, so a lost stream asks
+    /// for one. Repeated losses back off (see `Recovery`) instead of rebuilding a failing
+    /// stream every 2 seconds.
+    fn retry_lost_streams(&mut self, lost: bool, now: Instant) {
+        if lost {
+            self.recovery.lost(now);
+        }
+        if self.recovery.due(now) {
+            if let Some(discovery) = &self.discovery {
+                discovery.rescan();
+            }
+        }
     }
 
     fn sample(&mut self) {
@@ -1212,9 +1255,11 @@ impl NativeAddon for Aural {
             .input
             .as_ref()
             .and_then(|input| input.signal.error.lock().unwrap().take());
+        let mut lost = false;
         if let Some(raw) = error {
             self.cancel();
             self.mic_fault = Some(Fault::new(MICROPHONE_LOST, &raw));
+            lost = true;
         }
         for index in 0..2 {
             let error = self.routes[index]
@@ -1223,8 +1268,10 @@ impl NativeAddon for Aural {
             if let Some(raw) = error {
                 self.stop_route(index);
                 self.route_errors[index] = Some(Fault::new(OUTPUT_LOST, &raw));
+                lost = true;
             }
         }
+        self.retry_lost_streams(lost, Instant::now());
     }
 
     fn cancel(&mut self) {
@@ -1646,6 +1693,23 @@ mod tests {
         assert_eq!(signal.peaks[0].load(Relaxed), 0);
         assert!(!signal.clipped.load(Relaxed));
         assert_eq!(bridge.lock().unwrap().next(), [1.0; 2]);
+    }
+
+    #[test]
+    fn streams_open_on_the_one_current_entry_for_an_endpoint() {
+        // Endpoint IDs stand in for devices: a reopened stream uses today's entry for the same
+        // endpoint, never an old one and never a guess between duplicates.
+        let same = |a: &(&str, u32), b: &(&str, u32)| a.0 == b.0;
+        let listed = ("{mic}", 1);
+        assert_eq!(
+            fresh_match(&listed, [("{spk}", 2), ("{mic}", 2)].into_iter(), same),
+            Some(("{mic}", 2))
+        );
+        assert_eq!(fresh_match(&listed, [("{spk}", 2)].into_iter(), same), None);
+        assert_eq!(
+            fresh_match(&listed, [("{mic}", 2), ("{mic}", 3)].into_iter(), same),
+            None
+        );
     }
 
     #[test]

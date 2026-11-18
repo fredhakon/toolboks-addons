@@ -188,6 +188,8 @@ pub struct Action {
     pub reveal: Option<usize>,
     pub delete: Option<usize>,
     pub copy: Option<usize>,
+    /// A click on the empty space of the map: open the Space explorer.
+    pub explore: bool,
 }
 fn menu_key(input: &mut egui::InputState) -> bool {
     input.consume_key(egui::Modifiers::SHIFT, egui::Key::F10)
@@ -206,10 +208,15 @@ pub fn show(ui: &mut egui::Ui, layout: &MapLayout, state: &mut Interaction, heig
         return Action::default();
     }
     let mut action = Action::default();
-    let (area, _) = ui.allocate_exact_size(
+    let (area, background) = ui.allocate_exact_size(
         Vec2::new(ui.available_width().max(MIN_SIDE), height),
-        egui::Sense::hover(),
+        egui::Sense::click(),
     );
+    // Tiles sit on top; only the gaps between them reach the map itself.
+    if background.clicked() {
+        action.explore = true;
+    }
+    background.on_hover_text("Click to open the space explorer");
     let placed = layout.place(area.size());
     let mut grouped = 0;
     for tile in &placed {
@@ -506,6 +513,45 @@ mod tests {
             );
         }
         assert!(state.menu.is_none());
+    }
+    #[test]
+    fn a_click_between_tiles_opens_the_explorer_and_a_tile_click_does_not() {
+        let ctx = egui::Context::default();
+        let n = [node(0, 10), node(1, 10)];
+        let layout = MapLayout::new(&n.iter().collect::<Vec<_>>());
+        let mut state = Interaction::default();
+        let mut click = |pos: egui::Pos2| {
+            let mut explore = false;
+            for pressed in [None, Some(true), Some(false)] {
+                let events = pressed.map_or(vec![], |pressed| {
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ]
+                });
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(700.0, 600.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| explore |= show(ui, &layout, &mut state, 300.0).explore,
+                );
+                out.textures_delta.clear();
+            }
+            explore
+        };
+        // Two equal tiles side by side: the gap is in the middle.
+        assert!(click(egui::pos2(350.0, 150.0)));
+        assert!(!click(egui::pos2(100.0, 150.0)));
     }
     fn node(id: usize, bytes: u64) -> Node {
         Node {

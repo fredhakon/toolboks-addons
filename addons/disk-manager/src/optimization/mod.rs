@@ -4,6 +4,14 @@ pub(super) use backend::prepare_admin;
 use backend::{Action, Analysis, Media, Metadata, Shared, Volume};
 use toolboks_addon_sdk::{Capability, HostRequest};
 
+pub(super) fn media_label(letter: &str) -> &'static str {
+    match backend::media(letter) {
+        Media::Hdd => "HDD",
+        Media::Ssd => "SSD",
+        Media::Unknown => "Type unavailable",
+    }
+}
+
 pub(super) struct Panel {
     service: backend::Service,
     selected: String,
@@ -147,17 +155,33 @@ impl Panel {
         if self.pending.is_some() || state.refreshing || state.job.is_some() {
             ui.request_repaint_after(Duration::from_millis(250));
         }
-        theme::title(ui, "Drive optimization");
-        weak(
-            ui,
-            "Check how fragmented a drive is, then defragment a hard drive or run TRIM on an SSD. Nothing starts until you confirm.",
-        );
+        ui.horizontal_wrapped(|ui| {
+            theme::title(ui, "Drive optimization");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        !state.refreshing && state.job.is_none(),
+                        theme::outlined("Refresh drive information"),
+                    )
+                    .clicked()
+                {
+                    backend::refresh(&self.service);
+                    crate::health::clear(&self.health);
+                }
+            });
+        });
+        weak(ui, "Check how fragmented a drive is, then defragment a hard drive or run TRIM on an SSD. Nothing starts until you confirm.");
         if tutorial {
             weak(ui, "Tutorial sample. No disk operation runs.");
         }
         ui.add_space(theme::SPACE_L);
         if !self.allowed {
-            card().show(ui,|ui|{ui.set_width(ui.available_width());theme::section(ui, "Optimization is turned off");weak(ui,"This version of Disk Manager can only read. Review the add-on update to allow analysis and optimization. You can still say no.");if ui.add(theme::outlined("Review Disk Manager update")).clicked(){self.request=Some(HostRequest::ReviewUpdate);}});
+            card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                theme::section(ui, "Optimization is turned off");
+                weak(ui, "This version of Disk Manager can only read. Review the add-on update to allow analysis and optimization. You can still say no.");
+                if ui.add(theme::outlined("Review Disk Manager update")).clicked() { self.request = Some(HostRequest::ReviewUpdate); }
+            });
             ui.add_space(theme::SPACE_L);
         }
         if let Some(m) = &state.metadata {
@@ -168,120 +192,28 @@ impl Panel {
                     .map(|v| v.letter.clone())
                     .unwrap_or_default();
             }
-            guide::region(ui, "optimize-drive", |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    egui::ComboBox::from_id_salt("optimize-volume")
-                        .width(270.0)
-                        .selected_text(
-                            m.volumes
-                                .iter()
-                                .find(|v| v.letter == self.selected)
-                                .map_or("Select a drive".into(), |v| {
-                                    format!("{}  {}", v.letter, v.label)
-                                }),
-                        )
-                        .show_ui(ui, |ui| {
-                            for v in &m.volumes {
-                                ui.selectable_value(
-                                    &mut self.selected,
-                                    v.letter.clone(),
-                                    format!("{}  {}", v.letter, v.label),
-                                );
-                            }
-                        });
-                    if ui
-                        .add_enabled(
-                            !state.refreshing && state.job.is_none(),
-                            theme::outlined("Refresh drive information"),
-                        )
-                        .clicked()
-                    {
-                        backend::refresh(&self.service);
-                        crate::health::clear(&self.health);
-                    }
-                })
-            });
-            if let Some(v) = m.volumes.iter().find(|v| v.letter == self.selected) {
-                ui.add_space(theme::SPACE_M);
-                weak(
-                    ui,
-                    format!(
-                        "{} · {} · {} free of {}",
-                        v.media.label(),
-                        v.filesystem,
-                        size(v.free),
-                        size(v.capacity)
-                    ),
-                );
-                weak(
-                    ui,
-                    format!("Drive information checked {} · local time", m.checked_at),
-                );
-                if v.media == Media::Unknown {
-                    weak(ui,"The hardware did not expose a reliable media type. Windows will choose its appropriate optimization.");
-                }
-                ui.add_space(theme::SPACE_L);
-                if !tutorial {
-                    crate::health::show(ui, &self.health, &v.letter);
-                    ui.add_space(theme::SPACE_L);
-                }
-                let report = state.reports.get(&v.device_id);
-                guide::region(ui, "optimize-fragmentation", |ui| {
-                    card().show(ui,|ui|{
-                    ui.set_width(ui.available_width());theme::section(ui,"Fragmentation");ui.add_space(theme::SPACE_S);
-                    ui.horizontal_wrapped(|ui|{for(label,value)in [("total fragmentation",report.and_then(|a|a.total_percent)),("file fragmentation",report.and_then(|a|a.file_percent)),("free-space fragmentation",report.and_then(|a|a.free_percent))]{theme::stat(ui,value.map_or("Not analyzed".into(),|n|format!("{n:.0}%")),label);}});
-                    if let Some(r)=report{weak(ui,format!("Analyzed {} · local time · snapshot, not a live reading",r.checked_at));weak(ui,format!("{} fragmented files of {}",r.fragmented_files.map_or("Unknown".into(),|n|n.to_string()),r.total_files.map_or("unknown".into(),|n|n.to_string())));if v.media==Media::Hdd{weak(ui,if r.recommended{"Windows recommended defragmentation at the time of analysis."}else{"Windows did not recommend defragmentation at the time of analysis."});}}
-                    else{weak(ui,"Analyze this drive to get a numeric report from Windows. Unavailable measurements are never shown as zero.");}
-                    if v.media==Media::Ssd{weak(ui,"Fragmentation is not an SSD health or wear score. TRIM tells the SSD which unused blocks can be reclaimed.");}
-                });
-                });
-                ui.add_space(theme::SPACE_L);
-                guide::region(ui, "optimize-history", |ui| {
-                    card().show(ui,|ui|{
-                    ui.set_width(ui.available_width());theme::section(ui,"Last recorded optimization");
-                    ui.columns(3,|cols|{for(col,(title,record))in cols.iter_mut().zip([("Latest Windows record",v.history.first()),("Last defrag",v.history.iter().find(|h|h.kind()=="Defrag")),("Last TRIM",v.history.iter().find(|h|h.kind()=="TRIM"))]){weak(col,title);if let Some(h)=record{col.label(&h.time);weak(col,format!("{} · {}",h.kind(),h.operation));col.label(RichText::new(&h.volume).small().weak()).on_hover_text(&h.utc);}else{col.label("No available record");}}});
-                    weak(ui,"Successful Windows optimization events for this drive letter · local time. Missing records do not mean the drive was never optimized. Available history is limited by Windows log retention.");
-                    if let Some(w)=&m.history_warning{theme::caption(ui,format!("Windows history could not be read: {w}"));}
-                });
-                });
-                ui.add_space(theme::SPACE_L);
-                guide::region(ui, "optimize-actions", |ui| {
-                    card().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        theme::section(ui, "Maintain this drive");
-                        if v.dirty {
-                            weak(ui, "Windows marked this filesystem as needing a check. Optimization is unavailable.");
-                        } else if !v.supported() {
-                            weak(ui, "Optimization is unavailable for this filesystem or drive state.");
-                        }
-                        if v.media == Media::Hdd && v.free as f64 / (v.capacity.max(1) as f64) < 0.15 {
-                            weak(ui, "Less than 15% free space. Windows may only partially defragment this drive.");
-                        }
-                        ui.add_space(theme::SPACE_M);
-                        let enabled = self.allowed && v.supported() && !self.busy() && !tutorial;
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.add_enabled_ui(enabled, |ui| theme::primary(ui, "Analyze fragmentation")).inner.clicked() {
-                                self.start(&v.letter, &v.device_id, Action::Analyze);
-                            }
-                            if ui.add_enabled(enabled, theme::outlined(v.action().label())).clicked() {
-                                self.start(&v.letter, &v.device_id, v.action());
-                            }
-                        });
-                        weak(ui, "A separate administrator window will show exactly what will happen. Confirm or cancel there.");
-                        weak(ui, "Windows runs maintenance in the background. It may continue after Toolboks closes.");
+            let width = ui.available_width();
+            let height = (ui.clip_rect().height() - 100.0).max(480.0);
+            if width >= 820.0 {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = theme::SPACE_L;
+                    ui.vertical(|ui| {
+                        ui.set_width(290.0);
+                        self.drive_list(ui, m, tutorial, height);
+                    });
+                    ui.vertical(|ui| {
+                        ui.set_width(width - 302.0);
+                        self.detail(ui, m, &state, tutorial, height);
                     });
                 });
             } else {
-                weak(
-                    ui,
-                    "No local fixed drives with drive letters are available.",
-                );
+                self.drive_list(ui, m, tutorial, 0.0);
+                ui.add_space(theme::SPACE_L);
+                self.detail(ui, m, &state, tutorial, 0.0);
             }
         } else {
             if state.refreshing {
-                ui.horizontal(|ui| {
-                    ui.label("Reading drive information and Windows history...");
-                });
+                weak(ui, "Reading drive information and Windows history...");
             }
             if ui
                 .add_enabled(
@@ -292,24 +224,254 @@ impl Panel {
             {
                 backend::refresh(&self.service);
             }
+            self.activity(ui, &state);
         }
-        ui.add_space(theme::SPACE_L);
-        guide::region(ui, "optimize-progress", |ui| {
-            card().show(ui,|ui|{
-            ui.set_width(ui.available_width());theme::section(ui,"Activity and Windows report");
-            if let Some(job)=&state.job{ui.label(format!("{} · {} · {}s",job.action.label(),job.letter,job.started.elapsed().as_secs()));if let Some(p)=job.phase_percent{ui.add(egui::ProgressBar::new(p/100.0).text(format!("Windows-reported percentage · {p:.0}%")));weak(ui,"Windows may report several phases; this is not an overall completion estimate.");}
-if !job.output.is_empty(){egui::ScrollArea::vertical().id_salt("optimize-output").max_height(180.0).show(ui,|ui|{ui.label(RichText::new(&job.output).monospace().size(12.0));});}}
-            else if self.pending.is_some(){weak(ui,"An administrator action is pending. Use its separate window to confirm or cancel.");}
-            else{weak(ui,"No Toolboks optimization is running.");}
-            if let Some(message)=&state.message{ui.label(message);}
-            if !state.last_output.is_empty(){egui::CollapsingHeader::new("Last Windows report").show(ui,|ui|{ui.label(RichText::new(&state.last_output).monospace().size(12.0));});}
-        });
-        });
         if tutorial {
             return false;
         }
         self.save_preferences(prefs)
     }
+    fn drive_list(&mut self, ui: &mut egui::Ui, m: &Metadata, tutorial: bool, height: f32) {
+        let list = card().inner_margin(8).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let bottom = ui.cursor().top() + height - 48.0;
+            theme::caption(ui, "Local drives");
+            ui.add_space(theme::SPACE_S);
+            for v in &m.volumes {
+                let selected = self.selected == v.letter;
+                let response = egui::Frame::new()
+                    .fill(if selected {
+                        toolboks_shared::ui::SELECTED_BG
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    })
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            theme::section(ui, &v.letter);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if tutorial {
+                                        theme::caption(ui, "Sample");
+                                    } else {
+                                        crate::health::status(ui, &self.health, &v.letter);
+                                    }
+                                },
+                            );
+                        });
+                        theme::bar(
+                            ui,
+                            1.0 - v.free as f32 / v.capacity.max(1) as f32,
+                            if selected {
+                                theme::ACCENT
+                            } else {
+                                theme::MUTED
+                            },
+                            5.0,
+                        );
+                        theme::caption(
+                            ui,
+                            format!(
+                                "{} \u{b7} {} \u{b7} {} free of {}",
+                                v.media.label(),
+                                v.filesystem,
+                                size(v.free),
+                                size(v.capacity)
+                            ),
+                        );
+                        if !v.label.is_empty() {
+                            theme::caption(ui, &v.label);
+                        }
+                    })
+                    .response
+                    .interact(egui::Sense::click());
+                theme::selectable_card(ui, &response, selected, &v.letter);
+                if response.clicked() {
+                    self.selected = v.letter.clone();
+                }
+            }
+            ui.add_space((bottom - ui.cursor().top()).max(theme::SPACE_M));
+            theme::caption(
+                ui,
+                format!(
+                    "Drive information checked {} \u{b7} local time",
+                    m.checked_at
+                ),
+            );
+        });
+        guide::mark(ui, "optimize-drive", list.response.rect);
+    }
+
+    fn detail(
+        &mut self,
+        ui: &mut egui::Ui,
+        m: &Metadata,
+        state: &Shared,
+        tutorial: bool,
+        height: f32,
+    ) {
+        card().inner_margin(egui::Margin::symmetric(24, 20)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let bottom = ui.cursor().top() + height - 40.0;
+            let Some(v) = m.volumes.iter().find(|v| v.letter == self.selected) else {
+                weak(ui, "No local fixed drives with drive letters are available.");
+                self.activity(ui, state);
+                return;
+            };
+            theme::section(ui, &v.letter);
+            weak(ui, format!("{} \u{b7} {}", v.media.label(), v.filesystem));
+            if v.media == Media::Unknown { weak(ui, "The hardware did not expose a reliable media type. Windows will choose its appropriate optimization."); }
+            ui.add_space(theme::SPACE_M);
+            if !tutorial { crate::health::show(ui, &self.health, &v.letter); }
+            Self::divider(ui);
+            let report = state.reports.get(&v.device_id);
+            guide::region(ui, "optimize-fragmentation", |ui| {
+                theme::section(ui, "Fragmentation");
+                ui.add_space(theme::SPACE_M);
+                let values = [
+                    ("total fragmentation", report.and_then(|a| a.total_percent)),
+                    ("file fragmentation", report.and_then(|a| a.file_percent)),
+                    ("free-space fragmentation", report.and_then(|a| a.free_percent)),
+                ];
+                let columns = if ui.available_width() >= 480.0 { 3 } else { 1 };
+                ui.columns(columns, |cols| {
+                    for (index, (label, value)) in values.into_iter().enumerate() {
+                        let ui = &mut cols[index % columns];
+                        ui.label(RichText::new(value.map_or("Not analyzed".into(), |n| format!("{n:.0}%"))).size(14.0).strong());
+                        theme::caption(ui, label);
+                        theme::bar(ui, value.unwrap_or(0.0) as f32 / 100.0, theme::MUTED, 8.0);
+                        ui.add_space(theme::SPACE_S);
+                    }
+                });
+                if let Some(r) = report {
+                    weak(ui, format!("Analyzed {} \u{b7} local time \u{b7} snapshot, not a live reading", r.checked_at));
+                    weak(ui, format!("{} fragmented files of {}", r.fragmented_files.map_or("Unknown".into(), |n| n.to_string()), r.total_files.map_or("unknown".into(), |n| n.to_string())));
+                    if v.media == Media::Hdd { weak(ui, if r.recommended { "Windows recommended defragmentation at the time of analysis." } else { "Windows did not recommend defragmentation at the time of analysis." }); }
+                } else { weak(ui, "Analyze this drive to get a numeric report from Windows. Unavailable measurements are never shown as zero."); }
+                if v.media == Media::Ssd { weak(ui, "Fragmentation is not an SSD health or wear score. TRIM tells the SSD which unused blocks can be reclaimed."); }
+            });
+            Self::divider(ui);
+            guide::region(ui, "optimize-history", |ui| {
+                theme::section(ui, "Last recorded optimization");
+                ui.add_space(theme::SPACE_M);
+                let columns = if ui.available_width() >= 540.0 { 3 } else { 1 };
+                ui.columns(columns, |cols| {
+                    for (index, (title, record)) in [
+                        ("Latest Windows record", v.history.first()),
+                        ("Last defrag", v.history.iter().find(|h| h.kind() == "Defrag")),
+                        ("Last TRIM", v.history.iter().find(|h| h.kind() == "TRIM")),
+                    ].into_iter().enumerate() {
+                        let ui = &mut cols[index % columns];
+                        theme::caption(ui, title);
+                        if let Some(h) = record {
+                            ui.label(RichText::new(&h.time).strong());
+                            weak(ui, format!("{} \u{b7} {}", h.kind(), h.operation));
+                            theme::caption(ui, &h.volume);
+                            ui.response().on_hover_text(&h.utc);
+                        } else { ui.label("No available record"); }
+                        ui.add_space(theme::SPACE_S);
+                    }
+                });
+                theme::caption(ui, "Successful Windows optimization events for this drive letter \u{b7} local time. Missing records do not mean the drive was never optimized. Available history is limited by Windows log retention.");
+                if let Some(w) = &m.history_warning { theme::caption(ui, format!("Windows history could not be read: {w}")); }
+            });
+            ui.add_space((bottom - ui.cursor().top() - 170.0).max(theme::SPACE_L));
+            ui.separator();
+            ui.add_space(theme::SPACE_L);
+            self.actions(ui, v, tutorial);
+            ui.add_space(theme::SPACE_M);
+            self.activity(ui, state);
+        });
+    }
+
+    fn divider(ui: &mut egui::Ui) {
+        ui.add_space(theme::SPACE_L);
+        ui.separator();
+        ui.add_space(theme::SPACE_L);
+    }
+
+    fn actions(&mut self, ui: &mut egui::Ui, v: &Volume, tutorial: bool) {
+        guide::region(ui, "optimize-actions", |ui| {
+            theme::section(ui, "Maintain this drive");
+            if v.dirty {
+                weak(ui, "Windows marked this filesystem as needing a check. Optimization is unavailable.");
+            } else if !v.supported() {
+                weak(
+                    ui,
+                    "Optimization is unavailable for this filesystem or drive state.",
+                );
+            }
+            if v.media == Media::Hdd && v.free as f64 / (v.capacity.max(1) as f64) < 0.15 {
+                weak(
+                    ui,
+                    "Less than 15% free space. Windows may only partially defragment this drive.",
+                );
+            }
+            ui.add_space(theme::SPACE_M);
+            let enabled = self.allowed && v.supported() && !self.busy() && !tutorial;
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled_ui(enabled, |ui| theme::primary(ui, "Analyze fragmentation"))
+                    .inner
+                    .clicked()
+                {
+                    self.start(&v.letter, &v.device_id, Action::Analyze);
+                }
+                for (label, action, available) in [
+                    ("TRIM", Action::Trim, v.media == Media::Ssd),
+                    ("Defrag", Action::Defrag, v.media == Media::Hdd),
+                ] {
+                    if ui
+                        .add_enabled(enabled && available, theme::outlined(label))
+                        .clicked()
+                    {
+                        self.start(&v.letter, &v.device_id, action);
+                    }
+                }
+                if v.media == Media::Unknown
+                    && ui
+                        .add_enabled(enabled, theme::outlined(v.action().label()))
+                        .clicked()
+                {
+                    self.start(&v.letter, &v.device_id, v.action());
+                }
+            });
+            if v.media == Media::Ssd {
+                theme::caption(ui, "Defrag is for hard drives; this drive is an SSD.");
+            } else if v.media == Media::Hdd {
+                theme::caption(ui, "TRIM is for SSDs; this drive is a hard drive.");
+            }
+            weak(ui, "A separate administrator window will show exactly what will happen. Confirm or cancel there.");
+            weak(ui, "Windows runs maintenance in the background. It may continue after Toolboks closes.");
+        });
+    }
+
+    fn activity(&self, ui: &mut egui::Ui, state: &Shared) {
+        let activity = egui::Frame::new().fill(toolboks_shared::ui::SELECTED_BG).corner_radius(6).inner_margin(egui::Margin::symmetric(10, 8)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section(ui, "Activity and Windows report");
+            if let Some(job) = &state.job {
+                ui.label(format!("{} \u{b7} {} \u{b7} {}s", job.action.label(), job.letter, job.started.elapsed().as_secs()));
+                if let Some(p) = job.phase_percent {
+                    ui.add(egui::ProgressBar::new(p / 100.0).text(format!("Windows-reported percentage \u{b7} {p:.0}%")));
+                    weak(ui, "Windows may report several phases; this is not an overall completion estimate.");
+                }
+                if !job.output.is_empty() {
+                    egui::ScrollArea::vertical().id_salt("optimize-output").max_height(180.0).show(ui, |ui| { ui.label(RichText::new(&job.output).monospace().size(12.0)); });
+                }
+            } else if self.pending.is_some() { weak(ui, "An administrator action is pending. Use its separate window to confirm or cancel."); }
+            else { weak(ui, "No Toolboks optimization is running."); }
+            if let Some(message) = &state.message { ui.label(message); }
+            if !state.last_output.is_empty() {
+                egui::CollapsingHeader::new("Last Windows report").show(ui, |ui| { ui.label(RichText::new(&state.last_output).monospace().size(12.0)); });
+            }
+        });
+        guide::mark(ui, "optimize-progress", activity.response.rect);
+    }
+
     pub fn save_preferences(&self, prefs: &mut BTreeMap<String, serde_json::Value>) -> bool {
         if !self.loaded {
             return false;

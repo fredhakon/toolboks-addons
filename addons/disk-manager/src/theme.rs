@@ -1,9 +1,7 @@
 //! Disk Manager helpers using the pinned shared design tokens.
 use egui::{Color32, RichText, Vec2};
 
-pub use toolboks_shared::ui::{
-    ACCENT, BORDER as HAIRLINE, MUTED, PANEL_BG as CARD, TEXT, WINDOW_BG as WINDOW,
-};
+pub use toolboks_shared::ui::{ACCENT, BORDER as HAIRLINE, MUTED, PANEL_BG as CARD, TEXT};
 use toolboks_shared::ui::{DATA_CPU, DATA_DISK, DATA_GPU, DATA_MEMORY, DATA_NETWORK, DATA_SECOND};
 
 /// Shared data colours, in the same order as the original space map.
@@ -20,6 +18,7 @@ pub const SPACE_S: f32 = 4.0;
 pub const SPACE_M: f32 = 8.0;
 pub const SPACE_L: f32 = 12.0;
 pub const SPACE_XL: f32 = 16.0;
+pub const CONTROL_BORDER: Color32 = Color32::from_rgb(0x3a, 0x3d, 0x46);
 
 /// Card: 10 px radius, 1 px hairline, no shadow, no coloured edge.
 pub fn card() -> egui::Frame {
@@ -60,8 +59,8 @@ pub fn stat(ui: &mut egui::Ui, value: impl Into<String>, label: &str) {
 /// Primary button: accent fill, one per view.
 pub fn primary(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add(
-        egui::Button::new(RichText::new(label).color(WINDOW).strong())
-            .fill(ACCENT)
+        egui::Button::new(RichText::new(label).color(TEXT).strong())
+            .fill(toolboks_shared::ui::HOST_ACCENT_FILL)
             .corner_radius(6)
             .min_size(Vec2::new(75.0, 28.0)),
     )
@@ -71,8 +70,37 @@ pub fn primary(ui: &mut egui::Ui, label: &str) -> egui::Response {
 pub fn outlined(label: &str) -> egui::Button<'_> {
     egui::Button::new(label)
         .fill(Color32::TRANSPARENT)
-        .stroke(egui::Stroke::new(1.0, HAIRLINE))
+        .stroke(egui::Stroke::new(1.0, CONTROL_BORDER))
         .corner_radius(6)
+        .min_size(Vec2::new(0.0, 28.0))
+}
+
+/// Quiet, labelled elsewhere: capacity and share bars never imply a health score.
+pub fn bar(ui: &mut egui::Ui, fraction: f32, color: Color32, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, 3, HAIRLINE);
+    let fill = egui::Rect::from_min_size(
+        rect.min,
+        Vec2::new(rect.width() * fraction.clamp(0.0, 1.0), rect.height()),
+    );
+    ui.painter().rect_filled(fill, 3, color);
+}
+
+pub fn selectable_card(ui: &egui::Ui, response: &egui::Response, selected: bool, label: &str) {
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Button, response.enabled(), selected, label)
+    });
+    if response.has_focus() || response.hovered() {
+        ui.painter().rect_stroke(
+            response.rect,
+            10,
+            egui::Stroke::new(1.0, if response.has_focus() { ACCENT } else { MUTED }),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 /// One-line, muted, dismissible banner. Returns true when dismissed.

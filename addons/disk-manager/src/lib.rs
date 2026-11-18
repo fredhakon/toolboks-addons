@@ -9,6 +9,7 @@ mod map;
 mod optimization;
 mod saved_scan;
 mod scanner;
+mod space;
 mod theme;
 mod tutorial;
 use egui::RichText;
@@ -126,6 +127,8 @@ pub struct DiskManager {
     delete_job: Option<mpsc::Receiver<Result<(), String>>>,
     /// Put the keyboard focus on Cancel when the dialog opens.
     delete_focus: bool,
+    /// The full-window Space explorer, opened from the Space map.
+    explorer: space::Explorer,
 }
 impl Default for DiskManager {
     fn default() -> Self {
@@ -166,6 +169,7 @@ impl Default for DiskManager {
             delete_request: None,
             delete_job: None,
             delete_focus: false,
+            explorer: Default::default(),
         }
     }
 }
@@ -649,6 +653,7 @@ impl DiskManager {
         state.nodes = Arc::new(nodes);
         drop(state);
         // The same view, minus the deleted entry: no jump back to the top of the drive.
+        self.explorer.remap(&map, request.generation, generation);
         self.last_generation = generation;
         self.parent = map.get(self.parent).copied().flatten().unwrap_or(0);
         self.map_state.selected = self
@@ -1449,12 +1454,59 @@ impl DiskManager {
         });
     }
 
+    /// The Space explorer in place of the page, and what it asks the add-on to do.
+    fn space_explorer(&mut self, ui: &mut egui::Ui, p: &Progress, nodes: &Arc<Vec<Node>>) {
+        if let Some(message) = self.message.clone() {
+            if theme::banner(ui, &message) {
+                self.message = None;
+            }
+            ui.add_space(theme::SPACE_M);
+        }
+        let commands = self.explorer.show(
+            ui,
+            p,
+            nodes,
+            (self.settings.min_bytes, self.settings.older_days),
+            self.delete_request.is_some(),
+        );
+        for command in commands {
+            match command {
+                space::Command::Close(folder) => {
+                    self.explorer.open = false;
+                    // Overview comes back on the folder the explorer was zoomed to.
+                    let id = folder.and_then(|path| {
+                        nodes.iter().find(|n| n.dir && n.path == path).map(|n| n.id)
+                    });
+                    if let Some(id) = id.filter(|&id| id != self.parent) {
+                        self.parent = id;
+                        self.offset = 0;
+                        self.map_state = Default::default();
+                    }
+                }
+                space::Command::Reveal(path) => {
+                    self.message = Some(explorer::show(&path).unwrap_or_else(|e| e));
+                }
+                space::Command::Delete(node) => self.ask_delete(&node, p),
+                space::Command::Scan => self.start(false),
+            }
+        }
+    }
+
     fn space_map(&mut self, ui: &mut egui::Ui, nodes: &[Node], p: &Progress) {
         let map = ui.scope(|ui| {
-            theme::section(ui, "Space map");
+            let mut explore = false;
+            ui.horizontal(|ui| {
+                theme::section(ui, "Space map");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    explore = space::open_hint(ui).clicked();
+                });
+            });
             ui.add_space(theme::SPACE_M);
             let entries = self.map_entries(nodes, p);
             let action = map::show(ui, &entries, &mut self.map_state, 200.0);
+            if (explore || action.explore) && self.tutorial_snapshot.is_none() {
+                self.explorer.open_at(self.parent, p.generation, p.running);
+            }
             if let Some(n) = action.reveal.and_then(|id| nodes.get(id)) {
                 self.message = Some(explorer::show(&n.path).unwrap_or_else(|e| e));
             }
@@ -1507,6 +1559,7 @@ impl NativeAddon for DiskManager {
         self.restore = None;
         self.parent = 0;
         self.offset = 0;
+        self.explorer.reset();
     }
     fn has_background_work(&self) -> bool {
         // Always: the runtime has no timer, so the six-hour drive-health read is started from
@@ -1547,6 +1600,7 @@ impl NativeAddon for DiskManager {
             self.export_kind = None;
             self.page = page;
             self.offset = 0;
+            self.explorer.open = false;
         }
         if let Some(letter) = drive {
             self.optimization.select(&letter);
@@ -1564,6 +1618,7 @@ impl NativeAddon for DiskManager {
     fn tutorial_start(&mut self) {
         self.optimization.tutorial_start();
         self.tutorial_snapshot = Some((self.page, self.options, self.parent, self.offset));
+        self.explorer.open = false;
         self.parent = 0;
         self.offset = 0;
         self.map_cache = None;
@@ -1632,7 +1687,27 @@ impl NativeAddon for DiskManager {
                 .show(ui, |ui| self.optimization.ui(ui, prefs))
                 .inner;
         }
-        egui::ScrollArea::vertical().id_salt(("disk-workspace", self.page)).show(ui, |ui| {
+        self.explorer.forget_old(&p);
+        let ctx = ui.ctx().clone();
+        // M opens the Space explorer from Overview, unless the person is typing.
+        if self.page == 0
+            && !sample
+            && !self.explorer.open
+            && self.tutorial_snapshot.is_none()
+            && self.delete_request.is_none()
+            && !ctx.text_edit_focused()
+            && !egui::Popup::is_any_open(&ctx)
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M))
+        {
+            self.explorer.open_at(self.parent, p.generation, p.running);
+        }
+        if self.explorer.open && (self.page != 0 || sample) {
+            self.explorer.open = false;
+        }
+        if self.explorer.open {
+            self.space_explorer(ui, &p, &nodes);
+        } else {
+            egui::ScrollArea::vertical().id_salt(("disk-workspace", self.page)).show(ui, |ui| {
         let heading = ui.horizontal_wrapped(|ui| {
             theme::title(
                 ui,
@@ -1906,6 +1981,7 @@ impl NativeAddon for DiskManager {
                 );
             });
         });
+        }
         self.delete_dialog(ui.ctx());
         self.tick(ui.ctx());
         let value = serde_json::to_value(&self.settings).unwrap();
@@ -2515,6 +2591,58 @@ mod tests {
         assert!(!tmp.path().join("big/top.bin").exists());
         assert!(addon.message.as_deref().unwrap().contains("Run a rescan"));
         assert_eq!(addon.progress().1.len(), nodes.len());
+    }
+    #[test]
+    fn m_opens_the_space_explorer_and_esc_returns_to_the_folder_zoomed_to() {
+        let (_tmp, mut addon) = scanned();
+        // A scan started from the page is numbered; the fixture's direct scan is not.
+        addon.shared.lock().unwrap().progress.generation = 1;
+        let ctx = egui::Context::default();
+        let mut prefs = BTreeMap::new();
+        let mut frame = |addon: &mut DiskManager, events: Vec<egui::Event>| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    addon.ui(ui, &mut prefs);
+                },
+            );
+            out.textures_delta.clear();
+        };
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut addon, vec![]);
+        frame(&mut addon, vec![key(egui::Key::M)]);
+        assert!(addon.explorer.open, "M opens the explorer from Overview");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !addon.explorer.has_map() {
+            assert!(std::time::Instant::now() < deadline);
+            frame(&mut addon, vec![]);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let big = id_of(&addon, "big");
+        addon.explorer.zoom_for_test(big);
+        frame(&mut addon, vec![]);
+        frame(&mut addon, vec![key(egui::Key::Escape)]);
+        assert!(!addon.explorer.open, "Esc closes it");
+        assert_eq!(addon.parent, big, "Overview lists the folder zoomed to");
+        // Other pages never show it.
+        addon
+            .explorer
+            .open_at(0, addon.progress().0.generation, false);
+        addon.navigate("1");
+        assert!(!addon.explorer.open);
     }
     #[test]
     fn csv_protects_formulas_and_quotes() {

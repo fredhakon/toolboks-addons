@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "disk-manager"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "egui",
  "egui_extras",

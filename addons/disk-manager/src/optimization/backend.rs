@@ -507,7 +507,7 @@ fn phase_percent(text: &str) -> Option<f32> {
     (0.0..=100.0).contains(&value).then_some(value)
 }
 #[cfg(windows)]
-fn media(letter: &str) -> Media {
+pub(super) fn media(letter: &str) -> Media {
     use windows::{
         core::PCWSTR,
         Win32::{
@@ -569,7 +569,7 @@ fn media(letter: &str) -> Media {
     }
 }
 #[cfg(not(windows))]
-fn media(_: &str) -> Media {
+pub(super) fn media(_: &str) -> Media {
     Media::Unknown
 }
 #[cfg(test)]

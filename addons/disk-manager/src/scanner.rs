@@ -556,13 +556,36 @@ pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
-    pub(crate) fn temp(tag: &str) -> PathBuf {
+
+    /// A test folder inside the temp folder. The folder is removed when this value is dropped, so
+    /// a failing or panicking test cleans up too. Retries for up to 3 seconds because a scan
+    /// thread or the virus scanner may hold a file for a moment; errors at the end are ignored.
+    pub(crate) struct TestDir(PathBuf);
+    impl std::ops::Deref for TestDir {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+    impl AsRef<Path> for TestDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while self.0.exists() {
+                if fs::remove_dir_all(&self.0).is_ok() || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    pub(crate) fn temp(tag: &str) -> TestDir {
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        PathBuf::from(
-            std::env::var_os("CARGO_TARGET_DIR")
-                .unwrap_or_else(|| std::env::temp_dir().into_os_string()),
-        )
-        .join(format!("stratum-{tag}-{}-{n}", std::process::id()))
+        TestDir(std::env::temp_dir().join(format!("stratum-{tag}-{}-{n}", std::process::id())))
     }
     fn run(root: &Path, exclude: &[&str], threads: usize) -> Arc<Mutex<State>> {
         let state = Arc::new(Mutex::new(State::default()));
@@ -692,7 +715,6 @@ pub(crate) mod tests {
         assert_eq!(l.total, 1);
         assert_eq!(l.rows[0].bytes, 33);
         drop(s);
-        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn matches_reference_for_any_thread_count() {
@@ -713,7 +735,6 @@ pub(crate) mod tests {
                 assert!(s.nodes[n.parent.unwrap()].dir);
             }
         }
-        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn thread_count_is_bounded() {
@@ -757,7 +778,6 @@ pub(crate) mod tests {
         assert!(!s.progress.running);
         assert_eq!(s.nodes[0].files, s.progress.files);
         drop(s);
-        fs::remove_dir_all(root).unwrap();
     }
     #[cfg(windows)]
     #[test]
@@ -770,7 +790,6 @@ pub(crate) mod tests {
             assert_eq!(state.lock().unwrap().progress.skipped, 1);
             fs::remove_dir(root.join("loop")).unwrap();
         }
-        fs::remove_dir(root).unwrap();
     }
     #[test]
     #[ignore]

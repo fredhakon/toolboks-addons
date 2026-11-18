@@ -129,12 +129,13 @@ fn menu_key(input: &mut egui::InputState) -> bool {
     input.consume_key(egui::Modifiers::SHIFT, egui::Key::F10)
         || input.consume_key(egui::Modifiers::NONE, egui::Key::Menu)
 }
-pub fn show(ui: &mut egui::Ui, layout: &MapLayout, state: &mut Interaction) -> Action {
+pub fn show(ui: &mut egui::Ui, layout: &MapLayout, state: &mut Interaction, height: f32) -> Action {
     if layout.tiles.is_empty() {
         crate::theme::weak(ui, "This folder is empty.");
         return Action::default();
     }
     let mut action = Action::default();
+    let y_scale = height / HEIGHT;
     let gaps = GAP * layout.columns.saturating_sub(1) as f32;
     let scale = ((ui.available_width() - gaps) / (layout.width - gaps)).max(1.0);
     let gap_correction = GAP * (scale - 1.0);
@@ -145,7 +146,7 @@ pub fn show(ui: &mut egui::Ui, layout: &MapLayout, state: &mut Interaction) -> A
         .auto_shrink([false, true])
         .show_viewport(ui, |ui, viewport| {
             let (r, _) = ui.allocate_exact_size(
-                Vec2::new((layout.width - gaps) * scale + gaps, HEIGHT),
+                Vec2::new((layout.width - gaps) * scale + gaps, height),
                 egui::Sense::hover(),
             );
             let first = layout.tiles.partition_point(|t| right(t) < viewport.left());
@@ -154,8 +155,8 @@ pub fn show(ui: &mut egui::Ui, layout: &MapLayout, state: &mut Interaction) -> A
                 .take_while(|t| left(t) <= viewport.right())
             {
                 let rect = egui::Rect::from_min_max(
-                    r.min + Vec2::new(left(tile), tile.rect.top()),
-                    r.min + Vec2::new(right(tile), tile.rect.bottom()),
+                    r.min + Vec2::new(left(tile), tile.rect.top() * y_scale),
+                    r.min + Vec2::new(right(tile), tile.rect.bottom() * y_scale),
                 );
                 if !ui.is_rect_visible(rect) {
                     continue;
@@ -215,11 +216,13 @@ pub fn show(ui: &mut egui::Ui, layout: &MapLayout, state: &mut Interaction) -> A
                 job.wrap.max_rows = 1;
                 job.wrap.break_anywhere = true;
                 let galley = painter.layout_job(job);
-                painter.galley(
-                    rect.min + Vec2::new(7.0, 7.0),
-                    galley,
-                    crate::category::text(tile.color),
-                );
+                if rect.height() >= 44.0 {
+                    painter.galley(
+                        rect.min + Vec2::new(7.0, 7.0),
+                        galley,
+                        crate::category::text(tile.color),
+                    );
+                }
                 painter.text(
                     rect.left_bottom() + Vec2::new(7.0, -7.0),
                     egui::Align2::LEFT_BOTTOM,
@@ -318,7 +321,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                show(ui, layout, state);
+                show(ui, layout, state, HEIGHT);
             },
         );
         output.textures_delta.clear();

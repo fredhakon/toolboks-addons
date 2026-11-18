@@ -885,7 +885,6 @@ mod tests {
         assert!(close(cpu.avg as f64, 70.0, 0.01));
         // The gap marker of run 2's start is not in this period; run 1's events are.
         assert!(a.events.iter().all(|e| e.utc_ms < NOW - 120 * MIN));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -951,7 +950,6 @@ mod tests {
             .map(|e| e.kind)
             .collect();
         assert_eq!(kinds, vec![EventKind::Started]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -974,7 +972,6 @@ mod tests {
             .filter(|p| !p.is_gap())
             .all(|p| p.detail == Some(Level::Day) || p.end_ms > NOW - FIVE_MS));
         assert!(a.markers.iter().any(|m| m.kind == MarkerKind::Began));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -989,7 +986,6 @@ mod tests {
         assert!(a.breakdown.apps.is_empty());
         assert!(a.curve.iter().all(|p| p.is_gap() && p.app.is_none()));
         assert!(a.breakdown.system.iter().all(Option::is_none));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Prints the breakdown of a recorded period, to compare with Windows' own counters (#43,
@@ -1066,6 +1062,5 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(got.unwrap().curve.len(), 10);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

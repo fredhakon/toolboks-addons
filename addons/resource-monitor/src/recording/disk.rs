@@ -1148,21 +1148,46 @@ pub(crate) mod tests {
     use super::super::store::Store;
     use super::*;
 
-    /// A fresh folder next to the test exe (the build disk, never C:).
-    pub(crate) fn test_dir(name: &str) -> PathBuf {
-        let base = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_owned))
-            .unwrap_or_else(std::env::temp_dir);
+    /// A fresh test folder in the temp folder, removed when this value is dropped, so a failing
+    /// or panicking test cleans up too. Retries for up to 3 seconds because a worker thread or
+    /// the virus scanner may hold a file for a moment; errors at the end are ignored.
+    pub(crate) struct TestDir(PathBuf);
+
+    impl std::ops::Deref for TestDir {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TestDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while self.0.exists() {
+                if fs::remove_dir_all(&self.0).is_ok() || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    pub(crate) fn test_dir(name: &str) -> TestDir {
         static N: AtomicU64 = AtomicU64::new(0);
-        let dir = base.join("rm-history-tests").join(format!(
-            "{name}-{}-{}",
+        let dir = std::env::temp_dir().join(format!(
+            "rm-history-tests-{name}-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        dir
+        TestDir(dir)
     }
 
     /// 2026-11-17 00:00 UTC.
@@ -1524,7 +1549,6 @@ pub(crate) mod tests {
         fs::write(&b, &big).unwrap();
         prune(&dir, now, &HashSet::new());
         assert!(!a.exists() && b.exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1589,7 +1613,6 @@ pub(crate) mod tests {
             "{:?}",
             loaded.problems
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1601,7 +1624,6 @@ pub(crate) mod tests {
         fs::write(dir.join(file_name(Level::Day, t, 9)), &h).unwrap();
         let loaded = load(&dir, &all(t));
         assert!(loaded.problems[0].contains("version 2"));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

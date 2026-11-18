@@ -514,7 +514,6 @@ mod tests {
         );
         control.apply(false, || None);
         assert!(wait_for(|| control.stopped()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -595,7 +594,6 @@ mod tests {
             loaded.markers[0].rec.kind,
             record::MarkerKind::Began
         ));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

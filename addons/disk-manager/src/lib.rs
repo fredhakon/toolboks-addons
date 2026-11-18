@@ -1,5 +1,6 @@
 //! Native Disk Manager workspace, adapted from the standalone Stratum scan engine.
 mod category;
+mod delete;
 mod explorer;
 mod folder_picker;
 mod health;
@@ -115,6 +116,14 @@ pub struct DiskManager {
     restore: Option<(String, Option<String>)>,
     delete_confirm: Option<DeleteScope>,
     scan_times: BTreeMap<String, u64>,
+    /// Overview list: every file under the open folder instead of its direct entries. Turned on
+    /// when a folder is clicked on the space map.
+    list_files: bool,
+    /// The entry waiting in the "Delete permanently?" dialog, or being deleted.
+    delete_request: Option<delete::Request>,
+    delete_job: Option<mpsc::Receiver<Result<(), String>>>,
+    /// Put the keyboard focus on Cancel when the dialog opens.
+    delete_focus: bool,
 }
 impl Default for DiskManager {
     fn default() -> Self {
@@ -150,6 +159,10 @@ impl Default for DiskManager {
             restore: None,
             delete_confirm: None,
             scan_times: BTreeMap::new(),
+            list_files: false,
+            delete_request: None,
+            delete_job: None,
+            delete_focus: false,
         }
     }
 }
@@ -159,6 +172,7 @@ impl DiskManager {
     fn has_user_work(&self) -> bool {
         self.export_job.is_some()
             || self.picker.is_some()
+            || self.delete_job.is_some()
             || self.optimization.busy()
             || self.cache.as_ref().is_some_and(|w| w.pending > 0)
     }
@@ -192,6 +206,34 @@ fn display_path(path: &str) -> String {
     } else {
         path.strip_prefix(r"\\?\").unwrap_or(path).into()
     }
+}
+/// A node's name for display. The scan root is named by its full path, which carries the
+/// extended-length prefix on Windows.
+fn node_name(n: &Node) -> String {
+    if n.parent.is_none() {
+        display_path(&n.name)
+    } else {
+        n.name.clone()
+    }
+}
+/// The folder of a listed file, relative to the folder that holds `base`: a file in
+/// `D:\Games\Steam` listed under `D:\Games` shows `Games\Steam`.
+fn folder_label(file: &str, base: &str) -> String {
+    let folder = display_path(
+        &std::path::Path::new(file)
+            .parent()
+            .map_or_else(String::new, |p| p.to_string_lossy().into_owned()),
+    );
+    std::path::Path::new(base)
+        .parent()
+        .map(|p| display_path(&p.to_string_lossy()))
+        .and_then(|cut| {
+            folder
+                .strip_prefix(&cut)
+                .map(|s| s.trim_start_matches('\\'))
+        })
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| folder.clone(), str::to_owned)
 }
 fn path_key(path: &str) -> String {
     display_path(path.trim())
@@ -232,6 +274,24 @@ impl DiskManager {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.message = Some("The export worker stopped unexpectedly.".into());
                     self.export_job = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(job) = &self.delete_job {
+            match job.try_recv() {
+                Ok(result) => {
+                    self.delete_job = None;
+                    if let Some(request) = self.delete_request.take() {
+                        self.finish_delete(request, result);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.delete_job = None;
+                    self.delete_request = None;
+                    self.message = Some(
+                        "The delete stopped unexpectedly. Run a rescan to see what is left.".into(),
+                    );
                 }
                 _ => {}
             }
@@ -494,6 +554,166 @@ impl DiskManager {
         self.parent = id;
         self.offset = 0;
         self.search.clear();
+    }
+    /// A click on a map tile: a folder opens on the map and the list shows every file in it.
+    fn open_map_entry(&mut self, n: &Node) {
+        if n.dir {
+            self.drill(n.id);
+            self.list_files = true;
+        } else {
+            self.message = Some(format!("{} · {}", display_path(&n.path), size(n.bytes)));
+        }
+    }
+    /// Opens the "Delete permanently?" dialog for `n`, or says plainly why it cannot.
+    fn ask_delete(&mut self, n: &Node, p: &Progress) {
+        let refusal = if self.tutorial_snapshot.is_some() {
+            Some("Deleting is off during the tutorial.".to_owned())
+        } else if p.running {
+            Some("Wait for the scan to finish, then try again.".to_owned())
+        } else if self.delete_job.is_some() {
+            Some("Another delete is still running.".to_owned())
+        } else {
+            delete::refusal(&n.path, &p.root)
+        };
+        if let Some(refusal) = refusal {
+            self.message = Some(refusal);
+            return;
+        }
+        self.delete_request = Some(delete::Request {
+            path: n.path.clone(),
+            dir: n.dir,
+            bytes: n.bytes,
+            files: n.files,
+            generation: p.generation,
+        });
+        self.delete_focus = true;
+    }
+    fn start_delete(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.delete_request.clone() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        match std::thread::Builder::new()
+            .name("disk-delete".into())
+            .spawn(move || {
+                let _ = tx.send(delete::delete(&request));
+                ctx.request_repaint();
+            }) {
+            Ok(_) => self.delete_job = Some(rx),
+            Err(e) => {
+                self.delete_request = None;
+                self.message = Some(format!("Could not start the delete: {e}"));
+            }
+        }
+    }
+    /// After a delete, takes the entry out of the scan so the list, map, totals and the saved
+    /// scan agree. A scan that changed meanwhile is left alone and a rescan is suggested.
+    fn finish_delete(&mut self, request: delete::Request, result: Result<(), String>) {
+        let shown = display_path(&request.path);
+        if let Err(error) = result {
+            self.message = Some(error);
+            return;
+        }
+        let mut state = self.shared.lock().unwrap();
+        let mut p = state.progress.clone();
+        let patched = (p.generation == request.generation && !p.running)
+            .then(|| delete::remove(&mut p, &state.nodes, &request.path))
+            .flatten();
+        let Some((nodes, map)) = patched else {
+            drop(state);
+            self.message = Some(format!(
+                "Deleted {shown}. Run a rescan to update the results."
+            ));
+            return;
+        };
+        p.generation += 1;
+        let generation = p.generation;
+        state.progress = p;
+        state.nodes = Arc::new(nodes);
+        drop(state);
+        // The same view, minus the deleted entry: no jump back to the top of the drive.
+        self.last_generation = generation;
+        self.parent = map.get(self.parent).copied().flatten().unwrap_or(0);
+        self.map_state.selected = self
+            .map_state
+            .selected
+            .and_then(|id| map.get(id).copied().flatten());
+        self.map_cache = None;
+        self.listing_cache = None;
+        self.message = Some(format!(
+            "Deleted {shown} ({}). It did not go to the Recycle Bin.",
+            size(request.bytes)
+        ));
+    }
+    fn delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.delete_request.clone() else {
+            return;
+        };
+        let busy = self.delete_job.is_some();
+        let mut cancel = false;
+        let mut confirm = false;
+        let modal = egui::Modal::new(egui::Id::unique("disk-delete-confirm")).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            theme::section(
+                ui,
+                if busy {
+                    "Deleting..."
+                } else {
+                    "Delete permanently?"
+                },
+            );
+            ui.add_space(theme::SPACE_M);
+            ui.add(egui::Label::new(RichText::new(display_path(&request.path)).strong()).wrap());
+            theme::caption(
+                ui,
+                if request.dir {
+                    format!("Folder · {} · {} files", size(request.bytes), request.files)
+                } else {
+                    format!("File · {}", size(request.bytes))
+                },
+            );
+            ui.add_space(theme::SPACE_M);
+            weak(
+                ui,
+                if request.dir {
+                    "This cannot be undone. The folder and everything in it are deleted now and do not go to the Recycle Bin."
+                } else {
+                    "This cannot be undone. The file is deleted now and does not go to the Recycle Bin."
+                },
+            );
+            ui.add_space(theme::SPACE_L);
+            if busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    weak(ui, "Deleting. A large folder takes a while.");
+                });
+                return;
+            }
+            ui.horizontal(|ui| {
+                let keep = ui.add(theme::outlined("Cancel"));
+                if std::mem::take(&mut self.delete_focus) {
+                    keep.request_focus();
+                }
+                let delete = ui.add(
+                    egui::Button::new(
+                        RichText::new("Delete permanently")
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    )
+                    .fill(delete::DANGER_FILL)
+                    .corner_radius(6)
+                    .min_size(egui::vec2(0.0, 28.0)),
+                );
+                cancel = keep.clicked();
+                confirm = delete.clicked();
+            });
+        });
+        if !busy && (cancel || modal.should_close()) {
+            self.delete_request = None;
+        } else if !busy && confirm {
+            self.start_delete(ctx);
+        }
     }
     fn map_entries(&mut self, nodes: &[Node], p: &Progress) -> Arc<map::MapLayout> {
         if self
@@ -819,9 +1039,13 @@ impl DiskManager {
         if changed {
             self.offset = 0;
         }
+        // Largest files covers the whole scan; Overview lists the open folder, or every file
+        // under it after a folder is clicked on the map.
+        let files = self.page == 1 || self.list_files;
+        let base = if self.page == 1 { 0 } else { self.parent };
         let q = Query {
-            parent: Some(self.parent),
-            mode: Some(if self.page == 1 { "files" } else { "folders" }.into()),
+            parent: Some(base),
+            mode: Some(if files { "files" } else { "folders" }.into()),
             search: Some(self.search.clone()),
             sort: Some(self.settings.sort.clone()),
             offset: Some(self.offset),
@@ -842,11 +1066,18 @@ impl DiskManager {
         if listing.rows.is_empty() {
             weak(
                 ui,
-                "No entries to show. Try a different folder or change the filters.",
+                if files {
+                    "No files to show. Try a different folder or change the filters."
+                } else {
+                    "No entries to show. Try a different folder or change the filters."
+                },
             );
             return;
         }
+        let base_path = nodes.get(base).map_or_else(String::new, |n| n.path.clone());
+        let bar = self.page == 0 && !files;
         let mut navigate = None;
+        let mut delete_target = None;
         let painter = ui.painter().with_clip_rect(ui.available_rect_before_wrap());
         // Use the viewport, not the scrolled cursor: scrolling to the inspector must not
         // grow the table and move the target away on every frame.
@@ -861,12 +1092,8 @@ impl DiskManager {
             .max_scroll_height(table_height);
         if !compact {
             table = table
-                .column(egui_extras::Column::exact(if self.page == 0 {
-                    140.0
-                } else {
-                    90.0
-                }))
-                .column(egui_extras::Column::exact(65.0));
+                .column(egui_extras::Column::exact(if bar { 140.0 } else { 70.0 }))
+                .column(egui_extras::Column::exact(if files { 170.0 } else { 65.0 }));
         }
         table
             .header(24.0, |mut h| {
@@ -874,10 +1101,17 @@ impl DiskManager {
                 let labels = if compact {
                     &["Size"][..]
                 } else {
-                    &["Size", "Of scan", "Files"][..]
+                    &["Size", "Of scan"][..]
                 };
                 for label in labels {
                     h.col(|ui| theme::number_cell(ui, |ui| theme::header_cell(ui, label)));
+                }
+                if !compact {
+                    if files {
+                        h.col(|ui| theme::header_cell(ui, "Folder"));
+                    } else {
+                        h.col(|ui| theme::number_cell(ui, |ui| theme::header_cell(ui, "Files")));
+                    }
                 }
             })
             .body(|body| {
@@ -908,12 +1142,17 @@ impl DiskManager {
                             navigate = Some(n.id);
                         }
                         r.context_menu(|ui| {
+                            if ui.button("Show in Explorer").clicked() {
+                                self.message = Some(explorer::show(&n.path).unwrap_or_else(|e| e));
+                                ui.close();
+                            }
                             if ui.button("Copy path").clicked() {
                                 ui.ctx().copy_text(display_path(&n.path));
                                 ui.close();
                             }
-                            if ui.button("Show in Explorer").clicked() {
-                                self.message = Some(explorer::show(&n.path).unwrap_or_else(|e| e));
+                            ui.separator();
+                            if ui.button(delete::menu_label()).clicked() {
+                                delete_target = Some(n.clone());
                                 ui.close();
                             }
                         });
@@ -927,7 +1166,7 @@ impl DiskManager {
                         row.col(|ui| {
                             let share = n.bytes as f32 / p.bytes.max(1) as f32;
                             ui.horizontal(|ui| {
-                                if self.page == 0 {
+                                if bar {
                                     ui.allocate_ui(
                                         egui::vec2((ui.available_width() - 48.0).max(8.0), 6.0),
                                         |ui| {
@@ -940,7 +1179,19 @@ impl DiskManager {
                                 });
                             });
                         });
-                        row.col(|ui| theme::number_cell(ui, |ui| weak(ui, n.files.to_string())));
+                        if files {
+                            row.col(|ui| {
+                                let folder = folder_label(&n.path, &base_path);
+                                ui.add(
+                                    egui::Label::new(RichText::new(&folder).color(MUTED))
+                                        .truncate(),
+                                );
+                            });
+                        } else {
+                            row.col(|ui| {
+                                theme::number_cell(ui, |ui| weak(ui, n.files.to_string()))
+                            });
+                        }
                     }
                     let rect = row.response().rect;
                     if row.response().clicked() {
@@ -959,15 +1210,19 @@ impl DiskManager {
         if let Some(id) = navigate {
             self.drill(id);
         }
+        if let Some(n) = delete_target {
+            self.ask_delete(&n, p);
+        }
         ui.add_space(7.0);
         ui.horizontal_wrapped(|ui| {
             weak(
                 ui,
                 format!(
-                    "{}–{} of {} entries",
+                    "{}–{} of {} {}",
                     self.offset + 1,
                     self.offset + listing.rows.len(),
-                    listing.total
+                    listing.total,
+                    if files { "files" } else { "entries" }
                 ),
             );
             if listing.total <= 100 {
@@ -1007,10 +1262,10 @@ impl DiskManager {
                             weak(ui, "/");
                         }
                         if node.id == self.parent {
-                            ui.label(RichText::new(&node.name).strong())
+                            ui.label(RichText::new(node_name(node)).strong())
                                 .on_hover_text(display_path(&node.path));
                         } else if ui
-                            .small_button(&node.name)
+                            .small_button(node_name(node))
                             .on_hover_text(display_path(&node.path))
                             .clicked()
                         {
@@ -1049,9 +1304,36 @@ impl DiskManager {
         guide::region(ui, "disk-list", |ui| {
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                theme::section(ui, "Folders and files");
+                ui.horizontal(|ui| {
+                    theme::section(
+                        ui,
+                        if self.list_files {
+                            "Files"
+                        } else {
+                            "Folders and files"
+                        },
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Right to left: "Files" is drawn last-first so it ends up on the right.
+                        if ui.selectable_label(self.list_files, "Files").clicked() {
+                            self.list_files = true;
+                            self.offset = 0;
+                        }
+                        if ui.selectable_label(!self.list_files, "Folders").clicked() {
+                            self.list_files = false;
+                            self.offset = 0;
+                        }
+                    });
+                });
                 self.breadcrumbs(ui, nodes);
-                theme::caption(ui, "Double-click a folder to open it. Logical sizes; links and junctions are left out.");
+                theme::caption(
+                    ui,
+                    if self.list_files {
+                        "Every file in this folder and its subfolders, largest first. Right-click a file for more."
+                    } else {
+                        "Double-click a folder to open it. Right-click for more. Logical sizes; links and junctions are left out."
+                    },
+                );
                 ui.add_space(theme::SPACE_M);
                 self.list(ui, nodes, p, compact);
             });
@@ -1067,7 +1349,7 @@ impl DiskManager {
                 .and_then(|id| nodes.get(id))
                 .or_else(|| nodes.get(self.parent))
             {
-                theme::section(ui, &n.name);
+                theme::section(ui, &node_name(n));
                 theme::caption(
                     ui,
                     format!(
@@ -1138,12 +1420,14 @@ impl DiskManager {
             if let Some(n) = action.reveal.and_then(|id| nodes.get(id)) {
                 self.message = Some(explorer::show(&n.path).unwrap_or_else(|e| e));
             }
+            if let Some(n) = action.copy.and_then(|id| nodes.get(id)) {
+                ui.ctx().copy_text(display_path(&n.path));
+            }
+            if let Some(n) = action.delete.and_then(|id| nodes.get(id)) {
+                self.ask_delete(n, p);
+            }
             if let Some(n) = action.open.and_then(|id| nodes.get(id)) {
-                if n.dir {
-                    self.drill(n.id);
-                } else {
-                    self.message = Some(format!("{} · {}", display_path(&n.path), size(n.bytes)));
-                }
+                self.open_map_entry(n);
             }
         });
         guide::mark(ui, "disk-map", map.response.rect);
@@ -1289,6 +1573,7 @@ impl NativeAddon for DiskManager {
             self.map_state = Default::default();
             self.parent = 0;
             self.offset = 0;
+            self.list_files = false;
         }
         let sample = self.tutorial_snapshot.is_some() && (p.generation == 0 || p.running);
         let (p, nodes) = if sample {
@@ -1482,7 +1767,7 @@ impl NativeAddon for DiskManager {
                             },
                         );
                         ui.add_space(theme::SPACE_M);
-                        theme::caption(ui, "Scanning only reads. Your files are never changed.");
+                        theme::caption(ui, "Scanning only reads. Files change only when you delete one and confirm.");
                     });
                     return;
                 }
@@ -1579,10 +1864,11 @@ impl NativeAddon for DiskManager {
                 ui.add_space(theme::SPACE_M);
                 theme::caption(
                     ui,
-                    "Logical sizes. Links and junctions are left out. Read-only analysis.",
+                    "Logical sizes. Links and junctions are left out. Scans only read; files change only when you delete one.",
                 );
             });
         });
+        self.delete_dialog(ui.ctx());
         self.tick(ui.ctx());
         let value = serde_json::to_value(&self.settings).unwrap();
         if prefs.get("settings") != Some(&value) {
@@ -1596,6 +1882,7 @@ impl NativeAddon for DiskManager {
         if self.shared.lock().unwrap().progress.running
             || self.export_job.is_some()
             || self.picker.is_some()
+            || self.delete_job.is_some()
             || self.optimization.busy()
             || self.cache.as_ref().is_some_and(|w| w.pending > 0)
         {
@@ -2034,6 +2321,162 @@ mod tests {
         assert_eq!(addon.progress().1.len(), 700101);
         println!("LARGE_SNAPSHOT nodes=700101 files=700000 bytes={} load={:.3}s frames={} longest_frame={:.3}s",bytes,started.elapsed().as_secs_f64(),frames,max_frame.as_secs_f64());
         drop(addon);
+    }
+    /// An add-on holding a finished scan of a fresh temp folder with `big/inner/deep.bin`,
+    /// `big/top.bin` and `small.txt`. The folder is removed when the guard drops.
+    fn scanned() -> (tempfile::TempDir, DiskManager) {
+        let tmp = tempfile::Builder::new()
+            .prefix("toolboks-disk-ui-")
+            .tempdir()
+            .unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("big/inner")).unwrap();
+        std::fs::write(root.join("big/inner/deep.bin"), [0; 300]).unwrap();
+        std::fs::write(root.join("big/top.bin"), [0; 100]).unwrap();
+        std::fs::write(root.join("small.txt"), [0; 5]).unwrap();
+        let mut addon = DiskManager::default();
+        addon.loaded = true;
+        addon.cache_started = true;
+        addon.cache = Some(saved_scan::Worker::at(tmp.path().join("cache")));
+        addon.settings.remember = false;
+        scanner::scan(root, vec![], addon.shared.clone(), addon.cancel.clone());
+        (tmp, addon)
+    }
+    fn id_of(addon: &DiskManager, name: &str) -> usize {
+        addon
+            .progress()
+            .1
+            .iter()
+            .find(|n| n.name == name)
+            .unwrap()
+            .id
+    }
+    fn wait_for_delete(addon: &mut DiskManager) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while addon.delete_job.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            addon.poll_workers();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    #[test]
+    fn a_map_click_on_a_folder_lists_every_file_under_it() {
+        let (_tmp, mut addon) = scanned();
+        let (p, nodes) = addon.progress();
+        let big = id_of(&addon, "big");
+        addon.open_map_entry(&nodes[big]);
+        assert_eq!((addon.parent, addon.list_files), (big, true));
+        let q = Query {
+            parent: Some(addon.parent),
+            mode: Some("files".into()),
+            ..Default::default()
+        };
+        let rows = scanner::listing(&nodes, &q).rows;
+        let names: Vec<_> = rows.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["deep.bin", "top.bin"]);
+        assert_eq!(folder_label(&rows[0].path, &nodes[big].path), r"big\inner");
+        assert_eq!(folder_label(&rows[1].path, &nodes[big].path), "big");
+        // Under a scanned folder its own name leads; under a drive root the path is in full.
+        assert_eq!(
+            folder_label(&rows[1].path, &p.root),
+            format!("{}\\big", nodes[0].name)
+        );
+        assert_eq!(folder_label(r"\\?\D:\Games\x.bin", r"\\?\D:\"), r"D:\Games");
+        assert_eq!(folder_label(r"\\?\D:\x.bin", r"\\?\D:\"), r"D:\");
+        assert_eq!(node_name(&nodes[0]), display_path(&nodes[0].name));
+    }
+    #[test]
+    fn delete_asks_first_and_cancel_is_the_default() {
+        let (tmp, mut addon) = scanned();
+        let (p, nodes) = addon.progress();
+        addon.ask_delete(&nodes[0], &p);
+        assert!(
+            addon.delete_request.is_none(),
+            "the scanned folder is refused"
+        );
+        assert!(addon.message.take().unwrap().contains("folder you scanned"));
+        let small = id_of(&addon, "small.txt");
+        addon.ask_delete(&nodes[small], &p);
+        assert!(addon.delete_focus && addon.delete_request.is_some());
+        let ctx = egui::Context::default();
+        let mut prefs = BTreeMap::new();
+        let mut frame = |addon: &mut DiskManager, events: Vec<egui::Event>| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    addon.ui(ui, &mut prefs);
+                },
+            );
+            out.textures_delta.clear();
+        };
+        frame(&mut addon, vec![]);
+        frame(&mut addon, vec![]);
+        let enter = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut addon, vec![enter(egui::Key::Enter)]);
+        assert!(addon.delete_request.is_none(), "Enter pressed Cancel");
+        assert!(addon.delete_job.is_none());
+        assert!(tmp.path().join("small.txt").exists());
+        addon.ask_delete(&nodes[small], &p);
+        frame(&mut addon, vec![]);
+        frame(&mut addon, vec![enter(egui::Key::Escape)]);
+        assert!(addon.delete_request.is_none(), "Escape cancels");
+        assert!(tmp.path().join("small.txt").exists());
+    }
+    #[test]
+    fn a_confirmed_delete_updates_the_list_map_totals_and_keeps_the_view() {
+        let (tmp, mut addon) = scanned();
+        let (p, nodes) = addon.progress();
+        let big = id_of(&addon, "big");
+        addon.open_map_entry(&nodes[big]);
+        addon.last_generation = p.generation;
+        let inner = id_of(&addon, "inner");
+        addon.map_state.selected = Some(inner);
+        addon.ask_delete(&nodes[inner], &p);
+        addon.start_delete(&egui::Context::default());
+        wait_for_delete(&mut addon);
+        assert!(!tmp.path().join("big/inner").exists());
+        assert!(tmp.path().join("big/top.bin").exists());
+        let (after, nodes) = addon.progress();
+        assert_eq!((after.bytes, after.files), (105, 2));
+        assert_eq!(after.generation, p.generation + 1);
+        assert_eq!(
+            addon.last_generation, after.generation,
+            "no reset to the drive top"
+        );
+        assert_eq!(nodes[addon.parent].name, "big");
+        assert_eq!(nodes[addon.parent].bytes, 100);
+        assert_eq!(addon.map_state.selected, None);
+        assert!(addon.list_files);
+        assert!(nodes
+            .iter()
+            .all(|n| n.name != "deep.bin" && n.name != "inner"));
+        assert!(addon
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("did not go to the Recycle Bin"));
+        // A delete that finishes after a new scan does not patch that scan.
+        let top = id_of(&addon, "top.bin");
+        addon.ask_delete(&nodes[top], &after);
+        addon.shared.lock().unwrap().progress.generation += 5;
+        addon.start_delete(&egui::Context::default());
+        wait_for_delete(&mut addon);
+        assert!(!tmp.path().join("big/top.bin").exists());
+        assert!(addon.message.as_deref().unwrap().contains("Run a rescan"));
+        assert_eq!(addon.progress().1.len(), nodes.len());
     }
     #[test]
     fn csv_protects_formulas_and_quotes() {

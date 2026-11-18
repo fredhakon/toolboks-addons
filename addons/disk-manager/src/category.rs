@@ -1,4 +1,6 @@
-//! Labelled file groups; folder colours follow their dominant bytes, with neutral mixed folders.
+//! Labelled file groups; folder colours follow their dominant bytes. Every group has its own
+//! clear hue (the owner's wish overrides the grey category colours in DESIGN.md): only an entry
+//! that holds 0 bytes is drawn grey, with [`EMPTY`].
 use crate::scanner::Node;
 use egui::Color32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,9 +54,9 @@ impl Category {
             Self::Games => Color32::from_rgb(105, 70, 190),
             Self::Archives => Color32::from_rgb(210, 125, 104),
             Self::Audio => Color32::from_rgb(77, 188, 179),
-            Self::Apps => Color32::from_rgb(66, 69, 78),
-            Self::Documents => Color32::from_rgb(150, 166, 187),
-            Self::Other => Color32::from_rgb(81, 84, 92),
+            Self::Apps => Color32::from_rgb(222, 110, 190),
+            Self::Documents => Color32::from_rgb(190, 210, 90),
+            Self::Other => Color32::from_rgb(96, 128, 224),
         };
         // Opaque, bounded shades keep neighbouring cells distinct even in a Rust target tree.
         let factor = [1.0, 0.80, 1.13][variant % 3];
@@ -63,6 +65,16 @@ impl Category {
             (base.g() as f32 * factor).min(255.0) as u8,
             (base.b() as f32 * factor).min(255.0) as u8,
         )
+    }
+}
+/// The one grey: an entry that holds 0 bytes. The space map gives such entries no tile.
+pub const EMPTY: Color32 = Color32::from_rgb(66, 69, 78);
+/// Colour for an entry of `bytes` in `category`: grey only when it is empty.
+pub fn color_for(category: Category, bytes: u64, variant: usize) -> Color32 {
+    if bytes == 0 {
+        EMPTY
+    } else {
+        category.color(variant)
     }
 }
 pub fn file(name: &str) -> Category {
@@ -155,7 +167,7 @@ pub fn text(bg: Color32) -> Color32 {
 mod tests {
     use super::*;
     #[test]
-    fn folder_uses_dominant_descendants_and_mixed_folders_are_neutral() {
+    fn folder_uses_dominant_descendants_and_mixed_folders_are_other() {
         let n = |id, parent, name: &str, dir, bytes| Node {
             id,
             parent,
@@ -208,6 +220,24 @@ mod tests {
             assert_ne!(c.color(1), c.color(2));
             assert_eq!(c.color(0).a(), 255);
         }
+    }
+    fn saturation(c: Color32) -> f32 {
+        let max = c.r().max(c.g()).max(c.b()) as f32;
+        let min = c.r().min(c.g()).min(c.b()) as f32;
+        (max - min) / max.max(1.0)
+    }
+    #[test]
+    fn only_empty_entries_are_grey_and_every_group_has_its_own_hue() {
+        for c in Category::ALL {
+            assert!(saturation(c.color(0)) >= 0.35, "{c:?} reads as grey");
+            assert_eq!(color_for(c, 0, 0), EMPTY);
+            assert_eq!(color_for(c, 1, 0), c.color(0));
+        }
+        assert!(saturation(EMPTY) < 0.2);
+        let mut seen = Category::ALL.map(|c| c.color(0)).to_vec();
+        seen.sort_by_key(|c| c.to_array());
+        seen.dedup();
+        assert_eq!(seen.len(), Category::ALL.len());
     }
     #[test]
     fn groups_are_case_insensitive() {

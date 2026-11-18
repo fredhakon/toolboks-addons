@@ -1,5 +1,46 @@
 //! Windows Shell item IDs preserve Unicode and long paths without a command shell.
+//!
+//! Scans store canonical paths, which on Windows carry the extended-length prefix (`\\?\D:\`).
+//! The Shell does not parse that prefix, so "Show in Explorer" failed for every scanned item.
+//! Paths are turned back into the ordinary form first; `explorer.exe /select,` is the fallback
+//! when the Shell call itself fails.
 use std::path::{Path, PathBuf};
+/// The ordinary Windows form of a scanned path: no `\\?\` prefix, backslashes, and a drive
+/// root always ends in a backslash (`D:` alone means the current folder on D:).
+pub fn shell_path(path: &str) -> String {
+    let path = path.trim().replace('/', "\\");
+    let path = if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        path
+    };
+    if is_drive_root(&path) && !path.ends_with('\\') {
+        format!("{path}\\")
+    } else {
+        path
+    }
+}
+/// `D:` or `D:\` (after [`shell_path`]).
+pub fn is_drive_root(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b.len() == 2 || (b.len() == 3 && b[2] == b'\\'))
+}
+/// The single argument for `explorer.exe`. A drive root is opened; anything else is selected
+/// in its folder. Windows file names cannot contain quotes, so quoting is always safe.
+pub fn explorer_arg(path: &str, select: bool) -> String {
+    if is_drive_root(path) {
+        path.to_owned()
+    } else if select {
+        format!("/select,\"{path}\"")
+    } else {
+        format!("\"{path}\"")
+    }
+}
 fn target(path: &Path) -> Result<(PathBuf, bool), String> {
     if path.exists() {
         return Ok((path.to_owned(), false));
@@ -10,13 +51,38 @@ fn target(path: &Path) -> Result<(PathBuf, bool), String> {
     Err("This item and its parent are no longer available. Run a new scan.".into())
 }
 pub fn show(path: &str) -> Result<String, String> {
-    let (target, missing) = target(Path::new(path))?;
-    open(&target, !missing)?;
+    let (target, missing) = target(Path::new(&shell_path(path)))?;
+    let target = target.to_string_lossy().into_owned();
+    // A drive root is opened; selecting it would only highlight it in "This PC".
+    let select = !missing && !is_drive_root(&target);
+    if open(Path::new(&target), select).is_err() {
+        launch(&explorer_arg(&target, select))?;
+    }
     Ok(if missing {
         "This item no longer exists. Opened its parent folder instead.".into()
     } else {
         "Opened the selected item in Explorer.".into()
     })
+}
+#[cfg(windows)]
+fn launch(arg: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    // Explorer parses its own command line, so the argument goes in exactly as built. Its exit
+    // code is 1 even on success; only a failure to start counts.
+    // The full path in the Windows folder, not a lookup that starts in this add-on's own folder.
+    let explorer = std::env::var_os("SystemRoot")
+        .map(|root| std::path::PathBuf::from(root).join("explorer.exe"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| "explorer.exe".into());
+    std::process::Command::new(explorer)
+        .raw_arg(arg)
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("Explorer could not be started: {e}"))
+}
+#[cfg(not(windows))]
+fn launch(_: &str) -> Result<(), String> {
+    Err("Show in Explorer is available on Windows.".into())
 }
 #[cfg(windows)]
 fn open(path: &Path, select: bool) -> Result<(), String> {
@@ -110,6 +176,59 @@ mod tests {
             }
             result.unwrap();
         }
+    }
+    #[test]
+    fn extended_length_paths_become_shell_paths() {
+        assert_eq!(shell_path(r"\\?\D:\"), r"D:\");
+        assert_eq!(shell_path(r"\\?\D:"), r"D:\");
+        assert_eq!(shell_path("D:"), r"D:\");
+        assert_eq!(
+            shell_path(r"\\?\C:\Program Files (x86)\Steam\a, b & c.txt"),
+            r"C:\Program Files (x86)\Steam\a, b & c.txt"
+        );
+        assert_eq!(
+            shell_path(r"\\?\UNC\server\share\folder"),
+            r"\\server\share\folder"
+        );
+        assert_eq!(shell_path("C:/Users/me/My Files"), r"C:\Users\me\My Files");
+        assert_eq!(
+            shell_path("\\\\?\\E:\\\u{6f22}\u{5b57} \u{e6}\u{f8}"),
+            "E:\\\u{6f22}\u{5b57} \u{e6}\u{f8}"
+        );
+        assert!(is_drive_root(r"D:\") && is_drive_root("d:"));
+        assert!(!is_drive_root(r"D:\x") && !is_drive_root(r"\\server\share"));
+    }
+    #[test]
+    fn explorer_arguments_select_items_and_open_drive_roots() {
+        assert_eq!(explorer_arg(r"D:\", true), r"D:\");
+        assert_eq!(
+            explorer_arg(r"D:\SteamLibrary", true),
+            r#"/select,"D:\SteamLibrary""#
+        );
+        assert_eq!(
+            explorer_arg(r"C:\My Games\a, b; c (1).txt", true),
+            r#"/select,"C:\My Games\a, b; c (1).txt""#
+        );
+        assert_eq!(explorer_arg(r"C:\My Games", false), r#""C:\My Games""#);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn canonical_scan_paths_are_found_after_cleaning() {
+        let tmp = tempfile::Builder::new()
+            .prefix("toolboks-explorer-canon-")
+            .tempdir()
+            .unwrap();
+        let file = tmp.path().join("a file, with spaces.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let canonical = std::fs::canonicalize(&file).unwrap();
+        let raw = canonical.to_string_lossy();
+        assert!(raw.starts_with(r"\\?\"), "scans keep this form: {raw}");
+        let clean = shell_path(&raw);
+        assert!(!clean.starts_with(r"\\?\"));
+        assert_eq!(
+            target(Path::new(&clean)).unwrap(),
+            (PathBuf::from(&clean), false)
+        );
     }
     #[test]
     fn missing_item_falls_back_only_to_existing_parent() {

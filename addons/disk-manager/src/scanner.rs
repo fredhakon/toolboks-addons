@@ -502,11 +502,20 @@ pub fn listing(nodes: &[Node], q: &Query) -> Listing {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    // Files mode lists every file under the parent folder, at any depth. Parents always come
+    // before their children, so one pass marks the whole subtree.
+    let under: Option<Vec<bool>> = (mode == "files" && parent_id != 0).then(|| {
+        let mut under = vec![false; nodes.len()];
+        for n in nodes {
+            under[n.id] = n.id == parent_id || n.parent.is_some_and(|p| under[p]);
+        }
+        under
+    });
     let mut rows: Vec<&Node> = nodes
         .iter()
         .filter(|n| {
             (if mode == "files" {
-                !n.dir
+                !n.dir && under.as_ref().is_none_or(|u| u[n.id])
             } else if !search.is_empty() {
                 n.id != 0
             } else {
@@ -714,6 +723,27 @@ pub(crate) mod tests {
         );
         assert_eq!(l.total, 1);
         assert_eq!(l.rows[0].bytes, 33);
+        let nested = s.nodes.iter().find(|n| n.name == "nested").unwrap().id;
+        let under = |parent| {
+            listing(
+                &s.nodes,
+                &Query {
+                    parent: Some(parent),
+                    mode: Some("files".into()),
+                    ..Default::default()
+                },
+            )
+            .rows
+            .into_iter()
+            .map(|n| n.name)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(under(nested), ["two.bin"], "only files under the folder");
+        assert_eq!(
+            under(0),
+            ["two.bin", "one.bin"],
+            "the root lists every file, largest first"
+        );
         drop(s);
     }
     #[test]

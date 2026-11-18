@@ -303,6 +303,13 @@ impl DiskManager {
                 _ => {}
             }
         }
+        // The Space explorer's duplicates delete: the files it removed leave the scan.
+        if let Some((generation, paths)) = self.explorer.take_deleted() {
+            if !paths.is_empty() && !self.patch_scan(generation, &paths) {
+                self.message =
+                    Some("Duplicates were deleted. Run a rescan to update the results.".into());
+            }
+        }
         if let Some(picker) = &self.picker {
             match picker.try_recv() {
                 Ok(Ok(path)) => {
@@ -577,7 +584,7 @@ impl DiskManager {
             Some("Deleting is off during the tutorial.".to_owned())
         } else if p.running {
             Some("Wait for the scan to finish, then try again.".to_owned())
-        } else if self.delete_job.is_some() {
+        } else if self.delete_job.is_some() || self.explorer.deleting() {
             Some("Another delete is still running.".to_owned())
         } else {
             delete::refusal(&n.path, &p.root)
@@ -635,25 +642,36 @@ impl DiskManager {
             self.message = Some(error);
             return;
         }
-        let mut state = self.shared.lock().unwrap();
-        let mut p = state.progress.clone();
-        let patched = (p.generation == request.generation && !p.running)
-            .then(|| delete::remove(&mut p, &state.nodes, &request.path))
-            .flatten();
-        let Some((nodes, map)) = patched else {
-            drop(state);
+        if !self.patch_scan(request.generation, std::slice::from_ref(&request.path)) {
             self.message = Some(format!(
                 "Deleted {shown}. Run a rescan to update the results."
             ));
             return;
+        }
+        self.message = Some(format!(
+            "Deleted {shown} ({}). It did not go to the Recycle Bin.",
+            size(request.bytes)
+        ));
+    }
+    /// Takes deleted entries out of scan `generation` so the list, map, totals and the saved
+    /// scan agree, keeping the views on the same entries. False when the scan changed meanwhile.
+    fn patch_scan(&mut self, generation: u64, paths: &[String]) -> bool {
+        let mut state = self.shared.lock().unwrap();
+        let mut p = state.progress.clone();
+        let patched = (p.generation == generation && !p.running)
+            .then(|| delete::remove_all(&mut p, &state.nodes, paths))
+            .flatten();
+        let Some((nodes, map)) = patched else {
+            return false;
         };
+        let old = generation;
         p.generation += 1;
         let generation = p.generation;
         state.progress = p;
         state.nodes = Arc::new(nodes);
         drop(state);
-        // The same view, minus the deleted entry: no jump back to the top of the drive.
-        self.explorer.remap(&map, request.generation, generation);
+        // The same view, minus the deleted entries: no jump back to the top of the drive.
+        self.explorer.remap(&map, old, generation);
         self.last_generation = generation;
         self.parent = map.get(self.parent).copied().flatten().unwrap_or(0);
         self.map_state.selected = self
@@ -662,10 +680,7 @@ impl DiskManager {
             .and_then(|id| map.get(id).copied().flatten());
         self.map_cache = None;
         self.listing_cache = None;
-        self.message = Some(format!(
-            "Deleted {shown} ({}). It did not go to the Recycle Bin.",
-            size(request.bytes)
-        ));
+        true
     }
     fn delete_dialog(&mut self, ctx: &egui::Context) {
         let Some(request) = self.delete_request.clone() else {
@@ -1997,6 +2012,7 @@ impl NativeAddon for DiskManager {
             || self.export_job.is_some()
             || self.picker.is_some()
             || self.delete_job.is_some()
+            || self.explorer.busy()
             || self.optimization.busy()
             || self.cache.as_ref().is_some_and(|w| w.pending > 0)
         {
@@ -2591,6 +2607,54 @@ mod tests {
         assert!(!tmp.path().join("big/top.bin").exists());
         assert!(addon.message.as_deref().unwrap().contains("Run a rescan"));
         assert_eq!(addon.progress().1.len(), nodes.len());
+    }
+    #[test]
+    fn a_duplicates_delete_updates_the_scan_and_blocks_other_deletes() {
+        let (tmp, mut addon) = scanned();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir_all(root.join("copies")).unwrap();
+        std::fs::write(root.join("copies/top.bin"), [0; 100]).unwrap();
+        std::fs::write(root.join("copies/top again.bin"), [0; 100]).unwrap();
+        scanner::scan(
+            root.clone(),
+            vec![],
+            addon.shared.clone(),
+            addon.cancel.clone(),
+        );
+        addon.shared.lock().unwrap().progress.generation = 1;
+        let (p, nodes) = addon.progress();
+        assert_eq!((p.bytes, p.files), (605, 5));
+        let files = addon
+            .explorer
+            .delete_duplicates_for_test(nodes.clone(), 1, &p.root);
+        assert_eq!(files, 2, "three copies of top.bin, one kept");
+        // While it runs, no other delete starts.
+        if addon.explorer.deleting() {
+            let small = id_of(&addon, "small.txt");
+            addon.ask_delete(&nodes[small], &p);
+            assert!(addon.delete_request.is_none());
+            assert!(addon.message.take().unwrap().contains("Another delete"));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while addon.explorer.busy() {
+            assert!(std::time::Instant::now() < deadline);
+            addon.poll_workers();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        addon.poll_workers();
+        let left = ["big/top.bin", "copies/top.bin", "copies/top again.bin"]
+            .iter()
+            .filter(|f| root.join(f).exists())
+            .count();
+        assert_eq!(left, 1, "exactly one copy is kept");
+        let (after, nodes) = addon.progress();
+        assert_eq!((after.bytes, after.files), (405, 3));
+        assert_eq!(after.generation, 2);
+        assert_eq!(
+            nodes.iter().filter(|n| n.name.starts_with("top")).count(),
+            1
+        );
+        assert_eq!(nodes[0].bytes, 405);
     }
     #[test]
     fn m_opens_the_space_explorer_and_esc_returns_to_the_folder_zoomed_to() {

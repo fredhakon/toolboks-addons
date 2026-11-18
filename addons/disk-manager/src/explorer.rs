@@ -69,7 +69,12 @@ fn launch(arg: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     // Explorer parses its own command line, so the argument goes in exactly as built. Its exit
     // code is 1 even on success; only a failure to start counts.
-    std::process::Command::new("explorer.exe")
+    // The full path in the Windows folder, not a lookup that starts in this add-on's own folder.
+    let explorer = std::env::var_os("SystemRoot")
+        .map(|root| std::path::PathBuf::from(root).join("explorer.exe"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| "explorer.exe".into());
+    std::process::Command::new(explorer)
         .raw_arg(arg)
         .spawn()
         .map(drop)

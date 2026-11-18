@@ -103,6 +103,8 @@ pub struct DiskManager {
     export_job: Option<mpsc::Receiver<Result<String, String>>>,
     last_generation: u64,
     listing_cache: Option<(String, scanner::Listing)>,
+    /// Category of each listed entry, for the colour of its share bar. Rebuilt with the listing.
+    list_categories: std::collections::HashMap<usize, category::Category>,
     map_state: map::Interaction,
     map_cache: Option<(u64, usize, Arc<map::MapLayout>)>,
     picker: Option<mpsc::Receiver<Result<Option<String>, String>>>,
@@ -148,6 +150,7 @@ impl Default for DiskManager {
             export_job: None,
             last_generation: 0,
             listing_cache: None,
+            list_categories: std::collections::HashMap::new(),
             map_state: Default::default(),
             map_cache: None,
             picker: None,
@@ -592,6 +595,19 @@ impl DiskManager {
         let Some(request) = self.delete_request.clone() else {
             return;
         };
+        // The dialog can stay open while the host starts the tutorial or a scan begins.
+        let busy = if self.tutorial_snapshot.is_some() {
+            Some("Deleting is off during the tutorial.")
+        } else if self.shared.lock().unwrap().progress.running {
+            Some("Wait for the scan to finish, then try again.")
+        } else {
+            None
+        };
+        if let Some(reason) = busy {
+            self.delete_request = None;
+            self.message = Some(reason.into());
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         match std::thread::Builder::new()
@@ -668,7 +684,11 @@ impl DiskManager {
             theme::caption(
                 ui,
                 if request.dir {
-                    format!("Folder · {} · {} files", size(request.bytes), request.files)
+                    format!(
+                        "Folder · {} · {} files, as of the last scan",
+                        size(request.bytes),
+                        request.files
+                    )
                 } else {
                     format!("File · {}", size(request.bytes))
                 },
@@ -677,7 +697,7 @@ impl DiskManager {
             weak(
                 ui,
                 if request.dir {
-                    "This cannot be undone. The folder and everything in it are deleted now and do not go to the Recycle Bin."
+                    "This cannot be undone. Everything in the folder as it is now is deleted and does not go to the Recycle Bin, including items the scan skipped (excluded or linked folders, cloud files) and files added since the scan."
                 } else {
                     "This cannot be undone. The file is deleted now and does not go to the Recycle Bin."
                 },
@@ -1059,10 +1079,20 @@ impl DiskManager {
             .as_ref()
             .is_none_or(|(old, _)| old != &key)
         {
-            self.listing_cache = Some((key, scanner::listing(nodes, &q)));
+            let fresh = scanner::listing(nodes, &q);
+            let rows: Vec<&scanner::Node> = fresh.rows.iter().collect();
+            self.list_categories = category::folders(&rows, nodes);
+            self.listing_cache = Some((key, fresh));
         }
         let listing = self.listing_cache.as_ref().unwrap().1.clone();
         ui.add_space(10.0);
+        if listing.rows.is_empty() && self.offset > 0 {
+            // The last row of the last page was deleted: go back to the first page.
+            self.offset = 0;
+            self.listing_cache = None;
+            ui.ctx().request_repaint();
+            return;
+        }
         if listing.rows.is_empty() {
             weak(
                 ui,
@@ -1170,7 +1200,15 @@ impl DiskManager {
                                     ui.allocate_ui(
                                         egui::vec2((ui.available_width() - 48.0).max(8.0), 6.0),
                                         |ui| {
-                                            theme::bar(ui, share, theme::MUTED, 6.0);
+                                            let color = category::color_for(
+                                                self.list_categories
+                                                    .get(&n.id)
+                                                    .copied()
+                                                    .unwrap_or(category::Category::Other),
+                                                n.bytes,
+                                                0,
+                                            );
+                                            theme::bar(ui, share, color, 6.0);
                                         },
                                     );
                                 }

@@ -9,7 +9,7 @@
 //! data. For those, and for any drive whose direct read is unsupported, the read falls back to
 //! Windows' own read-only rating (`MSFT_PhysicalDisk` HealthStatus and OperationalStatus). That
 //! rating is shown as exactly that: no wear, temperature or SMART value is ever made up for it.
-use crate::theme::{self, card, weak};
+use crate::theme::{self, weak};
 use egui::RichText;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -998,23 +998,29 @@ fn chip(ui: &mut egui::Ui, verdict: Verdict) {
         Verdict::Watch => AMBER,
         Verdict::ReplaceSoon | Verdict::Problem => RED,
     };
-    egui::Frame::new()
-        .stroke(egui::Stroke::new(1.0, color))
-        .corner_radius(6)
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(verdict.label()).color(color).strong());
-        });
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(egui::Vec2::splat(8.0), egui::Sense::hover());
+        ui.painter().circle_filled(r.center(), 4.0, color);
+        ui.label(RichText::new(verdict.label()).color(color).strong());
+    });
 }
 
-/// The Drive health card for one drive letter.
+/// Compact master-list verdict, using only the existing cached reading.
+pub fn status(ui: &mut egui::Ui, cache: &Cache, letter: &str) {
+    match peek(cache, letter) {
+        Some((Ok(report), _)) => chip(ui, assess(&report.health).0),
+        Some((Err(_), _)) => theme::caption(ui, "Unavailable"),
+        None => theme::caption(ui, "Reading health..."),
+    }
+}
+
+/// Drive health section inside the selected drive's detail panel.
 pub fn show(ui: &mut egui::Ui, cache: &Cache, letter: &str) {
     let result = get(cache, letter);
     if result.is_none() {
         ui.request_repaint_after(std::time::Duration::from_millis(250));
     }
-    card().show(ui, |ui| {
-        ui.set_width(ui.available_width());
+    ui.scope(|ui| {
         theme::section(ui, "Drive health");
         ui.add_space(theme::SPACE_S);
         match result {

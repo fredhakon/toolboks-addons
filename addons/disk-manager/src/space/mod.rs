@@ -2,7 +2,10 @@
 //! file is a tile sized by its logical size and coloured by type, age or top folder; folders
 //! are blocks with thin borders. The wheel zooms toward the pointer, the middle button pans,
 //! the left button selects and the right button opens the menu. The scan is only read: the
-//! one thing that changes files is Delete permanently, through the add-on's usual dialog.
+//! one thing that changes files is Delete permanently, through the add-on's usual dialog, and
+//! the Duplicates panel's own delete of extra copies (issue #187).
+mod dupes;
+mod dupes_ui;
 mod layout;
 mod model;
 
@@ -27,6 +30,8 @@ const DANGER_TEXT: Color32 = Color32::from_rgb(0xf0, 0x80, 0x7a);
 const DANGER_BORDER: Color32 = Color32::from_rgb(0x4a, 0x2c, 0x2b);
 const CHIP_BG: Color32 = Color32::from_rgba_premultiplied(12, 13, 14, 214);
 const ASIDE: f32 = 272.0;
+/// The right panel with Duplicates on: the group rows need the room.
+const ASIDE_DUPES: f32 = 340.0;
 
 /// File type colours of design G. The add-on's own category colours are reused where they
 /// already match (videos, images, system); every non-empty entry is colourful.
@@ -122,6 +127,8 @@ struct View {
     color_by: ColorBy,
     highlight: String,
     pick: Option<Pick>,
+    /// Duplicates on: the right panel lists duplicate groups and the map colours them.
+    dupes: bool,
 }
 impl View {
     fn new(generation: u64, focus: usize) -> Self {
@@ -133,6 +140,7 @@ impl View {
             color_by: ColorBy::Type,
             highlight: String::new(),
             pick: None,
+            dupes: false,
         }
     }
 }
@@ -234,6 +242,7 @@ pub struct Explorer {
     close_requested: bool,
     /// Where the map was drawn, for a menu opened from the keyboard.
     map_origin: Vec2,
+    dupes: dupes_ui::Dupes,
     #[cfg(test)]
     map_rect: Option<Rect>,
 }
@@ -260,6 +269,7 @@ impl Explorer {
     /// Frees the last map once a newer scan is in, also while the explorer is closed: a map
     /// holds its whole scan in memory.
     pub fn forget_old(&mut self, p: &Progress) {
+        self.dupes.sync(p.generation);
         if !p.running
             && !self.open
             && self
@@ -272,6 +282,19 @@ impl Explorer {
             self.job = None;
         }
     }
+    /// A duplicates search or delete is running.
+    pub fn busy(&self) -> bool {
+        self.dupes.busy()
+    }
+    /// Duplicates are being deleted: no other delete may start.
+    pub fn deleting(&self) -> bool {
+        self.dupes.deleting()
+    }
+    /// The paths a finished duplicates delete removed and the scan they came from, once, for
+    /// the add-on to take out of the scan like a single delete.
+    pub fn take_deleted(&mut self) -> Option<(u64, Vec<String>)> {
+        self.dupes.take_deleted()
+    }
     #[cfg(test)]
     pub(crate) fn has_map(&self) -> bool {
         self.model.is_some()
@@ -279,6 +302,31 @@ impl Explorer {
     #[cfg(test)]
     pub(crate) fn zoom_for_test(&mut self, folder: usize) {
         self.zoom_to(folder);
+    }
+    /// Finds the duplicates in `nodes` (any size), waits, and starts deleting every extra copy.
+    /// Returns the number of files the delete will remove.
+    #[cfg(test)]
+    pub(crate) fn delete_duplicates_for_test(
+        &mut self,
+        nodes: Arc<Vec<Node>>,
+        generation: u64,
+        root: &str,
+    ) -> u64 {
+        let ctx = egui::Context::default();
+        self.dupes.min_bytes = 0;
+        self.dupes
+            .start_search(&ctx, nodes, generation, root.to_owned());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while self.dupes.found.is_none() {
+            assert!(std::time::Instant::now() < deadline, "search never ended");
+            self.dupes.poll_search();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let f = self.dupes.found.as_ref().unwrap();
+        let plan = dupes::plan(&f.groups, None, 0, generation, String::new()).unwrap();
+        let files = plan.files();
+        self.dupes.start_delete(&ctx, plan, root.to_owned());
+        files
     }
     /// Drops the map and everything remembered (the add-on was suspended).
     pub fn reset(&mut self) {
@@ -289,6 +337,7 @@ impl Explorer {
     }
     /// After a delete patched the scan: keeps the view on the same entries under their new ids.
     pub fn remap(&mut self, map: &[Option<usize>], old: u64, new: u64) {
+        self.dupes.remap(map, old, new);
         self.layout = None;
         self.menu = None;
         let Some(view) = self.view.as_mut().filter(|v| v.generation == old) else {
@@ -407,6 +456,7 @@ impl Explorer {
         modal: bool,
     ) -> Vec<Command> {
         let mut out = vec![];
+        let modal_other = modal;
         let filters = Filters {
             min_bytes: list.0,
             older_days: list.1,
@@ -416,6 +466,13 @@ impl Explorer {
             self.want(ui.ctx(), nodes, p, filters);
         }
         self.poll();
+        self.dupes.sync(p.generation);
+        self.dupes.poll_search();
+        if self.dupes.busy() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        let modal = modal || self.dupes.confirm.is_some();
         let model = self.model.clone().filter(|m| {
             self.view
                 .as_ref()
@@ -439,7 +496,13 @@ impl Explorer {
         self.toolbar(ui, &model);
         ui.add_space(theme::SPACE_M);
         let body = ui.available_rect_before_wrap();
-        let aside = if body.width() >= 760.0 { ASIDE } else { 220.0 };
+        let aside = if self.view().dupes && body.width() >= 1000.0 {
+            ASIDE_DUPES
+        } else if body.width() >= 760.0 {
+            ASIDE
+        } else {
+            220.0
+        };
         let card = Rect::from_min_max(body.min, egui::pos2(body.max.x - aside - 12.0, body.max.y))
             .with_max_y(body.max.y.max(body.min.y + 240.0));
         ui.painter().rect(
@@ -462,11 +525,30 @@ impl Explorer {
             egui::pos2(body.max.x, card.max.y),
         );
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(aside_rect));
+        let dupes = self.view().dupes;
         egui::ScrollArea::vertical()
-            .id_salt("space-explorer-aside")
-            .show(&mut child, |ui| self.aside(ui, &model, &layout, &mut out));
+            .id_salt(if dupes {
+                "space-explorer-dupes"
+            } else {
+                "space-explorer-aside"
+            })
+            .show(&mut child, |ui| {
+                if dupes {
+                    self.dupes_panel(ui, &model, &layout, &p.root, p.running, modal, &mut out);
+                } else {
+                    self.aside(ui, &model, &layout, &mut out)
+                }
+            });
         ui.advance_cursor_after_rect(card.union(aside_rect));
         self.global_keys(ui, Some((&model, &layout)), keys_off, menu_open, &mut out);
+        let blocked = if p.running {
+            Some("Wait for the scan to finish, then try again.")
+        } else if modal_other {
+            Some("Wait for the other delete to finish.")
+        } else {
+            None
+        };
+        self.dupes_confirm(ui.ctx(), &p.root, blocked);
         out
     }
 
@@ -620,7 +702,7 @@ impl Explorer {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui, model: &Model) {
-        const CONTROLS: f32 = 690.0;
+        const CONTROLS: f32 = 800.0;
         let crumbs_width = ui.available_width() - CONTROLS - 16.0;
         if crumbs_width >= 160.0 {
             ui.horizontal(|ui| {
@@ -702,7 +784,7 @@ impl Explorer {
                     (ColorBy::Age, "Age"),
                     (ColorBy::Folder, "Folder"),
                 ] {
-                    let on = view.color_by == mode;
+                    let on = view.color_by == mode && !view.dupes;
                     let r = ui.add(
                         egui::Button::new(if on {
                             RichText::new(label).color(TEXT).strong()
@@ -728,12 +810,38 @@ impl Explorer {
                     });
                     if r.clicked() && !on {
                         view.color_by = mode;
+                        view.dupes = false;
                         if !matches!(view.pick, Some(Pick::Type(_))) {
                             view.pick = None;
                         }
                     }
                 }
             });
+        let view = self.view_mut();
+        let on = view.dupes;
+        let r = ui
+            .add(
+                theme::outlined("Duplicates")
+                    .fill(if on {
+                        SELECTED_BG
+                    } else {
+                        Color32::TRANSPARENT
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if on { ACCENT } else { theme::CONTROL_BORDER },
+                    )),
+            )
+            .on_hover_text(if on {
+                "Back to the usual colours and panel"
+            } else {
+                "Find files with the same content, sort them and delete extra copies"
+            });
+        r.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, on, "Duplicates"));
+        if r.clicked() {
+            view.dupes = !on;
+            view.pick = None;
+        }
         let at_top = self.view().focus == 0 && self.view().camera == Camera::default();
         let target = self
             .selected_folder(model)
@@ -866,6 +974,9 @@ impl Explorer {
                     Some(folder) => self.zoom_to(folder as usize),
                     None => self.select(hit, add),
                 }
+                if self.view().dupes {
+                    self.dupes_follow_selection();
+                }
             } else if let Some(sel) = hit.or(chip.map(Sel::Node)) {
                 if !self.view().selected.contains(&sel) {
                     self.view_mut().selected = vec![sel];
@@ -884,6 +995,7 @@ impl Explorer {
             let r = t.rect.translate(origin);
             let bright = !dimming || matches(model, t, &query, view.pick, &mut memo);
             let mut fill = match t.kind {
+                _ if view.dupes => self.dupes_fill(t.kind),
                 TileKind::Hidden { .. } => SELECTED_BG,
                 TileKind::Group { .. } => mix(tile_color(model, t, view.color_by), MAP_BG, 0.45),
                 TileKind::File(_) => tile_color(model, t, view.color_by),
@@ -1089,6 +1201,7 @@ impl Explorer {
         let mut open = true;
         let mut act = None;
         let is_node = matches!(sel, Sel::Node(_));
+        let has_copies = matches!(sel, Sel::Node(id) if self.dupes.group_of(id).is_some());
         egui::Popup::new(id.with("menu"), ui.ctx().clone(), pos, ui.layer_id())
             .kind(egui::PopupKind::Menu)
             .open_bool(&mut open)
@@ -1107,6 +1220,10 @@ impl Explorer {
                         act = Some(a);
                         ui.close();
                     }
+                }
+                if has_copies && ui.button("Select its other copies").clicked() {
+                    act = Some(Act::OtherCopies);
+                    ui.close();
                 }
                 ui.separator();
                 let delete = ui
@@ -1177,6 +1294,20 @@ impl Explorer {
             Act::Highlight => {
                 let c = model.category(target(first));
                 self.view_mut().pick = Some(Pick::Type(c));
+            }
+            Act::OtherCopies => {
+                if let Sel::Node(id) = first {
+                    let others: Vec<Sel> = self
+                        .dupes
+                        .copies_of(*id)
+                        .into_iter()
+                        .filter(|c| c != id)
+                        .map(Sel::Node)
+                        .collect();
+                    if !others.is_empty() {
+                        self.view_mut().selected = others;
+                    }
+                }
             }
             Act::Delete if sels.len() == 1 => {
                 if let Sel::Node(id) = first {
@@ -1637,6 +1768,7 @@ enum Act {
     Copy,
     Zoom,
     Highlight,
+    OtherCopies,
     Delete,
 }
 

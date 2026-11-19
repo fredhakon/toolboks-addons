@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "manifest": {
+    "id": "toolboks.testdeck",
+    "title": "Testdeck",
+    "native_provider": "toolboks.testdeck",
+    "description": "Queue the heavy test and build jobs that coding agents start on this PC.",
+    "long_description": "Testdeck is for developers who let AI coding agents run tests and builds. It runs a small job queue that only programs on this PC can reach (127.0.0.1, port 47123 by default). Agents ask it for a slot before a heavy test or build and wait their turn, so the PC is not swamped. While Toolboks runs, also hidden in the tray, Testdeck watches those jobs: it lowers the priority of their processes, limits them to a share of the processor cores, and can end a job, its child processes or leftover test processes, when you press Kill or when free memory runs very low. It keeps a job history and a cache of test results in its data folder. The AI setup page can install or repair the helper scripts in the .claude/gate folder in your user folder and add one hook to .claude/settings.json there; it only does that when you press Install, keeps a backup of every file it changes and can undo it. It can show Windows notifications when a long run ends. Nothing is sent anywhere.",
+    "version": "0.1.0",
+    "author": "Toolboks team",
+    "publisher": "Toolboks",
+    "category": "Developer tools",
+    "icon": "layers",
+    "accent": "#A48ACA",
+    "api_version": 2,
+    "min_toolboks_version": "0.15.0",
+    "website": "https://github.com/Gusseti/toolboks",
+    "support_url": "https://github.com/Gusseti/toolboks/issues",
+    "license": "MIT",
+    "capabilities": [
+      "host_metrics",
+      "local_preferences"
+    ],
+    "data_note": "Keeps a history of this PC's test and build jobs (commands, times, results) and a test result cache on this PC. Nothing is sent anywhere."
+  },
+  "pages": []
+}

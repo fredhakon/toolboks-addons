@@ -18,7 +18,7 @@ pub struct Managed {
     pub content: &'static str,
 }
 
-pub const MANAGED: [Managed; 5] = [
+pub const MANAGED: [Managed; 6] = [
     Managed {
         name: "slots.sh",
         hook: false,
@@ -28,6 +28,11 @@ pub const MANAGED: [Managed; 5] = [
         name: "jt.sh",
         hook: false,
         content: include_str!("../gate/jt.sh"),
+    },
+    Managed {
+        name: "heavy.sh",
+        hook: false,
+        content: include_str!("../gate/heavy.sh"),
     },
     Managed {
         name: "testdeck-client.sh",

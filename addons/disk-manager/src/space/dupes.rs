@@ -4,19 +4,32 @@
 //! then a SHA-256 of their whole content; only equal full hashes are duplicates. Results live
 //! in memory only. Deleting re-checks every file first and always leaves one copy.
 use crate::delete;
-use crate::scanner::Node;
+use crate::scanner::{Kind, Node};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
     io::{Read, Seek, SeekFrom},
     path::Path,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 /// "Ignore files smaller than": 0 B, 1 MiB, 10 MiB, 100 MiB.
 pub const MIN_OPTIONS: [u64; 4] = [0, 1 << 20, 10 << 20, 100 << 20];
 pub const DEFAULT_MIN: u64 = 1 << 20;
+/// How many threads "Auto" reads with: one on a hard disk (several make the head seek back and
+/// forth, which is slower), a few on a network drive, most of the cores otherwise.
+pub fn auto_threads(kind: Kind, cores: usize) -> usize {
+    match kind {
+        Kind::Hdd => 1,
+        Kind::Network => cores.clamp(1, 4),
+        Kind::Fast => cores.saturating_sub(1).clamp(1, 8),
+    }
+}
+/// Cores the PC reports (at least 1).
+pub fn cores() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
 /// The quick hash reads this much from each end of a file.
 const EDGE: u64 = 64 * 1024;
 const BUFFER: usize = 1 << 20;
@@ -427,8 +440,143 @@ struct Read1 {
     links: Option<u32>,
 }
 
-/// Finds the duplicates among `nodes`. Reads files only; never changes anything. `cancel`
-/// stops it between reads; what was found so far is returned with `stopped` set.
+/// What checking all the files of one size found.
+#[derive(Default)]
+struct SizeOut {
+    groups: Vec<(u64, [u8; 32], Vec<Read1>)>,
+    checked: u64,
+    cloud: u64,
+    changed: u64,
+    unreadable: u64,
+    stopped: bool,
+}
+
+/// Checks every file of one size: the quick hash of all of them, then the full hash of the ones
+/// whose quick hashes match another's. Reads one file at a time.
+fn check_size(
+    nodes: &[Node],
+    len: u64,
+    ids: &[usize],
+    cancel: &AtomicBool,
+    counters: &Counters,
+) -> SizeOut {
+    let mut out = SizeOut::default();
+    // Quick step: the first and last 64 KiB (the whole file when it is that small).
+    let mut quick: HashMap<[u8; 32], Vec<Read1>> = HashMap::new();
+    let mut order = vec![];
+    for &id in ids {
+        if cancel.load(Ordering::Relaxed) {
+            out.stopped = true;
+            return out;
+        }
+        let n = &nodes[id];
+        let result = open(&n.path, len)
+            .and_then(|mut o| hash(&mut o.file, len, true, cancel, counters).map(|h| (h, o)));
+        match result {
+            Ok((h, o)) => {
+                if !quick.contains_key(&h) {
+                    order.push(h);
+                }
+                quick.entry(h).or_default().push(Read1 {
+                    node: id,
+                    stamp: o.stamp,
+                    id: o.id,
+                    links: o.links,
+                });
+            }
+            Err(Skip::Stopped) => {
+                out.stopped = true;
+                return out;
+            }
+            Err(Skip::Cloud) => out.cloud += 1,
+            Err(Skip::Changed) => out.changed += 1,
+            Err(Skip::Unreadable) => out.unreadable += 1,
+        }
+        out.checked += 1;
+        counters.checked.fetch_add(1, Ordering::Relaxed);
+    }
+    // Full step: only files whose quick hashes match another's.
+    for qh in order {
+        let same = quick.remove(&qh).unwrap_or_default();
+        if same.len() < 2 {
+            continue;
+        }
+        if quick_is_full(len) {
+            out.groups.push((len, qh, same));
+            continue;
+        }
+        let mut full: HashMap<[u8; 32], Vec<Read1>> = HashMap::new();
+        let mut full_order = vec![];
+        for r in same {
+            let n = &nodes[r.node];
+            let result = open(&n.path, len).and_then(|mut o| {
+                if o.stamp != r.stamp {
+                    return Err(Skip::Changed);
+                }
+                hash(&mut o.file, len, false, cancel, counters)
+            });
+            match result {
+                Ok(h) => {
+                    if !full.contains_key(&h) {
+                        full_order.push(h);
+                    }
+                    full.entry(h).or_default().push(r);
+                }
+                Err(Skip::Stopped) => {
+                    out.stopped = true;
+                    return out;
+                }
+                Err(Skip::Cloud) => out.cloud += 1,
+                Err(Skip::Changed) => out.changed += 1,
+                Err(Skip::Unreadable) => out.unreadable += 1,
+            }
+        }
+        for fh in full_order {
+            let same = full.remove(&fh).unwrap_or_default();
+            if same.len() > 1 {
+                out.groups.push((len, fh, same));
+            }
+        }
+    }
+    out
+}
+
+/// Runs `work(0..n)` on up to `threads` threads, each taking the next unstarted item, and
+/// returns the results by item. Items not started when `cancel` is set are left out.
+fn parallel<T: Send>(
+    threads: usize,
+    n: usize,
+    cancel: &AtomicBool,
+    work: impl Fn(usize) -> T + Sync,
+) -> Vec<(usize, T)> {
+    let next = AtomicUsize::new(0);
+    let run = || {
+        let mut done = vec![];
+        while !cancel.load(Ordering::Relaxed) {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            done.push((i, work(i)));
+        }
+        done
+    };
+    let threads = threads.clamp(1, n.max(1));
+    if threads == 1 {
+        return run();
+    }
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads).map(|_| s.spawn(run)).collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+/// Finds the duplicates among `nodes`, reading on `threads` threads (1 reads one file at a
+/// time). Reads files only; never changes anything. `cancel` stops it between reads; what was
+/// found so far is returned with `stopped` set.
 pub fn find(
     nodes: &[Node],
     generation: u64,
@@ -436,6 +584,7 @@ pub fn find(
     protected: Guard,
     cancel: &AtomicBool,
     counters: &Counters,
+    threads: usize,
 ) -> Found {
     let (considered, sizes) = candidates(nodes, min_bytes);
     let mut found = Found {
@@ -446,85 +595,18 @@ pub fn find(
         ..Default::default()
     };
     counters.total.store(found.candidates, Ordering::Relaxed);
+    let mut outs = parallel(threads, sizes.len(), cancel, |i| {
+        check_size(nodes, sizes[i].0, &sizes[i].1, cancel, counters)
+    });
+    found.stopped = outs.len() < sizes.len() || outs.iter().any(|o| o.1.stopped);
+    outs.sort_by_key(|o| o.0);
     let mut groups: Vec<(u64, [u8; 32], Vec<Read1>)> = vec![];
-    'sizes: for (len, ids) in sizes {
-        // Quick step: the first and last 64 KiB (the whole file when it is that small).
-        let mut quick: HashMap<[u8; 32], Vec<Read1>> = HashMap::new();
-        let mut order = vec![];
-        for id in ids {
-            if cancel.load(Ordering::Relaxed) {
-                found.stopped = true;
-                break 'sizes;
-            }
-            let n = &nodes[id];
-            let result = open(&n.path, len)
-                .and_then(|mut o| hash(&mut o.file, len, true, cancel, counters).map(|h| (h, o)));
-            match result {
-                Ok((h, o)) => {
-                    if !quick.contains_key(&h) {
-                        order.push(h);
-                    }
-                    quick.entry(h).or_default().push(Read1 {
-                        node: id,
-                        stamp: o.stamp,
-                        id: o.id,
-                        links: o.links,
-                    });
-                }
-                Err(Skip::Stopped) => {
-                    found.stopped = true;
-                    break 'sizes;
-                }
-                Err(Skip::Cloud) => found.cloud += 1,
-                Err(Skip::Changed) => found.changed += 1,
-                Err(Skip::Unreadable) => found.unreadable += 1,
-            }
-            found.checked += 1;
-            counters.checked.fetch_add(1, Ordering::Relaxed);
-        }
-        // Full step: only files whose quick hashes match another's.
-        for qh in order {
-            let same = quick.remove(&qh).unwrap_or_default();
-            if same.len() < 2 {
-                continue;
-            }
-            if quick_is_full(len) {
-                groups.push((len, qh, same));
-                continue;
-            }
-            let mut full: HashMap<[u8; 32], Vec<Read1>> = HashMap::new();
-            let mut full_order = vec![];
-            for r in same {
-                let n = &nodes[r.node];
-                let result = open(&n.path, len).and_then(|mut o| {
-                    if o.stamp != r.stamp {
-                        return Err(Skip::Changed);
-                    }
-                    hash(&mut o.file, len, false, cancel, counters)
-                });
-                match result {
-                    Ok(h) => {
-                        if !full.contains_key(&h) {
-                            full_order.push(h);
-                        }
-                        full.entry(h).or_default().push(r);
-                    }
-                    Err(Skip::Stopped) => {
-                        found.stopped = true;
-                        break 'sizes;
-                    }
-                    Err(Skip::Cloud) => found.cloud += 1,
-                    Err(Skip::Changed) => found.changed += 1,
-                    Err(Skip::Unreadable) => found.unreadable += 1,
-                }
-            }
-            for fh in full_order {
-                let same = full.remove(&fh).unwrap_or_default();
-                if same.len() > 1 {
-                    groups.push((len, fh, same));
-                }
-            }
-        }
+    for (_, o) in outs {
+        found.checked += o.checked;
+        found.cloud += o.cloud;
+        found.changed += o.changed;
+        found.unreadable += o.unreadable;
+        groups.extend(o.groups);
     }
     found.bytes_read = counters.bytes.load(Ordering::Relaxed);
     // Hard links: two names of one file are one copy, and saves nothing.
@@ -857,6 +939,7 @@ mod tests {
             &none,
             &AtomicBool::new(false),
             &Counters::default(),
+            1,
         )
     }
     fn names(g: &Group) -> Vec<&str> {
@@ -984,6 +1067,60 @@ mod tests {
         assert_eq!(found.groups[0].bytes, 3000);
         assert_eq!(found.considered, 2);
         assert!(MIN_OPTIONS.contains(&DEFAULT_MIN) && DEFAULT_MIN == 1 << 20);
+    }
+
+    #[test]
+    fn auto_uses_one_thread_on_a_hard_disk_and_most_cores_otherwise() {
+        assert_eq!(auto_threads(Kind::Hdd, 16), 1);
+        assert_eq!(auto_threads(Kind::Network, 16), 4);
+        assert_eq!(auto_threads(Kind::Network, 2), 2);
+        assert_eq!(auto_threads(Kind::Fast, 16), 8, "capped");
+        assert_eq!(auto_threads(Kind::Fast, 4), 3, "one core stays free");
+        assert_eq!(auto_threads(Kind::Fast, 1), 1);
+        assert_eq!(auto_threads(Kind::Fast, 0), 1);
+    }
+
+    #[test]
+    fn several_threads_find_the_same_duplicates_as_one() {
+        let t = tmp("threads");
+        // Many sizes, some with duplicates, some with lookalikes (same size, different content).
+        for size in 1..=40usize {
+            let a = vec![size as u8; size * 700];
+            let mut b = a.clone();
+            *b.last_mut().unwrap() ^= 1;
+            write(t.path(), &format!("a/{size}.bin"), &a);
+            write(
+                t.path(),
+                &format!("b/{size}.bin"),
+                if size % 3 == 0 { &b } else { &a },
+            );
+            write(t.path(), &format!("c/{size}.bin"), &a);
+        }
+        let (_, nodes) = scan(t.path());
+        let shape = |f: &Found| {
+            let mut v: Vec<(u64, Vec<String>)> = f
+                .groups
+                .iter()
+                .map(|g| (g.bytes, g.copies.iter().map(|c| c.path.clone()).collect()))
+                .collect();
+            v.sort();
+            (v, f.checked, f.candidates, f.stopped)
+        };
+        let one = shape(&search(&nodes, 0));
+        for threads in [2, 4, 16] {
+            let found = find(
+                &nodes,
+                1,
+                0,
+                &none,
+                &AtomicBool::new(false),
+                &Counters::default(),
+                threads,
+            );
+            assert_eq!(shape(&found), one, "{threads} threads");
+        }
+        assert_eq!(one.0.len(), 40);
+        assert!(!one.3);
     }
 
     #[test]
@@ -1259,6 +1396,7 @@ mod tests {
             &guard,
             &AtomicBool::new(false),
             &Counters::default(),
+            1,
         );
         let g = &mut found.groups[0];
         let pf = g
@@ -1332,7 +1470,7 @@ mod tests {
         }
         let (_, nodes) = scan(t.path());
         let stop = AtomicBool::new(true);
-        let found = find(&nodes, 1, 0, &none, &stop, &Counters::default());
+        let found = find(&nodes, 1, 0, &none, &stop, &Counters::default(), 1);
         assert!(found.stopped);
         assert!(found.groups.is_empty());
         assert_eq!(found.checked, 0);
@@ -1349,7 +1487,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(Counters::default());
         let (s, c, n) = (stop.clone(), counters.clone(), nodes.clone());
-        let worker = std::thread::spawn(move || find(&n, 1, 0, &none, &s, &c));
+        let worker = std::thread::spawn(move || find(&n, 1, 0, &none, &s, &c, 1));
         stop.store(true, Ordering::Relaxed);
         let found = worker.join().unwrap();
         assert!(found.checked <= found.candidates);

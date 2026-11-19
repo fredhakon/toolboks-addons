@@ -1164,6 +1164,36 @@
       "release_notes": "Release system-profiles-v0.2.1.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.macro-manager",
+      "title": "Macro Manager",
+      "short_description": "Record, edit and repeat keyboard and mouse actions.",
+      "long_description": "Record keystrokes, mouse movements, clicks and scrolling when you choose. Edit steps and movement paths, set timings, and replay with an optional repeat delay and duration. Configurable shortcuts control recording and playback; Escape stops active work. Macros and settings stay on this PC. Playback sends real input to the active desktop.",
+      "publisher": "Toolboks",
+      "category": "Automation",
+      "icon": "macro",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "input_automation",
+        "local_preferences"
+      ],
+      "pages": [
+        "Editor",
+        "Mouse editor"
+      ],
+      "background": true,
+      "kind": "native",
+      "version": "0.1.1",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/macro-manager-v0.1.1/macro-manager.exe",
+      "size": 3374592,
+      "sha256": "74db3156a375d0a57c01e01ed0de0a9c4aed32dd690aacaa65c46807d86e6c33",
+      "release_notes": "Release macro-manager-v0.1.1.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

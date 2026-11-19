@@ -141,7 +141,7 @@ struct Job {
 
 /// Disk kind of the volume holding a scan root, used to pick the thread count.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
+pub(crate) enum Kind {
     Fast,
     Hdd,
     Network,
@@ -157,7 +157,7 @@ fn thread_count(root: &Path) -> usize {
     }
 }
 #[cfg(windows)]
-fn volume_kind(root: &Path) -> Kind {
+pub(crate) fn volume_kind(root: &Path) -> Kind {
     use std::path::{Component, Prefix};
     use windows::{
         core::PCWSTR,
@@ -227,7 +227,7 @@ fn volume_kind(root: &Path) -> Kind {
     }
 }
 #[cfg(not(windows))]
-fn volume_kind(_: &Path) -> Kind {
+pub(crate) fn volume_kind(_: &Path) -> Kind {
     Kind::Fast
 }
 

@@ -1002,6 +1002,39 @@
       "release_notes": "Release disk-manager-v0.9.2.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.memory-cleaner",
+      "title": "Memory Cleaner",
+      "short_description": "Keep an eye on memory and clean up what idle apps are holding.",
+      "long_description": "Memory Cleaner shows how your memory is used, which apps hold the most, and how close Windows is to running short. It can trim the memory that idle apps are not using, by hand or automatically when memory is under real pressure, and it keeps a short history. Trimming moves memory into the cache and never closes an app. One advanced action, clearing the low-priority cache, changes how Windows manages memory for the whole PC: it asks for administrator rights in a separate window and only runs when you confirm there. It also reports to Home whether memory is under pressure, kept in memory only and never saved. Nothing is stored between runs.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "chip",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "host_metrics",
+        "system_tuning"
+      ],
+      "pages": [
+        "Home",
+        "Advanced"
+      ],
+      "background": true,
+      "checks": [
+        "Memory pressure"
+      ],
+      "kind": "native",
+      "version": "0.4.1",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/memory-cleaner-v0.4.1/memory-cleaner.exe",
+      "size": 3597824,
+      "sha256": "5f9b98a440682798f7e2bc3736e3763f9c349e6689e08f1aa818b1dda6485e5f",
+      "release_notes": "Release memory-cleaner-v0.4.1.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

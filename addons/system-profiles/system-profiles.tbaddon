@@ -6,7 +6,7 @@
     "native_provider": "toolboks.system-profiles",
     "description": "Review and apply a Windows gaming profile with a restore point, registry backup, and activity log.",
     "long_description": "Choose the Gaming profile changes to apply, follow guided Windows and NVIDIA settings, and restore the settings Toolboks applied.",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "author": "Toolboks",
     "publisher": "Toolboks",
     "category": "System",

@@ -117,24 +117,37 @@ fn explain(shown: &str, e: &std::io::Error, partial: bool) -> String {
     }
 }
 
-/// The scan without the entry at `path` and everything under it. Totals of every parent, the
+/// The scan without the entries at `paths` and everything under them (one entry after a
+/// single delete, many after a duplicates delete), in one pass. Totals of every parent, the
 /// scan totals and the file-type list shrink to match. Returns the new nodes and a map from
-/// old ids to new ids, or `None` when `path` is not in the scan.
-pub fn remove(
+/// old ids to new ids, or `None` when none of the paths is in the scan (the root never is).
+pub fn remove_all(
     progress: &mut Progress,
     nodes: &[Node],
-    path: &str,
+    paths: &[String],
 ) -> Option<(Vec<Node>, Vec<Option<usize>>)> {
-    let target = nodes
-        .iter()
-        .position(|n| n.path == path)
-        .filter(|&i| i > 0)?;
-    // Parents always come before their children, so one pass marks the whole subtree.
+    let wanted: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+    let mut target = vec![false; nodes.len()];
+    let mut first = None;
+    for n in nodes.iter().skip(1) {
+        if n.id < nodes.len() && wanted.contains(n.path.as_str()) && !target[n.id] {
+            target[n.id] = true;
+            first.get_or_insert(n.id);
+        }
+    }
+    let first = first?;
+    // Parents always come before their children, so one pass marks every subtree. A target
+    // inside another target is gone with it and is not counted twice.
     let mut gone = vec![false; nodes.len()];
+    let mut tops = vec![];
     let mut ext: std::collections::HashMap<String, (u64, u64)> = Default::default();
     let mut folders = 0u64;
-    for n in &nodes[target..] {
-        if n.id == target || n.parent.is_some_and(|p| gone[p]) {
+    for n in &nodes[first..] {
+        let under = n.parent.is_some_and(|p| gone[p]);
+        if target[n.id] && !under {
+            tops.push(n.id);
+        }
+        if target[n.id] || under {
             gone[n.id] = true;
             if n.dir {
                 folders += 1;
@@ -149,7 +162,6 @@ pub fn remove(
             }
         }
     }
-    let (bytes, files) = (nodes[target].bytes, nodes[target].files);
     let mut map = vec![None; nodes.len()];
     let mut out = Vec::with_capacity(nodes.len());
     for n in nodes.iter().filter(|n| !gone[n.id]) {
@@ -159,12 +171,18 @@ pub fn remove(
         n.parent = n.parent.and_then(|p| map[p]);
         out.push(n);
     }
-    let mut ancestor = nodes[target].parent;
-    while let Some(id) = ancestor {
-        let n = &mut out[map[id]?];
-        n.bytes = n.bytes.saturating_sub(bytes);
-        n.files = n.files.saturating_sub(files);
-        ancestor = nodes[id].parent;
+    let (mut bytes, mut files) = (0u64, 0u64);
+    for &target in &tops {
+        let (b, f) = (nodes[target].bytes, nodes[target].files);
+        bytes = bytes.saturating_add(b);
+        files = files.saturating_add(f);
+        let mut ancestor = nodes[target].parent;
+        while let Some(id) = ancestor {
+            let n = &mut out[map[id]?];
+            n.bytes = n.bytes.saturating_sub(b);
+            n.files = n.files.saturating_sub(f);
+            ancestor = nodes[id].parent;
+        }
     }
     progress.bytes = progress.bytes.saturating_sub(bytes);
     progress.files = progress.files.saturating_sub(files);
@@ -203,6 +221,13 @@ mod tests {
         );
         let s = state.lock().unwrap();
         (s.progress.clone(), s.nodes.to_vec())
+    }
+    fn remove(
+        progress: &mut Progress,
+        nodes: &[Node],
+        path: &str,
+    ) -> Option<(Vec<Node>, Vec<Option<usize>>)> {
+        remove_all(progress, nodes, &[path.to_owned()])
     }
     fn request(n: &Node, generation: u64) -> Request {
         Request {
@@ -305,6 +330,67 @@ mod tests {
             remove(&mut p, &nodes, &nodes[0].path).is_none(),
             "never the root"
         );
+    }
+
+    #[test]
+    fn several_entries_leave_in_one_pass_and_nested_ones_count_once() {
+        let n = |id: usize, parent: Option<usize>, name: &str, dir: bool, bytes, files| Node {
+            id,
+            parent,
+            name: name.into(),
+            path: format!(r"D:\{name}"),
+            dir,
+            bytes,
+            files,
+            modified: 0,
+            dir_stamp: 0,
+        };
+        let nodes = vec![
+            n(0, None, "root", true, 111, 4),
+            n(1, Some(0), "a", true, 101, 3),
+            n(2, Some(1), "a1.bin", false, 1, 1),
+            n(3, Some(1), "a2.bin", false, 100, 1),
+            n(4, Some(1), "a3.txt", false, 0, 1),
+            n(5, Some(0), "b.txt", false, 10, 1),
+        ];
+        let mut p = Progress {
+            bytes: 111,
+            files: 4,
+            folders: 1,
+            extensions: vec![
+                Extension {
+                    name: ".bin".into(),
+                    bytes: 101,
+                    files: 2,
+                },
+                Extension {
+                    name: ".txt".into(),
+                    bytes: 10,
+                    files: 2,
+                },
+            ],
+            ..Default::default()
+        };
+        let paths = [r"D:\a2.bin", r"D:\b.txt", r"D:\not there"].map(String::from);
+        let (out, map) = remove_all(&mut p, &nodes, &paths).unwrap();
+        assert_eq!(map, [Some(0), Some(1), Some(2), None, Some(3), None]);
+        assert_eq!((out[0].bytes, out[0].files), (1, 2));
+        assert_eq!((out[1].bytes, out[1].files), (1, 2));
+        assert_eq!((p.bytes, p.files, p.folders), (1, 2, 1));
+        assert_eq!(p.extensions.len(), 2);
+        // A folder and a file inside it: the file is not taken off twice.
+        let mut p2 = Progress {
+            bytes: 111,
+            files: 4,
+            folders: 1,
+            ..Default::default()
+        };
+        let paths = [r"D:\a2.bin", r"D:\a"].map(String::from);
+        let (out, _) = remove_all(&mut p2, &nodes, &paths).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].bytes, out[0].files), (10, 1));
+        assert_eq!((p2.bytes, p2.files, p2.folders), (10, 1, 0));
+        assert!(remove_all(&mut p2, &nodes, &[r"D:\root".into()]).is_none());
     }
 
     #[test]

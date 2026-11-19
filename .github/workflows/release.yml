@@ -26,28 +26,16 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           ./scripts/check-release.ps1 -Tag $env:RELEASE_TAG | Out-File $env:GITHUB_OUTPUT -Append -Encoding ascii
-      - name: Test only the selected add-on
+      # The full checks, including every add-on's tests and the release exe's protocol test, run on the
+      # developer's PC before anything is merged to main (README, "Build and test"). GitHub's runner is
+      # slow at them, so this job only builds the release executable.
+      - name: Build the selected add-on
         shell: pwsh
         env:
           ADDON: ${{ steps.release.outputs.addon }}
-          # The runner is an administrator. Test builds of the SDK may then start elevated; the
-          # release exe ignores this switch and always refuses, so the shipped add-on is unchanged.
-          TOOLBOKS_TEST_ALLOW_ELEVATED: "1"
         run: |
-          cargo test --locked -p $env:ADDON
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --release -p $env:ADDON
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-          if ($admin) {
-            # A release exe refuses to run as administrator on purpose and GitHub's runner is one,
-            # so these tests cannot run here. Run them on a normal account before tagging.
-            Write-Host "::notice::Protocol tests skipped: this runner is an administrator and the release exe refuses to run as one."
-          } else {
-            $env:ADDON_TEST_EXE = (Resolve-Path "target/release/$env:ADDON.exe").Path
-            cargo test --locked -p $env:ADDON --test protocol
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
       - name: Package executable and checksum
         shell: pwsh
         env:

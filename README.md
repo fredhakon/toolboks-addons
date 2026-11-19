@@ -62,6 +62,10 @@ $env:ADDON_TEST_EXE = (Resolve-Path target/release/hello.exe).Path
 cargo test --locked -p hello --test protocol
 ```
 
+Dependabot (`.github/dependabot.yml`) opens weekly pull requests into `staging` for Cargo crates and
+GitHub Actions, minor and patch updates grouped. It leaves the pinned host crates and egui alone; those
+move with the pin. Run the checks below on its pull requests before merging.
+
 Run these checks locally for all add-ons before every merge to `main` and before every tag, and
 merge only when all pass: the full workspace build and tests, `validate`, `fmt`, clippy
 (`cargo clippy --workspace --all-targets --locked -- -D warnings`) and the protocol test of each

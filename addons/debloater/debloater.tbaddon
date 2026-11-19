@@ -6,7 +6,7 @@
     "native_provider": "toolboks.debloater",
     "description": "Tune Windows privacy, apps, startup and background tasks.",
     "long_description": "Debloater explains optional Windows changes in plain language, so you can turn off what you do not need. Nothing is changed until you choose it, and supported changes can be undone later, also after Toolboks closes or Windows restarts: Debloater keeps a small undo list in its own data folder. It changes your own account's settings: privacy and advertising switches, startup entries and installed apps. Changes that need administrator rights are made by a small separate helper that shows its own Confirm or Cancel window listing exactly what will change; Debloater itself never runs as administrator. The Startup page shows how much slower Windows measured an entry to start, read from Windows' boot performance log; the boot timings are read in memory only and never saved. Windows only lets administrators read that log on a default PC, and an administrator can allow reading in the log's access list (Toolboks never changes it).",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "author": "Toolboks team",
     "publisher": "Toolboks",
     "category": "System tools",

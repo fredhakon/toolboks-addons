@@ -1,6 +1,6 @@
 [package]
 name = "resource-monitor"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "Resource Monitor - native Toolboks add-on with live CPU, memory, GPU, disk, network and power graphs"

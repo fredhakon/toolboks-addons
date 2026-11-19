@@ -1,6 +1,6 @@
 [package]
 name = "system-profiles"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "System Profiles - native Toolboks add-on that reviews and applies a Windows gaming profile"

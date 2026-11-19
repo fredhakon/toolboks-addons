@@ -44,7 +44,7 @@ fn package(name: &str) -> Package {
 
 /// The host release the workspace is pinned to (README, "When to move the pin"). Manifests are
 /// checked as this host checks them, so an add-on may need this host but nothing newer.
-const PINNED_HOST: &str = "0.16.0";
+const PINNED_HOST: &str = "0.18.0";
 
 /// The first host release that speaks each protocol newer than 3. A catalog entry at one of these
 /// protocols needs at least that host, so no older host offers it. When the pin moves to a host

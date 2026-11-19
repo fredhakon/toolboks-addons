@@ -1,0 +1,38 @@
+[package]
+name = "testdeck"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Testdeck - native Toolboks background add-on that queues and shows the heavy test and build jobs on this PC"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+egui = { version = "0.37", default-features = false }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+sysinfo = "0.33"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+toml = "0.8"
+toolboks-addon-sdk.workspace = true
+toolboks-shared.workspace = true
+
+[dev-dependencies]
+toolboks-addon-proto.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }

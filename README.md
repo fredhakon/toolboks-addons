@@ -20,8 +20,9 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `25aaa815197ec16b63cdb9d4b71e01d039fde9ca`, the commit of host release **v0.17.2**: it
-contains the Debloater evidence labels in the shared engine (host PR #214). Protocol 5 and the SDK have not changed since
+Host dependencies pin commit `164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f`, the commit of host release **v0.18.0**: it
+adds the `developer_integration` capability that Testdeck declares (host PR #226), after the Debloater evidence labels
+in the shared engine (host PR #214, v0.17.2). Protocol 5 and the SDK have not changed since
 the released host **v0.16.0** (`63beeb11`; its SDK still agrees on 4 or 3 with a host that speaks those, and
 sends a protocol 4 host its findings without `why` and `evidence`), and only the statically linked engine crate
 differs, so the add-ons still run on every host they did. `addon-repo` checks manifests as this host would

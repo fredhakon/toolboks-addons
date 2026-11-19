@@ -1194,6 +1194,34 @@
       "release_notes": "Release macro-manager-v0.1.1.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.aural",
+      "title": "Audio Gainer",
+      "short_description": "Check your microphone level, hear yourself, and route your mic to other apps.",
+      "long_description": "Adjust microphone gain, watch live left and right levels, and monitor through headphones. Sending audio to another app uses a separately installed driver such as VB-Audio Virtual Cable. Aural includes setup instructions and a link to the official installer page.",
+      "publisher": "Toolboks",
+      "byline": "by aural",
+      "category": "Audio",
+      "icon": "mic",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "live_audio",
+        "local_preferences"
+      ],
+      "pages": [],
+      "background": true,
+      "kind": "native",
+      "version": "0.3.2",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/aural-v0.3.2/aural.exe",
+      "size": 3443200,
+      "sha256": "b423b1216ed2ccbf1923c71941ff5da562810b46bf4b82ca6ca49135f90bda4b",
+      "release_notes": "Release aural-v0.3.2.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

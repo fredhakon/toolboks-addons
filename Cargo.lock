@@ -1963,7 +1963,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 [[package]]
 name = "toolboks-addon-proto"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=25aaa815197ec16b63cdb9d4b71e01d039fde9ca#25aaa815197ec16b63cdb9d4b71e01d039fde9ca"
+source = "git+https://github.com/Gusseti/toolboks?rev=164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f#164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f"
 dependencies = [
  "egui",
  "postcard",
@@ -1973,7 +1973,7 @@ dependencies = [
 [[package]]
 name = "toolboks-addon-sdk"
 version = "0.4.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=25aaa815197ec16b63cdb9d4b71e01d039fde9ca#25aaa815197ec16b63cdb9d4b71e01d039fde9ca"
+source = "git+https://github.com/Gusseti/toolboks?rev=164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f#164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f"
 dependencies = [
  "egui",
  "serde",
@@ -1985,7 +1985,7 @@ dependencies = [
 [[package]]
 name = "toolboks-catalog"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=25aaa815197ec16b63cdb9d4b71e01d039fde9ca#25aaa815197ec16b63cdb9d4b71e01d039fde9ca"
+source = "git+https://github.com/Gusseti/toolboks?rev=164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f#164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f"
 dependencies = [
  "serde",
  "serde_json",
@@ -1996,7 +1996,7 @@ dependencies = [
 [[package]]
 name = "toolboks-debloat-engine"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=25aaa815197ec16b63cdb9d4b71e01d039fde9ca#25aaa815197ec16b63cdb9d4b71e01d039fde9ca"
+source = "git+https://github.com/Gusseti/toolboks?rev=164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f#164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f"
 dependencies = [
  "serde",
  "toolboks-shared",
@@ -2006,7 +2006,7 @@ dependencies = [
 [[package]]
 name = "toolboks-shared"
 version = "0.1.0"
-source = "git+https://github.com/Gusseti/toolboks?rev=25aaa815197ec16b63cdb9d4b71e01d039fde9ca#25aaa815197ec16b63cdb9d4b71e01d039fde9ca"
+source = "git+https://github.com/Gusseti/toolboks?rev=164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f#164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f"
 dependencies = [
  "egui",
  "toolboks-addon-sdk",

@@ -13,13 +13,14 @@
     "icon": "layers",
     "accent": "#A48ACA",
     "api_version": 2,
-    "min_toolboks_version": "0.15.0",
+    "min_toolboks_version": "0.18.0",
     "website": "https://github.com/Gusseti/toolboks",
     "support_url": "https://github.com/Gusseti/toolboks/issues",
     "license": "MIT",
     "capabilities": [
       "host_metrics",
-      "local_preferences"
+      "local_preferences",
+      "developer_integration"
     ],
     "data_note": "Keeps a history of this PC's test and build jobs (commands, times, results) and a test result cache on this PC. Nothing is sent anywhere."
   },

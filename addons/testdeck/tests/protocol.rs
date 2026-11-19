@@ -12,7 +12,7 @@ struct Guard(Child);
 #[test]
 fn manifest_matches_the_executable() {
     let package =
-        toolboks_addon_sdk::Package::parse(include_bytes!("../testdeck.tbaddon"), "0.15.0")
+        toolboks_addon_sdk::Package::parse(include_bytes!("../testdeck.tbaddon"), "0.18.0")
             .unwrap();
     assert_eq!(package.manifest.id, "toolboks.testdeck");
     assert_eq!(package.manifest.id, testdeck::ID);
@@ -25,12 +25,12 @@ fn manifest_matches_the_executable() {
         serde_json::from_str(include_str!("../host-services.json")).unwrap();
     assert_eq!(services["pages"], serde_json::json!(testdeck::PAGES));
     assert_eq!(services["background"], true);
-    // TODO: add `developer_integration` here and in testdeck.tbaddon once the host pin includes it.
     assert_eq!(
         package.manifest.capabilities,
         [
             toolboks_addon_sdk::Capability::HostMetrics,
             toolboks_addon_sdk::Capability::LocalPreferences,
+            toolboks_addon_sdk::Capability::DeveloperIntegration,
         ]
     );
 }
@@ -113,6 +113,7 @@ fn protocol_test_host_draws_pings_and_quits() {
             .write(&HostMessage::Capabilities(vec![
                 "host_metrics".into(),
                 "local_preferences".into(),
+                "developer_integration".into(),
             ]))
             .unwrap();
         for page in 0..testdeck::PAGES.len() {

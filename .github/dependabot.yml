@@ -1,0 +1,30 @@
+# Weekly dependency updates as pull requests into staging. Run the full checks locally before merging
+# (README, "Build and test"): no workflow tests these pull requests.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    target-branch: staging
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    ignore:
+      # The host crates move only with a host release (README, "When to move the pin"), and egui must
+      # stay on the version the pinned host uses.
+      - dependency-name: "toolboks-*"
+      - dependency-name: "egui*"
+      - dependency-name: "eframe"
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: staging
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns: ["*"]

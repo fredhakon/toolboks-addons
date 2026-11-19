@@ -62,7 +62,11 @@ $env:ADDON_TEST_EXE = (Resolve-Path target/release/hello.exe).Path
 cargo test --locked -p hello --test protocol
 ```
 
-Run these checks locally for all add-ons before merging; nothing runs them for you. For interactive inspection, use the pinned
+Run these checks locally for all add-ons before every merge to `main` and before every tag, and
+merge only when all pass: the full workspace build and tests, `validate`, `fmt`, clippy
+(`cargo clippy --workspace --all-targets --locked -- -D warnings`) and the protocol test of each
+add-on you release, run against its release exe. Nothing runs them for you; the release workflow
+only builds and publishes. For interactive inspection, use the pinned
 host's `cargo run --example addon_host -- <absolute-hello.exe-path> toolboks.hello`.
 
 ## Budgets
@@ -98,8 +102,8 @@ add-on); those are checked in the host repository.
 2. Tag the main commit, for example `hello-v0.1.0`, and push that tag. **Tag pushes
    publish real public releases.** No workflow creates tags automatically.
 3. The Windows build job validates tag syntax, main ancestry and matching versions,
-   then builds/tests only that crate, including the exact release executable. It
-   reports executable bytes and uploads the exe and `.exe.sha256`.
+   then builds only that crate's release executable (the tests ran on your PC before the
+   merge to main). It reports executable bytes and uploads the exe and `.exe.sha256`.
 4. A separate publish job creates the release. It alone has a write-capable
    `GITHUB_TOKEN` and executes no repository code. All actions use full SHAs.
 5. The catalog job uses the released manifest/protocol pin and executable to update

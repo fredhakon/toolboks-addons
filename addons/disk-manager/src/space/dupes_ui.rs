@@ -8,6 +8,7 @@ use super::{
     DANGER_TEXT, SELECTED_BG,
 };
 use crate::category::Category;
+use crate::scanner::Kind;
 use crate::theme::{self, ACCENT, HAIRLINE, MUTED, TEXT};
 use egui::{Color32, RichText, Sense, Vec2};
 use std::{
@@ -66,6 +67,10 @@ impl Drop for DeleteJob {
 /// Everything the Duplicates panel holds. Results are in memory only.
 pub(super) struct Dupes {
     pub(super) min_bytes: u64,
+    /// Threads a search reads with: `None` is Auto (picked from the drive kind).
+    pub(super) threads: Option<usize>,
+    /// The kind of the scanned drive, looked up once per scanned folder.
+    drive: std::cell::RefCell<Option<(String, Kind)>>,
     sort: SortBy,
     rule: KeepRule,
     /// The folder "Copy in the current folder" used, for the dialog.
@@ -91,6 +96,8 @@ impl Default for Dupes {
     fn default() -> Self {
         Self {
             min_bytes: dupes::DEFAULT_MIN,
+            threads: None,
+            drive: std::cell::RefCell::new(None),
             sort: SortBy::default(),
             rule: KeepRule::default(),
             rule_folder: None,
@@ -111,6 +118,26 @@ impl Default for Dupes {
     }
 }
 impl Dupes {
+    /// What kind of drive `root` is on (cached: asking Windows opens the drive).
+    fn drive_kind(&self, root: &str) -> Kind {
+        let mut cached = self.drive.borrow_mut();
+        match &*cached {
+            Some((r, k)) if r == root => *k,
+            _ => {
+                let k = crate::scanner::volume_kind(std::path::Path::new(root));
+                *cached = Some((root.to_owned(), k));
+                k
+            }
+        }
+    }
+    /// The threads a search of `root` reads with now.
+    fn threads_for(&self, root: &str) -> usize {
+        let cores = dupes::cores();
+        match self.threads {
+            Some(n) => n.clamp(1, cores),
+            None => dupes::auto_threads(self.drive_kind(root), cores),
+        }
+    }
     pub(super) fn busy(&self) -> bool {
         self.search.is_some() || self.deleting.is_some()
     }
@@ -246,11 +273,14 @@ impl Dupes {
         let (tx, rx) = mpsc::channel();
         let (c, n, ctx) = (cancel.clone(), counters.clone(), ctx.clone());
         let min = self.min_bytes;
+        let threads = self.threads_for(&root);
         let spawned = std::thread::Builder::new()
             .name("disk-duplicates".into())
             .spawn(move || {
                 let guard = dupes::guard(root);
-                let _ = tx.send(dupes::find(&nodes, generation, min, &guard, &c, &n));
+                let _ = tx.send(dupes::find(
+                    &nodes, generation, min, &guard, &c, &n, threads,
+                ));
                 ctx.request_repaint();
             });
         match spawned {
@@ -330,9 +360,24 @@ enum Do {
     ShowUpTo(usize),
     Scrolled,
     Min(u64),
+    Threads(Option<usize>),
     Dismiss,
 }
 
+/// The line under the thread selector: what was detected and what Auto does with it.
+fn drive_note(kind: Kind, auto: usize, chosen: Option<usize>) -> String {
+    let threads = plural(auto as u64, "thread", "threads");
+    match kind {
+        Kind::Hdd if chosen.is_some_and(|n| n > 1) => {
+            "Hard disk detected: more than one thread usually makes it slower.".into()
+        }
+        Kind::Hdd => format!(
+            "Hard disk detected: Auto reads with {threads}, because several make it seek back and forth."
+        ),
+        Kind::Network => format!("Network drive: Auto reads with {threads}."),
+        Kind::Fast => format!("Not a hard disk: Auto reads with {threads}."),
+    }
+}
 fn size_label(v: u64) -> String {
     if v == 0 {
         "0 B".into()
@@ -509,6 +554,41 @@ impl Explorer {
             if min != d.min_bytes {
                 todo.push(Do::Min(min));
             }
+            ui.add_space(4.0);
+            let cores = dupes::cores();
+            let kind = d.drive_kind(root);
+            let auto = dupes::auto_threads(kind, cores);
+            let mut threads = d.threads;
+            let shown = match threads {
+                None => format!("Auto ({auto} of {cores})"),
+                Some(n) => format!("{} of {cores}", n.clamp(1, cores)),
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Threads to use").size(12.0));
+                let r = egui::ComboBox::from_id_salt("space-dupes-threads")
+                    .selected_text(shown.clone())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut threads,
+                            None,
+                            format!("Auto ({auto} of {cores})"),
+                        );
+                        for n in 1..=cores {
+                            ui.selectable_value(&mut threads, Some(n), format!("{n} of {cores}"));
+                        }
+                    });
+                r.response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::Role::ComboBox,
+                        true,
+                        format!("Threads to use: {shown}"),
+                    )
+                });
+            });
+            if threads != d.threads {
+                todo.push(Do::Threads(threads));
+            }
+            theme::caption(ui, drive_note(kind, auto, d.threads));
             ui.add_space(6.0);
             if let Some(job) = &d.search {
                 let total = job.counters.total.load(Ordering::Relaxed);
@@ -875,6 +955,7 @@ impl Explorer {
                 Do::ShowUpTo(n) => self.dupes.shown = self.dupes.shown.max(n.div_ceil(PAGE) * PAGE),
                 Do::Scrolled => self.dupes.scroll_to_open = false,
                 Do::Min(v) => self.dupes.min_bytes = v,
+                Do::Threads(v) => self.dupes.threads = v,
                 Do::Dismiss => self.dupes.report = None,
             }
         }

@@ -1138,6 +1138,32 @@
       "release_notes": "Release debloater-v0.2.1.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.system-profiles",
+      "title": "System Profiles",
+      "short_description": "Review and apply a Windows gaming profile with a restore point, registry backup, and activity log.",
+      "long_description": "Choose the Gaming profile changes to apply, follow guided Windows and NVIDIA settings, and restore the settings Toolboks applied.",
+      "publisher": "Toolboks",
+      "category": "System",
+      "icon": "gauge",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "system_tuning"
+      ],
+      "pages": [],
+      "background": false,
+      "kind": "native",
+      "version": "0.2.1",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/system-profiles-v0.2.1/system-profiles.exe",
+      "size": 3358720,
+      "sha256": "2b796c4ebf156f01cb8d23943abd41121a3e683e564d502b95dcf9ed76c8e5ae",
+      "release_notes": "Release system-profiles-v0.2.1.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

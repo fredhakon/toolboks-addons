@@ -961,6 +961,304 @@
       "release_notes": "Release disk-manager-v0.9.1.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.disk-manager",
+      "title": "Disk Manager",
+      "short_description": "Map storage and find large files. Keeps your last scan of each drive on this PC. Saved file names stay local; remembering scans can be turned off.",
+      "long_description": "Stratum's disk analysis, built for your Toolboks workspace. Scan any drive or folder, explore an interactive space map, find the largest files, filter by size and age, inspect file types, and export your findings. Analyze fragmentation, inspect Windows optimization history, defragment hard drives, or TRIM SSDs with administrator access. Optimization only runs when requested. Scans are read-only, run in the background, and can be cancelled. Right-click a file or folder to show it in Explorer or delete it permanently: deleting asks first, skips the Recycle Bin, runs as you (never as administrator), and refuses drive roots, Windows and Program Files. Links and junctions are skipped; access errors are reported transparently. Sizes are logical file lengths and may differ from allocated disk usage. Drive-changing optimization (defrag and TRIM) is made by a small separate helper that shows its own Confirm or Cancel window; Disk Manager itself never runs as administrator. Keeps your last scan of each drive on this PC, in the add-on data folder, never in preferences or online. Turn off Remember my last scan or use Delete saved scans to remove saved file names. Quick rescans compare folder times; in-place file size changes require Full rescan. Drive optimization also shows drive health (Healthy, Watch or Replace soon) from the NVMe health log or SATA SMART data, with the raw values one click away; drives that only report health to administrators are named as such. Drives behind a RAID controller (Intel RST or VMD) give no such data, so Disk Manager shows the rating Windows itself gives them (Healthy, Warning or Unhealthy) and says plainly that detailed values are not available. It also reports each fixed drive's health and free space to Home, kept in memory only: health is read again every six hours, free space every five minutes.",
+      "publisher": "Toolboks",
+      "byline": "by stratum",
+      "category": "Storage",
+      "icon": "storage",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "filesystem_read",
+        "local_preferences",
+        "user_exports",
+        "drive_optimize"
+      ],
+      "pages": [
+        "Overview",
+        "Largest files",
+        "File types",
+        "Scan details",
+        "Optimization"
+      ],
+      "background": true,
+      "data_note": "Keeps your last scan of each drive on this PC (file and folder names).",
+      "checks": [
+        "Drive health",
+        "Free space"
+      ],
+      "kind": "native",
+      "version": "0.9.2",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/disk-manager-v0.9.2/disk-manager.exe",
+      "size": 4232192,
+      "sha256": "32a58ae8f02e83222335f875f410e96d708cf41b6a235a69ad9c65e4f73f6fa2",
+      "release_notes": "Release disk-manager-v0.9.2.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.memory-cleaner",
+      "title": "Memory Cleaner",
+      "short_description": "Keep an eye on memory and clean up what idle apps are holding.",
+      "long_description": "Memory Cleaner shows how your memory is used, which apps hold the most, and how close Windows is to running short. It can trim the memory that idle apps are not using, by hand or automatically when memory is under real pressure, and it keeps a short history. Trimming moves memory into the cache and never closes an app. One advanced action, clearing the low-priority cache, changes how Windows manages memory for the whole PC: it asks for administrator rights in a separate window and only runs when you confirm there. It also reports to Home whether memory is under pressure, kept in memory only and never saved. Nothing is stored between runs.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "chip",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "host_metrics",
+        "system_tuning"
+      ],
+      "pages": [
+        "Home",
+        "Advanced"
+      ],
+      "background": true,
+      "checks": [
+        "Memory pressure"
+      ],
+      "kind": "native",
+      "version": "0.4.1",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/memory-cleaner-v0.4.1/memory-cleaner.exe",
+      "size": 3597824,
+      "sha256": "5f9b98a440682798f7e2bc3736e3763f9c349e6689e08f1aa818b1dda6485e5f",
+      "release_notes": "Release memory-cleaner-v0.4.1.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.resource-monitor",
+      "title": "Resource Monitor",
+      "short_description": "Watch your processor, graphics, memory, disk and network.",
+      "long_description": "Resource Monitor draws live graphs of what your PC is doing. It also lists running apps, lets you change a process's priority or end it, and shows network connections. It reads system and process information; it changes something only when you use one of those process actions. With Record resource history on (the default), it saves which apps used the processor, memory, graphics and disk, and when: app names, times and figures, never window titles, file names or what you do in an app. It records while Toolboks runs, also when the window is closed to the tray, and stops when you quit. The history stays on this PC in the add-on's data folder, is kept for 7 days and is never sent anywhere. You can switch recording off and delete the history.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "activity",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "host_metrics",
+        "local_preferences"
+      ],
+      "pages": [
+        "Overview",
+        "Details",
+        "Processes",
+        "Connections",
+        "History"
+      ],
+      "background": true,
+      "data_note": "On by default: saves which apps used your PC's resources and when (app names, times, figures) on this PC for 7 days. Can be switched off and deleted.",
+      "kind": "native",
+      "version": "0.2.1",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/resource-monitor-v0.2.1/resource-monitor.exe",
+      "size": 4345344,
+      "sha256": "330a19fe989135d1c0d8d805ba790d558ba2311de3a7220b4323472ae013f4f5",
+      "release_notes": "Release resource-monitor-v0.2.1.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.event-watch",
+      "title": "Event Watch",
+      "short_description": "Understand Windows events, crashes and slow drivers.",
+      "long_description": "Event Watch reads the Windows event logs and explains what is going on, with a closer look at crashes and restarts. It reads crash dump headers to name the stop code. It never clears your logs and changes nothing on your PC. The optional latency check names the drivers with the longest interrupt (DPC and ISR) runs. It needs administrator rights, which Windows asks you to confirm each time you start it; it records for 10 to 30 seconds, deletes the recording as soon as it has been read, and keeps the result only until you close Event Watch. The Boot page shows boot times and slow-startup items from Windows' boot performance log; it is read in memory only and nothing is saved. Windows only lets administrators read that log on a default PC, and an administrator can allow reading in the log's access list (Toolboks never changes it). Event Watch also checks the last 7 days of crashes in the background and reports the result to Home; it is kept in memory only, read from the Windows event log, and nothing is saved.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "shield",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "filesystem_read",
+        "local_preferences",
+        "administrator"
+      ],
+      "pages": [
+        "Live",
+        "Crashes",
+        "Summary",
+        "Latency check",
+        "Boot"
+      ],
+      "background": true,
+      "checks": [
+        "Recent crashes"
+      ],
+      "kind": "native",
+      "version": "0.3.1",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/event-watch-v0.3.1/event-watch.exe",
+      "size": 3694080,
+      "sha256": "cfc9cbed2d6ae752984efa01ad02d32479f790678d9a632a129b730d6ba77c60",
+      "release_notes": "Release event-watch-v0.3.1.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.debloater",
+      "title": "Debloater",
+      "short_description": "Tune Windows privacy, apps, startup and background tasks.",
+      "long_description": "Debloater explains optional Windows changes in plain language, so you can turn off what you do not need. Nothing is changed until you choose it, and supported changes can be undone later, also after Toolboks closes or Windows restarts: Debloater keeps a small undo list in its own data folder. It changes your own account's settings: privacy and advertising switches, startup entries and installed apps. Changes that need administrator rights are made by a small separate helper that shows its own Confirm or Cancel window listing exactly what will change; Debloater itself never runs as administrator. The Startup page shows how much slower Windows measured an entry to start, read from Windows' boot performance log; the boot timings are read in memory only and never saved. Windows only lets administrators read that log on a default PC, and an administrator can allow reading in the log's access list (Toolboks never changes it).",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "sliders",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "system_tuning"
+      ],
+      "pages": [
+        "Privacy and ads",
+        "Apps",
+        "Startup",
+        "Tasks",
+        "Services"
+      ],
+      "background": false,
+      "kind": "native",
+      "version": "0.2.1",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/debloater-v0.2.1/debloater.exe",
+      "size": 3670016,
+      "sha256": "c6bac632fb9261ac84b8d1cf05533d010480812052675d9e96cd7548c295d68f",
+      "release_notes": "Release debloater-v0.2.1.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.system-profiles",
+      "title": "System Profiles",
+      "short_description": "Review and apply a Windows gaming profile with a restore point, registry backup, and activity log.",
+      "long_description": "Choose the Gaming profile changes to apply, follow guided Windows and NVIDIA settings, and restore the settings Toolboks applied.",
+      "publisher": "Toolboks",
+      "category": "System",
+      "icon": "gauge",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "system_tuning"
+      ],
+      "pages": [],
+      "background": false,
+      "kind": "native",
+      "version": "0.2.1",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/system-profiles-v0.2.1/system-profiles.exe",
+      "size": 3358720,
+      "sha256": "2b796c4ebf156f01cb8d23943abd41121a3e683e564d502b95dcf9ed76c8e5ae",
+      "release_notes": "Release system-profiles-v0.2.1.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.macro-manager",
+      "title": "Macro Manager",
+      "short_description": "Record, edit and repeat keyboard and mouse actions.",
+      "long_description": "Record keystrokes, mouse movements, clicks and scrolling when you choose. Edit steps and movement paths, set timings, and replay with an optional repeat delay and duration. Configurable shortcuts control recording and playback; Escape stops active work. Macros and settings stay on this PC. Playback sends real input to the active desktop.",
+      "publisher": "Toolboks",
+      "category": "Automation",
+      "icon": "macro",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "input_automation",
+        "local_preferences"
+      ],
+      "pages": [
+        "Editor",
+        "Mouse editor"
+      ],
+      "background": true,
+      "kind": "native",
+      "version": "0.1.1",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/macro-manager-v0.1.1/macro-manager.exe",
+      "size": 3374592,
+      "sha256": "74db3156a375d0a57c01e01ed0de0a9c4aed32dd690aacaa65c46807d86e6c33",
+      "release_notes": "Release macro-manager-v0.1.1.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.aural",
+      "title": "Audio Gainer",
+      "short_description": "Check your microphone level, hear yourself, and route your mic to other apps.",
+      "long_description": "Adjust microphone gain, watch live left and right levels, and monitor through headphones. Sending audio to another app uses a separately installed driver such as VB-Audio Virtual Cable. Aural includes setup instructions and a link to the official installer page.",
+      "publisher": "Toolboks",
+      "byline": "by aural",
+      "category": "Audio",
+      "icon": "mic",
+      "accent": "#8B5CF6",
+      "screenshots": [],
+      "capabilities": [
+        "live_audio",
+        "local_preferences"
+      ],
+      "pages": [],
+      "background": true,
+      "kind": "native",
+      "version": "0.3.2",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/aural-v0.3.2/aural.exe",
+      "size": 3443200,
+      "sha256": "b423b1216ed2ccbf1923c71941ff5da562810b46bf4b82ca6ca49135f90bda4b",
+      "release_notes": "Release aural-v0.3.2.",
+      "verified": true,
+      "channel": "stable"
+    },
+    {
+      "id": "toolboks.testdeck",
+      "title": "Testdeck",
+      "short_description": "Queue the heavy test and build jobs that coding agents start on this PC.",
+      "long_description": "Testdeck is for developers who let AI coding agents run tests and builds. It runs a small job queue that only programs on this PC can reach (127.0.0.1, port 47123 by default). Agents ask it for a slot before a heavy test or build and wait their turn, so the PC is not swamped. While Toolboks runs, also hidden in the tray, Testdeck watches those jobs: it lowers the priority of their processes, limits them to a share of the processor cores, and can end a job, its child processes or leftover test processes, when you press Kill or when free memory runs very low. It keeps a job history and a cache of test results in its data folder. The AI setup page can install or repair the helper scripts in the .claude/gate folder in your user folder and add one hook to .claude/settings.json there; it only does that when you press Install, keeps a backup of every file it changes and can undo it. It can show Windows notifications when a long run ends. Nothing is sent anywhere.",
+      "publisher": "Toolboks",
+      "category": "Developer tools",
+      "icon": "layers",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "host_metrics",
+        "local_preferences",
+        "developer_integration"
+      ],
+      "pages": [
+        "Overview",
+        "History",
+        "Agents",
+        "DB lanes",
+        "Orphans",
+        "AI setup",
+        "Settings"
+      ],
+      "background": true,
+      "data_note": "Keeps a history of this PC's test and build jobs (commands, times, results) and a test result cache on this PC. Nothing is sent anywhere.",
+      "kind": "native",
+      "version": "0.1.1",
+      "min_toolboks_version": "0.18.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/testdeck-v0.1.1/testdeck.exe",
+      "size": 5550080,
+      "sha256": "e50364b0e87687ab6a7bf8ac28eef5077d6284a783f50842900caeefac1240f5",
+      "release_notes": "Release testdeck-v0.1.1.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

@@ -1327,7 +1327,7 @@
       "size": 3712512,
       "sha256": "586e06e7f0cc2044945556d59d162cc5c9cf75065999260b806b38efe4893912",
       "release_notes": "Release memory-cleaner-v0.5.0.",
-      "verified": false,
+      "verified": true,
       "channel": "stable"
     },
     {
@@ -1360,7 +1360,7 @@
       "size": 3712512,
       "sha256": "c9584b3a260630b528e98712f32cecf6dfd97f3e572f5d8870e274b7464a989a",
       "release_notes": "Release memory-cleaner-v0.5.1.",
-      "verified": false,
+      "verified": true,
       "channel": "stable"
     }
   ]

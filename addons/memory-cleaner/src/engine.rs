@@ -371,9 +371,7 @@ impl Memory {
             Decision::Run { trigger } => {
                 self.advice = None;
                 if self.start_run(ctx, Trigger::Pressure) {
-                    self.scheduler.record_run(now);
-                    self.auto.record_run(now);
-                    self.run_note = Some(trigger);
+                    self.record_automatic_run(now, trigger);
                     return;
                 }
             }
@@ -381,10 +379,18 @@ impl Memory {
         // The pressure scheduler had nothing to run (or was busy): the user's own triggers.
         if let Some(fire) = fire {
             if self.start_run(ctx, fire.trigger()) {
-                self.auto.record_run(now);
-                self.run_note = Some(fire.text());
+                self.record_automatic_run(now, fire.text());
             }
         }
+    }
+
+    /// Any automatic run, whichever rule started it, starts every automatic cooldown, so one
+    /// rule cannot run seconds after another. `note` is shown as "Why it ran" once the run has
+    /// something to report (see `run_from_snapshot`).
+    fn record_automatic_run(&mut self, now: u64, note: String) {
+        self.scheduler.record_run(now);
+        self.auto.record_run(now);
+        self.pending_note = Some(note);
     }
 
     /// Starts the safe plan (priority lowering, then targeted trim). Returns whether a run was
@@ -397,8 +403,8 @@ impl Memory {
     }
 
     pub(super) fn run_from_snapshot(&mut self, ctx: &egui::Context, trigger: Trigger) -> bool {
-        self.settling = None;
         if trigger == Trigger::Manual {
+            self.settling = None;
             self.run_note = None;
         }
         let Some(sampler) = self.sampler.as_ref() else {
@@ -424,6 +430,16 @@ impl Memory {
         let cands = candidates(&inputs, &|pid| playing.contains(&pid));
         let plan = actions::plan(&cands, &policy, &self.cooldowns, now);
 
+        if plan.is_empty() && trigger.is_automatic() {
+            // Nothing to do: keep the last report, its settle readings and its reason.
+            self.pending_note = None;
+            return true;
+        }
+        self.settling = None;
+        let note = self.pending_note.take();
+        if let Some(note) = note.filter(|_| trigger.is_automatic()) {
+            self.run_note = Some(note);
+        }
         if plan.is_empty() {
             if sampler.audio.is_unknown() {
                 self.last_run = None;
@@ -597,6 +613,7 @@ mod tests {
 
     use super::*;
     use crate::audio::{AudioState, Session, SessionSource, SessionsUnavailable};
+    use crate::stats::Snapshot;
 
     const MB: u64 = 1024 * 1024;
 
@@ -932,6 +949,73 @@ mod tests {
         assert_eq!(auto.min_trim_bytes, 200 * MB);
         assert_eq!(auto.min_priority_bytes, 50 * MB);
         assert_eq!(auto.trim_cooldown, Duration::from_secs(45 * 60));
+        for trigger in [Trigger::MemoryLimit, Trigger::Interval] {
+            let p = policy_for(trigger, 1, Some(2));
+            assert_eq!(p.foreground_pid, Some(2));
+            assert_eq!(p.min_idle, auto.min_idle);
+            assert_eq!(p.min_trim_bytes, auto.min_trim_bytes);
+            assert_eq!(p.min_priority_bytes, auto.min_priority_bytes);
+            assert_eq!(p.trim_cooldown, auto.trim_cooldown);
+        }
+    }
+
+    fn memory_with_a_report() -> Memory {
+        let mut m = Memory::new();
+        m.sampler = Some(Snapshot {
+            totals: Default::default(),
+            processes: Vec::new(),
+            audio: AudioState::Read(Default::default()),
+        });
+        m.settling = Some(settling());
+        m.last_run = Some(RunSummary {
+            lowered: 1,
+            trimmed: 2,
+            failed: 0,
+        });
+        m.run_note = Some("old rule".to_string());
+        m.pending_note = Some("new rule".to_string());
+        m
+    }
+
+    #[test]
+    fn an_automatic_run_with_nothing_to_do_keeps_the_last_report() {
+        for trigger in [Trigger::Pressure, Trigger::MemoryLimit, Trigger::Interval] {
+            let mut m = memory_with_a_report();
+            assert!(m.run_from_snapshot(&egui::Context::default(), trigger));
+            assert!(m.settling.is_some(), "{trigger:?}");
+            assert_eq!(m.last_run.map(|r| r.trimmed), Some(2), "{trigger:?}");
+            assert_eq!(m.run_note.as_deref(), Some("old rule"), "{trigger:?}");
+            assert_eq!(m.pending_note, None, "{trigger:?}");
+        }
+    }
+
+    #[test]
+    fn a_manual_run_with_nothing_to_do_still_resets_the_card() {
+        let mut m = memory_with_a_report();
+        assert!(m.run_from_snapshot(&egui::Context::default(), Trigger::Manual));
+        assert!(m.settling.is_none());
+        assert_eq!(m.last_run, Some(RunSummary::default()));
+        assert_eq!(m.run_note, None);
+        assert_eq!(
+            m.pending_note, None,
+            "a manual run never takes an automatic note"
+        );
+    }
+
+    #[test]
+    fn a_trigger_run_starts_the_pressure_cooldown_too() {
+        let mut m = Memory::new();
+        m.scheduler.set_enabled(true);
+        m.auto.set_limit(Some(70));
+        m.record_automatic_run(1_000, "limit".to_string());
+        assert_eq!(m.pending_note.as_deref(), Some("limit"));
+        assert_eq!(m.auto.tick(2_000, 99.0, 0.5), None);
+        let pressure = Assessment {
+            verdict: Verdict::UnderPressure,
+            reasons: Vec::new(),
+        };
+        m.scheduler.tick(2_000, &pressure, 0.5);
+        assert_eq!(m.scheduler.tick(120_000, &pressure, 0.5), Decision::Idle);
     }
 
     #[test]

@@ -69,7 +69,7 @@ impl Memory {
             return;
         };
         let (mut run, mut cancel) = (false, false);
-        let modal = egui::Modal::new(egui::Id::new("memory-cleaner-confirm")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("memory-cleaner-confirm")).show(ctx, |ui| {
             ui.set_max_width(420.0);
             section(ui, &action.title(self.selection.len()));
             ui.add(egui::Label::new(action.body()).wrap());

@@ -109,7 +109,7 @@ pub struct Memory {
     /// result of the last run and the Windows version that gates regions 7 and 8. A run uses
     /// the same administrator request and `purge` job as the cache purge.
     regions: regions::Selection,
-    regions_loaded: bool,
+    preferences_loaded: bool,
     last_regions: Option<String>,
     windows_version: Option<regions::WindowsVersion>,
     /// Result of the last action, shown above the table.
@@ -121,6 +121,9 @@ pub struct Memory {
     settling: Option<Settling>,
     /// Why the last automatic run started (the scheduler's text).
     run_note: Option<String>,
+    /// The reason of an automatic run that was asked for, kept until the run finds something
+    /// to do and replaces `run_note`.
+    pending_note: Option<String>,
     /// Memory priorities the tool lowered, and when each app was last trimmed.
     undo: UndoLog,
     cooldowns: Cooldowns,
@@ -205,7 +208,7 @@ impl Memory {
             purge: None,
             last_purge: None,
             regions: regions::Selection::default(),
-            regions_loaded: false,
+            preferences_loaded: false,
             last_regions: None,
             windows_version: regions::windows_version(),
             status: None,
@@ -213,6 +216,7 @@ impl Memory {
             last_run: None,
             settling: None,
             run_note: None,
+            pending_note: None,
             undo: UndoLog::new(),
             cooldowns: Cooldowns::new(),
             activity: Activity::new(0),
@@ -417,12 +421,12 @@ impl NativeAddon for Memory {
         preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
     ) -> bool {
         style_once(ui.ctx());
-        if !self.regions_loaded {
+        if !self.preferences_loaded {
             self.regions = regions::Selection::load(preferences);
             self.auto = AutoTriggers::new(AutoSettings::load(preferences));
             self.options = clean_log::Options::load(preferences);
             self.log_count = clean_log::load(&self.log_store).len();
-            self.regions_loaded = true;
+            self.preferences_loaded = true;
         }
         self.draw(ui, self.page);
         self.confirm_ui(ui.ctx());

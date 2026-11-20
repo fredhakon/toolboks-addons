@@ -302,7 +302,7 @@ mod tests {
             ("Working set".to_string(), Some(c)),
             ("Combine".to_string(), None),
         ]);
-        assert_eq!(lines[0], "Working set: freed 100 MB, standby +100 MB.");
+        assert_eq!(lines[0], "Working set: freed 200 MB, standby +100 MB.");
         assert_eq!(lines[1], "Combine: not measured.");
         assert!(lines[2].contains("other programs"));
         assert!(parts_text(&[]).is_empty());

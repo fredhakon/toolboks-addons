@@ -410,7 +410,7 @@ impl Memory {
         stat_row(ui, "Status", self.scheduler.status(self.now_ms()));
         ui.label(
             RichText::new(
-                "Switch it on from the Home page. It is off by default and only acts when memory is really short, at most once an hour. The memory-limit and timer triggers below have their own settings.",
+                "Switch it on from the Home page. It is off by default and only acts when memory is really short, at most once an hour. Any automatic clean, including the ones started by the limit or interval below, also holds this one back for that hour. The memory-limit and interval triggers below have their own settings.",
             )
             .weak()
             .small(),

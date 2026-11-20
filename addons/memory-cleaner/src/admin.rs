@@ -18,7 +18,7 @@ pub const PURGE_WARNING: &str = "Drops the cached files Windows keeps in spare m
     It only runs when you press the button.";
 
 /// Why a separate administrator window appears.
-pub const NEEDS_ADMIN: &str = "Needs administrator rights, because it changes how Windows     manages memory for the whole PC. A separate window asks you to confirm.";
+pub const NEEDS_ADMIN: &str = "Needs administrator rights, because it changes how Windows manages memory for the whole PC. A separate window asks you to confirm.";
 
 /// What the confirmation window shows before anything changes.
 const CONFIRM_TEXT: &str =

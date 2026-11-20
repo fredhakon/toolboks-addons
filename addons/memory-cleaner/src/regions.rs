@@ -746,7 +746,7 @@ mod tests {
         let on_7 = all.available(Some(V7));
         assert_eq!(
             on_7.bits(),
-            0xFF & !(Region::RegistryCache.bit() | Region::CombineLists.bit())
+            !(Region::RegistryCache.bit() | Region::CombineLists.bit())
         );
     }
 

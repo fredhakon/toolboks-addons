@@ -7,6 +7,10 @@
 //! 200 ms `tick_background` the runtime calls while the add-on is suspended. A reading is
 //! taken at the existing cadences (1 s open, 10 s closed); the finding itself is recomputed
 //! at most once a minute (`health::should_refresh`). Everything stays in memory.
+//!
+//! The hidden tick also decides on automatic cleaning with the reading it just took (the same
+//! `Memory::automatic_check` the page uses), so the user's limit and interval and the pressure
+//! scheduler keep running while the window is hidden.
 
 use std::time::Instant;
 
@@ -15,6 +19,7 @@ use toolboks_addon_sdk::Finding;
 use super::engine::eval_interval;
 use super::health::{Source, Usage};
 use super::pressure::{Assessment, Signals};
+use super::report::Trigger;
 use super::Memory;
 
 /// What the finding says when Windows would not give the basic memory numbers.
@@ -59,14 +64,26 @@ impl Memory {
         }
     }
 
-    /// The runtime's background tick (the page is closed): advance the model at the closed-page
-    /// cadence, then the finding. Does not run the automatic scheduler: nothing starts while
-    /// the window is hidden, as before.
-    pub(super) fn health_background_tick(&mut self) {
+    /// The runtime's background tick (the window is hidden): advance the model at the
+    /// closed-page cadence, decide on the automatic cleaning with that same reading (the one
+    /// the page's frame uses), then the finding. A tick without a due reading does two time
+    /// comparisons and nothing else.
+    pub(super) fn health_background_tick(&mut self, ctx: &egui::Context) {
+        self.hidden_tick(&mut |m, trigger| m.start_run(ctx, trigger));
+    }
+
+    /// `health_background_tick` with the way a run is started passed in.
+    fn hidden_tick(&mut self, start: &mut dyn FnMut(&mut Self, Trigger) -> bool) {
         if !self.active && self.last_eval.elapsed() >= eval_interval(false) {
             self.last_eval = Instant::now();
             let now_ms = self.now_ms();
-            let _ = self.read_pressure(now_ms, unix_now());
+            if let Some((signals, assessment)) = self.read_pressure(now_ms, unix_now()) {
+                // Only an automatic rule needs to know which app was in front.
+                if self.scheduler.is_enabled() || self.auto.any_on() {
+                    self.note_foreground();
+                }
+                self.automatic_check(now_ms, &signals, assessment, start);
+            }
         }
         self.update_health(unix_now());
     }
@@ -358,6 +375,155 @@ mod tests {
         m.last_eval = Instant::now() - eval_interval(false) - Duration::from_millis(1);
         m.tick_background();
         assert_eq!(*count.lock().unwrap(), 1);
+    }
+
+    /// A suspended add-on whose background tick runs one due reading at `secs` seconds on the
+    /// model's clock (an injected clock: `epoch` is moved, nothing sleeps). `ok` is whether the
+    /// run could be started; the triggers asked for are pushed to `starts`.
+    fn hidden_at(m: &mut Memory, secs: u64, ok: bool, starts: &mut Vec<Trigger>) {
+        m.epoch = Instant::now() - Duration::from_secs(secs);
+        m.last_eval = Instant::now() - eval_interval(false) - Duration::from_millis(1);
+        m.hidden_tick(&mut |_, trigger| {
+            starts.push(trigger);
+            ok
+        });
+    }
+
+    fn hidden_memory(initial: Signals) -> Memory {
+        let (mut m, _) = memory(Some(initial));
+        m.suspend();
+        m
+    }
+
+    #[test]
+    fn the_memory_limit_fires_while_hidden() {
+        // 50% of 16 GB is in use.
+        let mut m = hidden_memory(calm());
+        m.auto.set_limit(Some(60));
+        let mut starts = Vec::new();
+        hidden_at(&mut m, 100, true, &mut starts);
+        assert!(starts.is_empty(), "50% is under a 60% limit");
+        m.auto.set_limit(Some(50));
+        hidden_at(&mut m, 110, true, &mut starts);
+        assert_eq!(starts, vec![Trigger::MemoryLimit]);
+        // Recorded like a visible automatic run: the reason is kept for the result.
+        assert_eq!(
+            m.pending_note.as_deref(),
+            Some("Memory in use reached your limit of 50%.")
+        );
+    }
+
+    #[test]
+    fn the_interval_fires_while_hidden() {
+        let mut m = hidden_memory(calm());
+        m.auto.set_interval(Some(5));
+        let mut starts = Vec::new();
+        hidden_at(&mut m, 100, true, &mut starts); // the count starts here
+        hidden_at(&mut m, 100 + 4 * 60, true, &mut starts);
+        assert!(starts.is_empty());
+        hidden_at(&mut m, 100 + 5 * 60, true, &mut starts);
+        assert_eq!(starts, vec![Trigger::Interval]);
+        // The run restarts the count.
+        hidden_at(&mut m, 100 + 9 * 60, true, &mut starts);
+        assert_eq!(starts.len(), 1);
+    }
+
+    #[test]
+    fn the_pressure_scheduler_runs_while_hidden() {
+        let mut m = hidden_memory(squeezed());
+        m.scheduler.set_enabled(true);
+        let mut starts = Vec::new();
+        for secs in (0..=240).step_by(10) {
+            hidden_at(&mut m, secs, true, &mut starts);
+        }
+        // Once, then the scheduler's own cooldown holds it back.
+        assert_eq!(starts, vec![Trigger::Pressure]);
+    }
+
+    #[test]
+    fn the_limit_cooldown_is_respected_while_hidden() {
+        let mut m = hidden_memory(calm());
+        m.auto.set_limit(Some(10));
+        let mut starts = Vec::new();
+        hidden_at(&mut m, 100, true, &mut starts);
+        hidden_at(&mut m, 110, true, &mut starts);
+        hidden_at(&mut m, 120, true, &mut starts);
+        assert_eq!(starts.len(), 1, "30 s have not passed");
+        hidden_at(&mut m, 131, true, &mut starts);
+        assert_eq!(starts.len(), 2);
+    }
+
+    #[test]
+    fn a_busy_hidden_run_is_retried_on_the_next_reading() {
+        let mut m = hidden_memory(calm());
+        m.auto.set_limit(Some(10));
+        let mut starts = Vec::new();
+        hidden_at(&mut m, 100, false, &mut starts);
+        assert!(
+            m.pending_note.is_none(),
+            "nothing started, nothing recorded"
+        );
+        hidden_at(&mut m, 110, true, &mut starts);
+        assert_eq!(starts, vec![Trigger::MemoryLimit, Trigger::MemoryLimit]);
+        assert!(m.pending_note.is_some());
+    }
+
+    #[test]
+    fn nothing_runs_while_hidden_when_commit_is_near_its_limit() {
+        let mut m = hidden_memory(Signals {
+            commit_used: 39 * GIB,
+            ..squeezed()
+        });
+        m.auto.set_limit(Some(10));
+        m.auto.set_interval(Some(1));
+        m.scheduler.set_enabled(true);
+        let mut starts = Vec::new();
+        for secs in (0..=600).step_by(10) {
+            hidden_at(&mut m, secs, true, &mut starts);
+        }
+        assert!(starts.is_empty(), "{starts:?}");
+    }
+
+    #[test]
+    fn a_hidden_tick_that_is_not_due_reads_and_starts_nothing() {
+        struct Counting(Arc<Mutex<u32>>);
+        impl SignalSource for Counting {
+            fn read(&mut self) -> Option<Signals> {
+                *self.0.lock().unwrap() += 1;
+                Some(calm())
+            }
+        }
+        let count = Arc::new(Mutex::new(0));
+        let mut m = Memory::new();
+        m.signals = Some(Box::new(Counting(count.clone())));
+        m.auto.set_limit(Some(1));
+        m.auto.set_interval(Some(1));
+        m.suspend();
+        m.last_eval = Instant::now();
+        let mut starts = Vec::new();
+        for _ in 0..50 {
+            m.hidden_tick(&mut |_, trigger| {
+                starts.push(trigger);
+                true
+            });
+        }
+        assert_eq!(*count.lock().unwrap(), 0);
+        assert!(starts.is_empty());
+    }
+
+    #[test]
+    fn a_hidden_add_on_starts_only_automatic_runs() {
+        let mut m = Memory::new();
+        m.suspend();
+        let ctx = egui::Context::default();
+        assert!(!m.request_refresh(&ctx, None));
+        assert!(!m.request_refresh(&ctx, Some(crate::RefreshAction::Optimize(Trigger::Manual))));
+        let trim = crate::RefreshAction::Trim {
+            selection: Default::default(),
+            grouped: false,
+        };
+        assert!(!m.request_refresh(&ctx, Some(trim)));
+        assert!(!m.refresh_action_pending);
     }
 
     #[test]

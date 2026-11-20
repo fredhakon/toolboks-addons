@@ -9,7 +9,9 @@
 //! The limit is checked first. Both wait while commit is near its limit (the same guard the
 //! scheduler uses: trimming does not help there). The decision is pure: the clock is injected
 //! as `now_ms` and nothing sleeps. `Memory::evaluate` starts the run and then calls
-//! `record_run`; until then the decision repeats on every tick, like the scheduler's.
+//! `record_run`; until then the decision repeats on every tick, like the scheduler's. The same
+//! decision runs from the page's frame and, with the window hidden, from the runtime's
+//! background tick (`Memory::automatic_check`).
 //!
 //! The "allow standby and modified lists in automatic cleaning" switch is stored, and
 //! `auto_regions` decides which "Clean selected regions" an automatic run may include. Every
@@ -252,7 +254,7 @@ impl Memory {
             RichText::new(
                 "Both are off by default. They start the same safe per-app trim as above, never \
                  touch the app you are using and never ask for administrator permission. They \
-                 pause when you switch away from Memory Cleaner or hide Toolboks in the tray.",
+                 keep working while Toolboks is hidden in the tray.",
             )
             .weak()
             .small(),

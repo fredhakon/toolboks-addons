@@ -12,7 +12,7 @@ pub(super) fn steps() -> Vec<S> {
         ("1/selected", "table", "Select processes and lock exclusions", "The table compares working-set and private memory. Select rows to inspect or trim them, and lock an application to exclude it. Trimming moves pages out of the application's working set (they stay in RAM as cache); it does not close the application."),
         ("1/selected", "inspector", "Selected · process actions", "This inspector explains the selected processes and offers Trim selected. Protected or excluded processes can be skipped. Review the result rather than assuming every requested process was changed."),
         ("1/system", "inspector", "System · deeper operations", "The System tab exposes system memory-list operations. Some require administrator rights and can remove useful cache. The tour only opens the tab; it does not request permission or perform a clean."),
-        ("1/rules", "inspector", "Rules · automatic behavior", "Rules controls automatic cleanup and lists excluded applications. These controls affect background behavior, so choose them deliberately. Opening this walkthrough does not turn any rule on."),
+        ("1/rules", "inspector", "Rules · automatic behavior", "Rules controls automatic cleanup and lists excluded applications. These controls keep working while Toolboks is hidden in the tray, so choose them deliberately. Opening this walkthrough does not turn any rule on."),
     ]
     .into_iter()
     .map(|(p, t, h, d)| S::new(p, t, h, d))

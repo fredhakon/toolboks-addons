@@ -261,7 +261,10 @@ impl Memory {
     }
 
     fn request_refresh(&mut self, ctx: &egui::Context, action: Option<RefreshAction>) -> bool {
-        if !self.active || (action.is_none() && self.refresh_in_flight != 0) {
+        // Hidden, only an automatic run may start (the hidden tick); a plain refresh or a
+        // manual action waits for the window.
+        let automatic_run = matches!(&action, Some(RefreshAction::Optimize(t)) if t.is_automatic());
+        if (!self.active && !automatic_run) || (action.is_none() && self.refresh_in_flight != 0) {
             return false;
         }
         if self.refresh_worker.is_none() {
@@ -395,6 +398,17 @@ pub const PAGES: [&str; 2] = ["Home", "Advanced"];
 pub const ID: &str = "toolboks.memory-cleaner";
 
 impl Memory {
+    /// Loads the saved settings once (from `load_preferences`, or the first frame).
+    fn load_prefs(&mut self, preferences: &std::collections::BTreeMap<String, serde_json::Value>) {
+        if !self.preferences_loaded {
+            self.regions = regions::Selection::load(preferences);
+            self.auto = AutoTriggers::new(AutoSettings::load(preferences));
+            self.options = clean_log::Options::load(preferences);
+            self.log_count = clean_log::load(&self.log_store).len();
+            self.preferences_loaded = true;
+        }
+    }
+
     fn tab_name(&self) -> &'static str {
         match self.tab {
             advanced::Tab::Selected => "selected",
@@ -421,13 +435,7 @@ impl NativeAddon for Memory {
         preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
     ) -> bool {
         style_once(ui.ctx());
-        if !self.preferences_loaded {
-            self.regions = regions::Selection::load(preferences);
-            self.auto = AutoTriggers::new(AutoSettings::load(preferences));
-            self.options = clean_log::Options::load(preferences);
-            self.log_count = clean_log::load(&self.log_store).len();
-            self.preferences_loaded = true;
-        }
+        self.load_prefs(preferences);
         self.draw(ui, self.page);
         self.confirm_ui(ui.ctx());
         let regions_changed = self.regions.store(preferences);
@@ -445,6 +453,14 @@ impl NativeAddon for Memory {
     }
     fn page_index(&self) -> usize {
         self.page
+    }
+    /// The host sends the saved settings before any frame, so automatic cleaning is on from
+    /// the start even if the page is never opened this session.
+    fn load_preferences(
+        &mut self,
+        preferences: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        self.load_prefs(preferences);
     }
     fn prepare_admin(
         &mut self,
@@ -497,8 +513,9 @@ impl NativeAddon for Memory {
     }
     /// A running trim or optimize keeps going, and finishes, while the window is hidden.
     fn has_background_work(&self) -> bool {
-        // Always: the memory-pressure finding is fed from the background tick while the page
-        // is closed. The tick does two time comparisons unless a reading is due.
+        // Always: the memory-pressure finding and the automatic cleaning (pressure scheduler,
+        // memory limit, interval) run from the background tick while the window is hidden.
+        // The tick does two time comparisons unless a reading is due.
         true
     }
     fn tick_background(&mut self) {
@@ -509,7 +526,7 @@ impl NativeAddon for Memory {
         self.poll_run(&ctx);
         self.poll_trim(&ctx);
         self.settle_tick();
-        self.health_background_tick();
+        self.health_background_tick(&ctx);
         if self.settling.is_none() && self.sampler.is_none() && self.run.is_none() {
             self.win_sampler = None;
         }

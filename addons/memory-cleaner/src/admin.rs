@@ -135,7 +135,13 @@ impl Memory {
             AdminOutcome::Completed { json } => serde_json::from_str::<serde_json::Value>(&json)
                 .ok()
                 .and_then(|v| v["text"].as_str().map(str::to_string))
-                .unwrap_or_else(|| "The cache was cleared.".to_string()),
+                .unwrap_or_else(|| {
+                    if regions {
+                        "The selected regions were cleaned.".to_string()
+                    } else {
+                        "The cache was cleared.".to_string()
+                    }
+                }),
         };
         let line = Some(format!(
             "{}  {}",
@@ -239,8 +245,12 @@ fn prepare_with(
     }
     let payload: serde_json::Value = serde_json::from_str(&request.json)
         .map_err(|_| "The administrator request could not be read.".to_string())?;
+    // Only an empty object is the old purge; anything else without "regions" is refused.
     let Some(mask) = payload.get("regions") else {
-        return Ok(Box::new(PurgeChange));
+        return match payload.as_object() {
+            Some(object) if object.is_empty() => Ok(Box::new(PurgeChange)),
+            _ => Err("The administrator request is not valid.".into()),
+        };
     };
     let bits = mask
         .as_u64()
@@ -265,7 +275,8 @@ impl AdminChange for RegionsChange {
         let mut text = String::from(
             "Clean the selected memory regions?\n\nIt does not change the memory promised to \
             programs (commit), and Windows refills its caches by itself. Apps and games can be \
-            slower for a moment while that happens.\n",
+            slower for a moment while that happens. None of these regions has a measured benefit \
+            (Unproven).\n",
         );
         for region in self.selection.regions() {
             text.push_str(&format!("\n- {}: {}", region.label(), region.note()));
@@ -440,8 +451,11 @@ mod tests {
             refused(r#"{"regions": 63}"#, old).is_none(),
             "regions 1 to 6 run anywhere"
         );
-        // The payload-less purge keeps working next to the new one.
+        // The payload-less purge keeps working next to the new one, but nothing else becomes it.
         assert!(prepare_with(&regions_request("{}"), old).is_ok());
+        for json in ["[]", "5", "null", r#"{"region": 1}"#, r#"{"x": 1}"#] {
+            assert!(refused(json, WINDOWS_11).is_some(), "{json}");
+        }
     }
 
     #[test]

@@ -28,12 +28,17 @@ impl WindowsSampler {
             page_faults: RateCounter::new(PAGE_FAULTS_PATH),
         }
     }
+}
 
+/// A reading of the system plus the private working set of each given process, only if that
+/// process is still the one the snapshot saw. The real one is `WindowsSampler`; tests fake it.
+pub(super) trait VerifiedSampler {
     /// Keep each reading tied to the original process, even if Windows reuses its PID.
-    pub(super) fn sample_verified(
-        &mut self,
-        processes: &[Identity],
-    ) -> Option<(RunMeasurement, WorkingSets)> {
+    fn sample_verified(&mut self, processes: &[Identity]) -> Option<(RunMeasurement, WorkingSets)>;
+}
+
+impl VerifiedSampler for WindowsSampler {
+    fn sample_verified(&mut self, processes: &[Identity]) -> Option<(RunMeasurement, WorkingSets)> {
         let reading = self.sample(&[])?;
         let sets = processes
             .iter()

@@ -44,7 +44,7 @@ use self::engine::{RunJob, RunSummary, Settling};
 use self::growth::GrowthTracker;
 use self::memlist::Lists;
 use self::pressure::{Assessment, PressureModel, SignalSource, Verdict, WindowsSignals};
-use self::sampler::WindowsSampler;
+use self::sampler::VerifiedSampler;
 use self::scheduler::Scheduler;
 use self::stats::{Sampler, Snapshot, SortKey};
 use self::workbench::Selection;
@@ -158,7 +158,7 @@ pub struct Memory {
     growth: GrowthTracker,
     last_growth: Option<Instant>,
     /// Reads the numbers a run report compares.
-    win_sampler: Option<WindowsSampler>,
+    win_sampler: Option<Box<dyn VerifiedSampler>>,
     /// "Where your memory goes" on Home; rebuilt with every refresh. Not stored anywhere.
     breakdown: groups::Breakdown,
     /// Commit charge on Home; refreshed with the sampler. `None` if the query fails.
@@ -199,7 +199,9 @@ impl Memory {
     /// no app in front. Tests add the fakes they need.
     #[cfg(test)]
     fn for_test() -> Self {
-        Self::build(None, None, None, Box::new(|| None))
+        let mut memory = Self::build(None, None, None, Box::new(|| None));
+        memory.log_store = clean_log::FileStore::nowhere();
+        memory
     }
 
     fn build(

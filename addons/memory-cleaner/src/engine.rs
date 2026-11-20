@@ -18,7 +18,7 @@ use super::freed::{self, Change};
 use super::growth::{self, WindowsPrivateMemory};
 use super::pressure::{Assessment, Signals, Verdict};
 use super::report::{self, HonestReport, RunMeasurement, RunMeasurements, Trigger};
-use super::sampler::{WindowsSampler, WorkingSets};
+use super::sampler::{VerifiedSampler, WindowsSampler, WorkingSets};
 use super::scheduler::Decision;
 use super::stats::ProcInfo;
 use super::Memory;
@@ -54,6 +54,10 @@ struct RunDone {
     results: Vec<ActionResult>,
     undo: UndoLog,
     cooldowns: Cooldowns,
+}
+
+fn windows_sampler() -> Box<dyn VerifiedSampler> {
+    Box::new(WindowsSampler::new())
 }
 
 fn paired_working_sets(before: &WorkingSets, after: &WorkingSets) -> (u64, u64, Vec<Identity>) {
@@ -476,7 +480,7 @@ impl Memory {
             .collect();
         let Some((before, before_sets)) = self
             .win_sampler
-            .get_or_insert_with(WindowsSampler::new)
+            .get_or_insert_with(windows_sampler)
             .sample_verified(&trim_processes)
         else {
             self.status = Some(
@@ -550,7 +554,7 @@ impl Memory {
             .collect();
         let Some((mut after, after_sets)) = self
             .win_sampler
-            .get_or_insert_with(WindowsSampler::new)
+            .get_or_insert_with(windows_sampler)
             .sample_verified(&trimmed)
         else {
             // The run happened; say so, without claiming numbers that were never read.
@@ -598,7 +602,7 @@ impl Memory {
             return;
         };
         let elapsed = settling.started.elapsed();
-        let sampler = self.win_sampler.get_or_insert_with(WindowsSampler::new);
+        let sampler = self.win_sampler.get_or_insert_with(windows_sampler);
         match settling.poll(elapsed, |processes| {
             let (mut reading, sets) = sampler.sample_verified(processes)?;
             reading.private_ws = sets.values().sum();
@@ -1114,6 +1118,102 @@ mod tests {
         let idle = |name| m.activity.idle_for(name, now, None, None).unwrap();
         assert!(idle("chrome.exe") < Duration::from_secs(10));
         assert!(idle("other.exe") >= Duration::from_secs(1000));
+    }
+
+    /// Pressure readings the test steers: little memory is ready, so a 10% limit is exceeded.
+    struct Fixed(Signals);
+
+    impl crate::pressure::SignalSource for Fixed {
+        fn read(&mut self) -> Option<Signals> {
+            Some(self.0)
+        }
+    }
+
+    fn half_full() -> Signals {
+        let gib = crate::pressure::limits::GIB;
+        Signals {
+            available: 8 * gib,
+            total_ram: 16 * gib,
+            commit_used: 10 * gib,
+            commit_limit: 40 * gib,
+            compressed: None,
+            hard_faults_per_sec: None,
+            low_memory_signalled: false,
+        }
+    }
+
+    /// A sampling worker whose requests the test reads, so no thread reads Windows.
+    fn fake_worker(m: &mut Memory) -> mpsc::Receiver<Option<crate::RefreshAction>> {
+        let (request, requests) = mpsc::channel();
+        let (_results, result) = mpsc::channel();
+        m.refresh_worker = Some(crate::RefreshWorker { request, result });
+        requests
+    }
+
+    #[test]
+    fn a_trigger_run_is_skipped_while_busy_and_retried_when_free() {
+        let mut m = Memory::for_test();
+        m.signals = Some(Box::new(Fixed(half_full())));
+        m.auto.set_limit(Some(10));
+        let requests = fake_worker(&mut m);
+        let ctx = egui::Context::default();
+
+        // Another job is going: nothing is asked of the worker and nothing is recorded, so the
+        // rule is not consumed.
+        m.refresh_action_pending = true;
+        m.evaluate(&ctx);
+        assert!(requests.try_recv().is_err());
+        assert!(m.pending_note.is_none());
+
+        m.refresh_action_pending = false;
+        m.evaluate(&ctx);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Some(crate::RefreshAction::Optimize(Trigger::MemoryLimit)))
+        ));
+        assert!(m.pending_note.is_some());
+    }
+
+    /// Readings that always fail, as when Windows will not give the memory numbers.
+    struct Unreadable;
+
+    impl VerifiedSampler for Unreadable {
+        fn sample_verified(&mut self, _: &[Identity]) -> Option<(RunMeasurement, WorkingSets)> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_finished_run_whose_after_reading_fails_says_so_without_numbers() {
+        let mut m = Memory::for_test();
+        assert!(!m.options.log, "the log is off, so nothing is written");
+        m.win_sampler = Some(Box::new(Unreadable));
+        let (tx, rx) = mpsc::channel();
+        tx.send(RunDone {
+            results: Vec::new(),
+            undo: UndoLog::new(),
+            cooldowns: Cooldowns::new(),
+        })
+        .unwrap();
+        m.run = Some(RunJob {
+            rx,
+            trigger: Trigger::Manual,
+            before: reading(100, 100, 1000),
+            before_sets: WorkingSets::new(),
+        });
+        m.poll_run(&egui::Context::default());
+        assert!(m.run.is_none());
+        assert_eq!(m.last_run, Some(RunSummary::default()));
+        assert_eq!(
+            m.status.as_deref(),
+            Some("Could not read the memory numbers after the run.")
+        );
+        let result = m.last_result.expect("the run is still recorded");
+        assert_eq!(
+            result.change, None,
+            "no numbers were read, so none are claimed"
+        );
+        assert!(m.settling.is_none() && m.reports.is_empty());
     }
 
     #[test]

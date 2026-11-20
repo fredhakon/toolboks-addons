@@ -411,6 +411,23 @@ mod tests {
     }
 
     #[test]
+    fn the_saved_automatic_settings_apply_before_any_frame() {
+        let mut m = Memory::for_test();
+        let preferences = [(
+            "auto_triggers".to_string(),
+            serde_json::json!({"limit": 85, "interval": 30}),
+        )]
+        .into();
+        // The host sends `LoadPreferences` right after connecting, before the page is drawn.
+        m.load_preferences(&preferences);
+        assert_eq!(
+            (m.auto.settings().limit, m.auto.settings().interval),
+            (Some(85), Some(30))
+        );
+        assert!(!m.active && m.auto.any_on());
+    }
+
+    #[test]
     fn the_first_frame_shows_the_page_without_a_resume() {
         let (mut m, _) = memory(Some(calm()));
         m.preferences_loaded = true; // nothing is read from disk

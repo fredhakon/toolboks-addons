@@ -1329,6 +1329,39 @@
       "release_notes": "Release memory-cleaner-v0.5.0.",
       "verified": false,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.memory-cleaner",
+      "title": "Memory Cleaner",
+      "short_description": "Keep an eye on memory and clean up what idle apps are holding.",
+      "long_description": "Memory Cleaner shows how your memory is used, which apps hold the most, and how close Windows is to running short. It can trim the memory that idle apps are not using, by hand, from the tray, or automatically when memory is under real pressure, above a memory limit you set, or at an interval you set, even while the window is hidden. Trimming moves memory into the cache and never closes an app. Advanced actions clean system-wide memory regions (all working sets, system file cache, modified file cache, modified page list, standby lists, registry cache, combine memory lists). They are opt-in, change how Windows manages memory for the whole PC, can briefly slow the next use of apps, and are never run automatically: each asks for administrator rights in a separate window and only runs when you confirm there. Memory Cleaner shows how much was freed and can keep a short local log of cleans. It also reports to Home whether memory is under pressure, kept in memory only and never saved.",
+      "publisher": "Toolboks",
+      "category": "System tools",
+      "icon": "chip",
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "host_metrics",
+        "system_tuning"
+      ],
+      "pages": [
+        "Home",
+        "Advanced"
+      ],
+      "background": true,
+      "checks": [
+        "Memory pressure"
+      ],
+      "kind": "native",
+      "version": "0.5.1",
+      "min_toolboks_version": "0.16.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/memory-cleaner-v0.5.1/memory-cleaner.exe",
+      "size": 3712512,
+      "sha256": "c9584b3a260630b528e98712f32cecf6dfd97f3e572f5d8870e274b7464a989a",
+      "release_notes": "Release memory-cleaner-v0.5.1.",
+      "verified": false,
+      "channel": "stable"
     }
   ]
 }

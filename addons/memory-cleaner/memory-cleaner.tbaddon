@@ -6,7 +6,7 @@
     "native_provider": "toolboks.memory-cleaner",
     "description": "Keep an eye on memory and clean up what idle apps are holding.",
     "long_description": "Memory Cleaner shows how your memory is used, which apps hold the most, and how close Windows is to running short. It can trim the memory that idle apps are not using, by hand, from the tray, or automatically when memory is under real pressure, above a memory limit you set, or at an interval you set, even while the window is hidden. Trimming moves memory into the cache and never closes an app. Advanced actions clean system-wide memory regions (all working sets, system file cache, modified file cache, modified page list, standby lists, registry cache, combine memory lists). They are opt-in, change how Windows manages memory for the whole PC, can briefly slow the next use of apps, and are never run automatically: each asks for administrator rights in a separate window and only runs when you confirm there. Memory Cleaner shows how much was freed and can keep a short local log of cleans. It also reports to Home whether memory is under pressure, kept in memory only and never saved.",
-    "version": "0.5.0",
+    "version": "0.5.1",
     "author": "Toolboks team",
     "publisher": "Toolboks",
     "category": "System tools",

@@ -139,7 +139,7 @@ pub struct Memory {
     health_source: health::Source,
     /// Automatic mode (off by default) and the advice shown instead of a run.
     scheduler: Scheduler,
-    /// The memory-limit and interval triggers (off by default) and the lists opt-in.
+    /// The memory-limit and interval triggers (off by default).
     auto: AutoTriggers,
     advice: Option<String>,
     advice_hidden: bool,

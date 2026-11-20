@@ -20,10 +20,9 @@ Why no clean region runs automatically yet:
   administrator helper, which shows a Confirm window. An unattended run must never show it.
   Region 1 (working set, all apps) is also a helper call; the safe per-app trim the scheduler
   uses is a different action and is what the two new triggers run.
-- The opt-in "Allow standby and modified lists in automatic cleaning" is stored (off by default,
-  with the freeze warning) and `auto_regions` filters the ticked regions: lists 4 and 5 are out
-  unless the switch is on, and anything that needs the helper is out always. Today that leaves
-  nothing; the Rules tab says so. When a region can run without the helper, only
-  `needs_helper` changes.
+- The opt-in "Allow standby and modified lists in automatic cleaning" switch was removed
+  (it was stored but did nothing, because no region can run unattended). A saved
+  `allow_lists` value from an older version is ignored on load and dropped on the next save.
+  When a region can run without the helper, an automatic-region filter can come back with it.
 
 Host: nothing needed.

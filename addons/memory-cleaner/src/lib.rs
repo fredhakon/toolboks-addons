@@ -14,6 +14,7 @@ mod health_feed;
 mod home;
 mod memlist;
 mod pressure;
+mod regions;
 mod report;
 mod sampler;
 mod scheduler;
@@ -59,7 +60,8 @@ struct RefreshWorker {
 
 /// Live RAM usage, a per-process table, manual per-process trimming, a pressure verdict, the
 /// safe optimize run and an automatic mode that only acts under real memory pressure.
-/// Nothing is stored anywhere: exclusions and filters reset when the app closes.
+/// Only the "Clean selected regions" ticks are saved (as a preference): exclusions and filters
+/// reset when the app closes.
 pub struct Memory {
     /// `None` if the platform refused to provide system info.
     sampler: Option<Snapshot>,
@@ -97,6 +99,13 @@ pub struct Memory {
     /// The low-priority cache purge running on a worker thread, and its last result.
     purge: Option<PurgeJob>,
     last_purge: Option<String>,
+    /// The ticked "Clean selected regions" (loaded from the preferences on the first frame), the
+    /// result of the last run and the Windows version that gates regions 7 and 8. A run uses
+    /// the same administrator request and `purge` job as the cache purge.
+    regions: regions::Selection,
+    regions_loaded: bool,
+    last_regions: Option<String>,
+    windows_version: Option<regions::WindowsVersion>,
     /// Result of the last action, shown above the table.
     status: Option<String>,
     /// The safe optimize run on a worker thread, what the last one did, and the settle
@@ -177,6 +186,10 @@ impl Memory {
             last_trim: None,
             purge: None,
             last_purge: None,
+            regions: regions::Selection::default(),
+            regions_loaded: false,
+            last_regions: None,
+            windows_version: regions::windows_version(),
             status: None,
             run: None,
             last_run: None,
@@ -376,11 +389,15 @@ impl NativeAddon for Memory {
     fn ui(
         &mut self,
         ui: &mut egui::Ui,
-        _preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
+        preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
     ) -> bool {
         style_once(ui.ctx());
+        if !self.regions_loaded {
+            self.regions = regions::Selection::load(preferences);
+            self.regions_loaded = true;
+        }
         self.draw(ui, self.page);
-        false
+        self.regions.store(preferences)
     }
     fn navigate(&mut self, page: &str) {
         self.page = page

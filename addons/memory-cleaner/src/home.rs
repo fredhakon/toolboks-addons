@@ -810,7 +810,8 @@ impl Memory {
                     r.sentences().join(" "),
                     why_it_ran(r.trigger, self.run_note.as_deref()),
                     r.copy_text(),
-                    (r.automatic() || r.is_small()) && self.scheduler.is_enabled(),
+                    (r.automatic() || r.is_small())
+                        && (self.scheduler.is_enabled() || self.auto.any_on()),
                 )
             });
 
@@ -907,6 +908,7 @@ impl Memory {
             }
             if offer_off && ui.link("Turn off auto-clean").clicked() {
                 self.scheduler.set_enabled(false);
+                self.auto.disable_all();
             }
         });
         if restore {

@@ -13,6 +13,7 @@ use super::actions::{
     self, ActionResult, Candidate, Cooldowns, Identity, Kind, Policy, UndoLog, WindowsOps,
 };
 use super::activity::{self, Activity};
+use super::auto_triggers;
 use super::growth::{self, WindowsPrivateMemory};
 use super::pressure::{Assessment, Verdict};
 use super::report::{self, HonestReport, RunMeasurement, RunMeasurements, Trigger};
@@ -342,7 +343,8 @@ impl Memory {
         self.activity.note_foreground(now, name.as_deref());
     }
 
-    /// One pressure reading, then the scheduler's answer to it.
+    /// One pressure reading, then the scheduler's answer to it, then the memory-limit and
+    /// interval triggers (the scheduler's run wins when both are due).
     fn evaluate(&mut self, ctx: &egui::Context) {
         let now = self.now_ms();
         let Some((signals, assessment)) = self.read_pressure(now, super::health_feed::unix_now())
@@ -357,6 +359,8 @@ impl Memory {
         self.hard_faults = signals.hard_faults_per_sec;
         let decision = self.scheduler.tick(now, &assessment, commit_fraction);
         self.assessment = assessment;
+        let used = auto_triggers::used_percent(signals.total_ram, signals.available);
+        let fire = self.auto.tick(now, used, commit_fraction);
         match decision {
             Decision::Idle => {
                 self.advice = None;
@@ -367,8 +371,17 @@ impl Memory {
                 self.advice = None;
                 if self.start_run(ctx, Trigger::Pressure) {
                     self.scheduler.record_run(now);
+                    self.auto.record_run(now);
                     self.run_note = Some(trigger);
+                    return;
                 }
+            }
+        }
+        // The pressure scheduler had nothing to run (or was busy): the user's own triggers.
+        if let Some(fire) = fire {
+            if self.start_run(ctx, fire.trigger()) {
+                self.auto.record_run(now);
+                self.run_note = Some(fire.text());
             }
         }
     }

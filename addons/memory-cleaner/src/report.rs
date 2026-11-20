@@ -91,6 +91,10 @@ pub enum Trigger {
     Manual,
     /// Memory pressure held for a minute.
     Pressure,
+    /// Memory in use reached the user's limit (`auto_triggers`).
+    MemoryLimit,
+    /// The user's interval passed (`auto_triggers`).
+    Interval,
 }
 
 impl Trigger {
@@ -103,6 +107,8 @@ impl Trigger {
         match self {
             Trigger::Manual => "You started this run.",
             Trigger::Pressure => "Memory had been under pressure for a minute.",
+            Trigger::MemoryLimit => "Memory in use reached your limit.",
+            Trigger::Interval => "Your interval passed.",
         }
     }
 }
@@ -479,6 +485,15 @@ mod tests {
             .text()
             .contains("Why it ran"));
         assert!(r.one_line().starts_with("Auto:"));
+    }
+
+    #[test]
+    fn the_extra_triggers_are_automatic_and_say_why() {
+        for trigger in [Trigger::MemoryLimit, Trigger::Interval] {
+            assert!(trigger.is_automatic());
+            assert!(trigger.text().ends_with('.'));
+            assert!(HonestReport::compute(trigger, 1, RunMeasurements::default()).automatic());
+        }
     }
 
     #[test]

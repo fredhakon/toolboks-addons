@@ -397,7 +397,7 @@ impl Memory {
     }
 
     /// The state of automatic cleaning; the switch itself is on the Home page.
-    fn automatic_status(&self, ui: &mut egui::Ui) {
+    fn automatic_status(&mut self, ui: &mut egui::Ui) {
         section(ui, "Automatic cleaning");
         stat_row(ui, "Status", self.scheduler.status(self.now_ms()));
         ui.label(
@@ -410,6 +410,8 @@ impl Memory {
         if let Some(line) = super::engine::verdict_line(&self.assessment) {
             ui.label(RichText::new(line).small());
         }
+        ui.separator();
+        self.auto_triggers_ui(ui);
     }
 
     fn selected_tab(&mut self, ui: &mut egui::Ui) {

@@ -3,6 +3,7 @@ mod activity;
 mod admin;
 mod advanced;
 mod audio;
+mod auto_triggers;
 #[cfg(test)]
 mod bench;
 mod commit;
@@ -33,6 +34,7 @@ use self::actions::{Cooldowns, UndoLog};
 use self::activity::Activity;
 pub use self::admin::prepare_admin;
 use self::admin::PurgeJob;
+use self::auto_triggers::{AutoTriggers, Settings as AutoSettings};
 use self::engine::{RunJob, RunSummary, Settling};
 use self::growth::GrowthTracker;
 use self::memlist::Lists;
@@ -60,7 +62,8 @@ struct RefreshWorker {
 
 /// Live RAM usage, a per-process table, manual per-process trimming, a pressure verdict, the
 /// safe optimize run and an automatic mode that only acts under real memory pressure.
-/// Only the "Clean selected regions" ticks are saved (as a preference): exclusions and filters
+/// Only the "Clean selected regions" ticks and the automatic trigger settings are saved (as
+/// preferences): exclusions and filters
 /// reset when the app closes.
 pub struct Memory {
     /// `None` if the platform refused to provide system info.
@@ -130,6 +133,8 @@ pub struct Memory {
     health_source: health::Source,
     /// Automatic mode (off by default) and the advice shown instead of a run.
     scheduler: Scheduler,
+    /// The memory-limit and interval triggers (off by default) and the lists opt-in.
+    auto: AutoTriggers,
     advice: Option<String>,
     advice_hidden: bool,
     /// Zero for the models' millisecond clock, when the pressure check last ran and when the
@@ -212,6 +217,7 @@ impl Memory {
                 reasons: Vec::new(),
             },
             scheduler: Scheduler::default(),
+            auto: AutoTriggers::default(),
             advice: None,
             advice_hidden: false,
             epoch,
@@ -394,10 +400,13 @@ impl NativeAddon for Memory {
         style_once(ui.ctx());
         if !self.regions_loaded {
             self.regions = regions::Selection::load(preferences);
+            self.auto = AutoTriggers::new(AutoSettings::load(preferences));
             self.regions_loaded = true;
         }
         self.draw(ui, self.page);
-        self.regions.store(preferences)
+        let regions_changed = self.regions.store(preferences);
+        let auto_changed = self.auto.settings().store(preferences);
+        regions_changed || auto_changed
     }
     fn navigate(&mut self, page: &str) {
         self.page = page

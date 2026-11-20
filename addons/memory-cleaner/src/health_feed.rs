@@ -78,10 +78,9 @@ impl Memory {
             self.last_eval = Instant::now();
             let now_ms = self.now_ms();
             if let Some((signals, assessment)) = self.read_pressure(now_ms, unix_now()) {
-                // Only an automatic rule needs to know which app was in front.
-                if self.scheduler.is_enabled() || self.auto.any_on() {
-                    self.note_foreground();
-                }
+                // Every reading, rule or not: a run started from the tray while hidden judges
+                // idleness by it. One foreground query every 10 s.
+                self.note_foreground();
                 self.automatic_check(now_ms, &signals, assessment, start);
             }
         }
@@ -150,7 +149,7 @@ mod tests {
 
     fn memory(initial: Option<Signals>) -> (Memory, Arc<Mutex<Option<Signals>>>) {
         let shared = Arc::new(Mutex::new(initial));
-        let mut m = Memory::new();
+        let mut m = Memory::for_test();
         m.signals = Some(Box::new(Fake(shared.clone())));
         (m, shared)
     }
@@ -363,7 +362,7 @@ mod tests {
             }
         }
         let count = Arc::new(Mutex::new(0));
-        let mut m = Memory::new();
+        let mut m = Memory::for_test();
         m.signals = Some(Box::new(Counting(count.clone())));
         m.suspend();
         // Fresh: the last reading was just now, so 200 ms ticks read nothing.
@@ -393,6 +392,81 @@ mod tests {
         let (mut m, _) = memory(Some(initial));
         m.suspend();
         m
+    }
+
+    #[test]
+    fn a_memory_that_never_drew_runs_the_hidden_tick_without_a_suspend() {
+        // No `suspend`, no frame: the host sends `Suspend` only after the add-on is already
+        // running, so a fresh one has to be hidden by itself.
+        let (mut m, _) = memory(Some(calm()));
+        assert!(!m.active);
+        m.auto.set_limit(Some(10));
+        let mut starts = Vec::new();
+        hidden_at(&mut m, 100, true, &mut starts);
+        assert_eq!(starts, vec![Trigger::MemoryLimit]);
+        // Hidden: a plain refresh still waits for the window.
+        let ctx = egui::Context::default();
+        assert!(!m.request_refresh(&ctx, None));
+    }
+
+    #[test]
+    fn the_saved_automatic_settings_apply_before_any_frame() {
+        let mut m = Memory::for_test();
+        let preferences = [(
+            "auto_triggers".to_string(),
+            serde_json::json!({"limit": 85, "interval": 30}),
+        )]
+        .into();
+        // The host sends `LoadPreferences` right after connecting, before the page is drawn.
+        m.load_preferences(&preferences);
+        assert_eq!(
+            (m.auto.settings().limit, m.auto.settings().interval),
+            (Some(85), Some(30))
+        );
+        assert!(!m.active && m.auto.any_on());
+    }
+
+    #[test]
+    fn the_first_frame_shows_the_page_and_starts_sampling_at_once() {
+        let (mut m, _) = memory(Some(calm()));
+        m.preferences_loaded = true; // nothing is read from disk
+                                     // A fake sampling worker, so no thread reads Windows. A tick only asks it for a reading
+                                     // when something is due (here: a finished purge wants fresh numbers), and the request
+                                     // is refused while the add-on is not shown, which is what this test is about.
+        let (request, requests) = std::sync::mpsc::channel();
+        let (_results, result) = std::sync::mpsc::channel();
+        m.refresh_worker = Some(crate::RefreshWorker { request, result });
+        m.refresh_after_purge = true;
+        let mut preferences = Default::default();
+        let ctx = egui::Context::default();
+        // The runtime ticks, then draws, in the same frame.
+        m.tick(&ctx);
+        let output = ctx.run_ui(Default::default(), |ui| {
+            m.ui(ui, &mut preferences);
+        });
+        output.drop_without_applying_deltas();
+        assert!(m.active);
+        // The first tick got its request through, so the page says it is collecting instead
+        // of "not available" for two seconds.
+        assert!(matches!(requests.try_recv(), Ok(None)));
+        assert_eq!(m.refresh_in_flight, 1);
+        // Shown: the hidden tick no longer reads on its own.
+        m.last_eval = Instant::now() - eval_interval(false) - Duration::from_millis(1);
+        m.hidden_tick(&mut |_, _| panic!("no run while the page is shown"));
+    }
+
+    #[test]
+    fn a_hidden_reading_notes_the_app_in_front_even_with_no_rule_on() {
+        let (mut m, _) = memory(Some(calm()));
+        m.probes.foreground_name = Box::new(|| Some("Notes.exe".to_string()));
+        assert!(!m.scheduler.is_enabled() && !m.auto.any_on());
+        m.epoch = Instant::now() - Duration::from_secs(1000);
+        m.last_eval = Instant::now() - eval_interval(false) - Duration::from_millis(1);
+        m.hidden_tick(&mut |_, _| true);
+        let now = m.now_ms();
+        let idle = |name| m.activity.idle_for(name, now, None, None).unwrap();
+        assert!(idle("notes.exe") < Duration::from_secs(10));
+        assert!(idle("other.exe") >= Duration::from_secs(1000));
     }
 
     #[test]
@@ -494,7 +568,7 @@ mod tests {
             }
         }
         let count = Arc::new(Mutex::new(0));
-        let mut m = Memory::new();
+        let mut m = Memory::for_test();
         m.signals = Some(Box::new(Counting(count.clone())));
         m.auto.set_limit(Some(1));
         m.auto.set_interval(Some(1));
@@ -512,18 +586,35 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_add_on_starts_only_automatic_runs() {
-        let mut m = Memory::new();
+    fn a_hidden_add_on_starts_only_runs() {
+        let mut m = Memory::for_test();
         m.suspend();
         let ctx = egui::Context::default();
+        // A plain refresh or a selected-rows trim waits for the window.
         assert!(!m.request_refresh(&ctx, None));
-        assert!(!m.request_refresh(&ctx, Some(crate::RefreshAction::Optimize(Trigger::Manual))));
         let trim = crate::RefreshAction::Trim {
             selection: Default::default(),
             grouped: false,
         };
         assert!(!m.request_refresh(&ctx, Some(trim)));
         assert!(!m.refresh_action_pending);
+        // A run (automatic, or the tray "Clean now", which is only offered hidden when it
+        // needs no prompt) may start.
+        let (request, _requests) = std::sync::mpsc::channel();
+        let (_results, result) = std::sync::mpsc::channel();
+        m.refresh_worker = Some(crate::RefreshWorker { request, result });
+        let run = crate::RefreshAction::Optimize(Trigger::Manual);
+        assert!(m.request_refresh(&ctx, Some(run)));
+        assert!(m.refresh_action_pending);
+    }
+
+    #[test]
+    fn resuming_makes_the_source_from_the_probe_not_from_windows() {
+        let mut m = Memory::for_test();
+        m.signals = None;
+        m.resume();
+        let mut source = m.signals.expect("a source was made");
+        assert!(source.read().is_none(), "the test probe reads nothing");
     }
 
     #[test]

@@ -131,7 +131,17 @@ pub fn foreground_app_name() -> Option<String> {
     }
     .ok()?;
     let path = String::from_utf16_lossy(&buf[..len as usize]);
-    path.rsplit('\\').next().map(str::to_string)
+    app_name_from_path(&path)
+}
+
+/// The app's display name from its image path: the file name after the last separator, as
+/// Windows spells it (`C:\Apps\Chrome.exe` is `Chrome.exe`). `None` if the path is empty or ends
+/// with a separator, since there is no file name then.
+fn app_name_from_path(path: &str) -> Option<String> {
+    path.rsplit(['\\', '/'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 /// Time since the last keyboard or mouse input, or `None` if Windows does not say.
@@ -162,6 +172,27 @@ mod tests {
             right: r,
             bottom: b,
         }
+    }
+
+    #[test]
+    fn the_app_name_is_the_file_name_of_the_image_path() {
+        let name = app_name_from_path;
+        assert_eq!(
+            name(r"C:\Program Files\Google\Chrome.exe").as_deref(),
+            Some("Chrome.exe")
+        );
+        assert_eq!(name("notepad.exe").as_deref(), Some("notepad.exe"));
+        // Not changed or guessed: no extension, or not an .exe.
+        assert_eq!(name(r"C:\bin\tool").as_deref(), Some("tool"));
+        assert_eq!(name(r"C:\bin\run.scr").as_deref(), Some("run.scr"));
+        assert_eq!(
+            name("C:\\Brukere\\Sn\u{f8}\\Lyd \u{2013} spiller.exe").as_deref(),
+            Some("Lyd \u{2013} spiller.exe")
+        );
+        // Nothing to name.
+        assert_eq!(name(""), None);
+        assert_eq!(name(r"C:\Apps\"), None);
+        assert_eq!(name(r"\"), None);
     }
 
     #[test]

@@ -8,6 +8,7 @@ use super::freed::{Change, RunResult};
 use super::report::{self, Trigger};
 use super::style::section;
 use super::Memory;
+use toolboks_addon_sdk::TrayItem;
 
 /// A manual action the add-on runs by itself, which can ask first.
 ///
@@ -19,6 +20,16 @@ pub enum Confirm {
     TrimIdle,
     TrimSelected,
 }
+
+/// The id of the one tray entry; the host sends it back to `tray_action`.
+const TRAY_CLEAN_NOW: &str = "clean-now";
+const TRAY_LABEL: &str = "Clean now";
+const TRAY_LABEL_BUSY: &str = "Clean now (running)";
+/// Said in the entry itself: a prompt cannot be seen while the page is hidden, and the add-on
+/// has no way to raise its page, so the entry waits for the page instead of cleaning unasked.
+/// A prompt is already open (on the page), so a second one would replace it.
+const TRAY_LABEL_PROMPT: &str = "Clean now (answer the question first)";
+const TRAY_LABEL_CONFIRM: &str = "Clean now (open Memory Cleaner to confirm)";
 
 const BUSY_TEXT: &str = "A run is already going. Try again when it has finished.";
 
@@ -68,6 +79,44 @@ impl Memory {
             }
             Confirm::TrimSelected => self.start_trim(ctx),
         }
+    }
+
+    /// Why the tray "Clean now" cannot be used right now, as the label of the entry; `None` if
+    /// it can. Never runs a clean the user was not asked about: with the ask-first switch on,
+    /// only a shown page can draw the prompt.
+    fn clean_now_blocked(&self) -> Option<&'static str> {
+        if self.busy() {
+            Some(TRAY_LABEL_BUSY)
+        } else if self.options.confirm_manual && !self.active {
+            Some(TRAY_LABEL_CONFIRM)
+        } else if self.pending_confirm.is_some() {
+            Some(TRAY_LABEL_PROMPT)
+        } else {
+            None
+        }
+    }
+
+    /// The tray menu: one "Clean now" entry, the same run as Home "Trim idle apps".
+    pub(super) fn clean_now_tray_items(&self) -> Vec<TrayItem> {
+        let blocked = self.clean_now_blocked();
+        vec![TrayItem {
+            id: TRAY_CLEAN_NOW.to_string(),
+            label: blocked.unwrap_or(TRAY_LABEL).to_string(),
+            enabled: blocked.is_none(),
+        }]
+    }
+
+    /// The user chose a tray entry: ask first or run, exactly like the Home button. An unknown
+    /// id, or a state the entry was offered disabled in, does nothing.
+    pub(super) fn clean_now_tray_action(&mut self, id: &str) {
+        // Also blocked while a prompt is open: it is left alone, not swapped for this one.
+        if id != TRAY_CLEAN_NOW || self.clean_now_blocked().is_some() {
+            return;
+        }
+        // Never ticked (started hidden): a throwaway context. Nothing is lost, because
+        // `tick_background` polls the run every 200 ms.
+        let ctx = self.ctx.clone().unwrap_or_default();
+        self.ask_or_run(&ctx, Confirm::TrimIdle);
     }
 
     /// Draws the prompt while one is pending.
@@ -188,11 +237,129 @@ impl Memory {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
+    use crate::{RefreshAction, RefreshWorker};
+
+    /// Puts a fake sampling worker in place, so a run that starts is seen on the returned
+    /// receiver and no thread reads Windows.
+    fn fake_worker(memory: &mut Memory) -> mpsc::Receiver<Option<RefreshAction>> {
+        let (request, requests) = mpsc::channel();
+        let (_results, result) = mpsc::channel();
+        memory.refresh_worker = Some(RefreshWorker { request, result });
+        requests
+    }
+
+    fn entry(memory: &Memory) -> TrayItem {
+        let mut items = memory.clean_now_tray_items();
+        assert_eq!(items.len(), 1);
+        items.remove(0)
+    }
+
+    #[test]
+    fn the_tray_entry_waits_for_the_page_when_it_must_ask() {
+        let mut memory = Memory::for_test();
+        assert!(memory.options.confirm_manual, "asking is the default");
+        memory.active = false;
+        let hidden = entry(&memory);
+        assert_eq!(hidden.id, "clean-now");
+        assert_eq!(hidden.label, "Clean now (open Memory Cleaner to confirm)");
+        assert!(!hidden.enabled);
+        assert!(hidden.label.chars().count() <= 60, "the host clips at 60");
+
+        memory.active = true;
+        assert_eq!(
+            entry(&memory),
+            TrayItem {
+                id: "clean-now".into(),
+                label: "Clean now".into(),
+                enabled: true
+            }
+        );
+
+        // Not asking: it can run with the page hidden.
+        memory.active = false;
+        memory.options.confirm_manual = false;
+        assert!(entry(&memory).enabled);
+        assert_eq!(entry(&memory).label, "Clean now");
+    }
+
+    #[test]
+    fn the_tray_entry_is_disabled_while_a_job_is_busy() {
+        for confirm in [true, false] {
+            let mut memory = Memory::for_test();
+            memory.active = true;
+            memory.options.confirm_manual = confirm;
+            memory.refresh_action_pending = true;
+            let busy = entry(&memory);
+            assert!(!busy.enabled);
+            assert_eq!(busy.label, "Clean now (running)");
+        }
+    }
+
+    #[test]
+    fn choosing_the_tray_entry_with_the_page_shown_asks_first() {
+        let mut memory = Memory::for_test();
+        memory.active = true;
+        let requests = fake_worker(&mut memory);
+        memory.clean_now_tray_action("clean-now");
+        assert_eq!(memory.pending_confirm, Some(Confirm::TrimIdle));
+        assert!(
+            requests.try_recv().is_err(),
+            "nothing runs before the answer"
+        );
+        assert!(!memory.busy());
+    }
+
+    #[test]
+    fn choosing_the_tray_entry_without_asking_runs_the_same_manual_run_even_hidden() {
+        let mut memory = Memory::for_test();
+        memory.active = false;
+        memory.options.confirm_manual = false;
+        let requests = fake_worker(&mut memory);
+        memory.clean_now_tray_action("clean-now");
+        assert_eq!(memory.pending_confirm, None);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Some(RefreshAction::Optimize(Trigger::Manual)))
+        ));
+        assert!(memory.busy());
+    }
+
+    #[test]
+    fn a_tray_click_leaves_an_open_prompt_alone() {
+        let mut memory = Memory::for_test();
+        memory.active = true;
+        memory.pending_confirm = Some(Confirm::TrimSelected);
+        let offered = entry(&memory);
+        assert!(!offered.enabled);
+        assert_eq!(offered.label, "Clean now (answer the question first)");
+        assert!(offered.label.chars().count() <= 60);
+        memory.clean_now_tray_action("clean-now");
+        assert_eq!(memory.pending_confirm, Some(Confirm::TrimSelected));
+    }
+
+    #[test]
+    fn the_tray_action_never_cleans_unasked() {
+        // Hidden with asking on (the entry is offered disabled), an unknown id, and busy.
+        let mut memory = Memory::for_test();
+        memory.active = false;
+        let requests = fake_worker(&mut memory);
+        memory.clean_now_tray_action("clean-now");
+        memory.options.confirm_manual = false;
+        memory.clean_now_tray_action("something-else");
+        memory.clean_now_tray_action("");
+        memory.refresh_action_pending = true;
+        memory.clean_now_tray_action("clean-now");
+        assert!(requests.try_recv().is_err());
+        assert_eq!(memory.pending_confirm, None);
+        assert_eq!(memory.status, None, "no busy text either: it did nothing");
+    }
 
     #[test]
     fn asking_is_the_default_and_starts_nothing_until_answered() {
-        let mut memory = Memory::new();
+        let mut memory = Memory::for_test();
         memory.ask_or_run(&egui::Context::default(), Confirm::TrimIdle);
         assert_eq!(memory.pending_confirm, Some(Confirm::TrimIdle));
         assert!(!memory.busy());
@@ -200,7 +367,7 @@ mod tests {
 
     #[test]
     fn answering_while_another_job_runs_says_so_instead_of_doing_nothing() {
-        let mut memory = Memory::new();
+        let mut memory = Memory::for_test();
         memory.options.confirm_manual = false;
         memory.refresh_action_pending = true;
         memory.ask_or_run(&egui::Context::default(), Confirm::TrimSelected);
@@ -210,7 +377,7 @@ mod tests {
 
     #[test]
     fn a_run_without_readable_numbers_is_recorded_without_claims() {
-        let mut memory = Memory::new();
+        let mut memory = Memory::for_test();
         memory.record_result(
             Trigger::Interval,
             vec!["Idle apps".into()],

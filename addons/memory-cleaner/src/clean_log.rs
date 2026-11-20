@@ -139,6 +139,20 @@ impl FileStore {
                 .join(FILE_NAME),
         )
     }
+
+    /// A store in a temp folder that is never created: it reads as an empty log, so a test never
+    /// touches the real log. A test that turns the log on would create (only) that temp folder.
+    #[cfg(test)]
+    pub fn nowhere() -> Self {
+        Self(
+            std::env::temp_dir()
+                .join(format!(
+                    "memory-cleaner-test-{}-no-folder",
+                    std::process::id()
+                ))
+                .join(FILE_NAME),
+        )
+    }
 }
 
 impl Store for FileStore {
@@ -189,11 +203,21 @@ pub fn append(store: &mut dyn Store, entry: Entry) -> Result<usize, String> {
     let mut entries = load(store);
     entries.push(entry);
     entries.drain(..entries.len().saturating_sub(MAX_ENTRIES));
-    let mut text = render(&entries);
-    while text.len() > MAX_BYTES && !entries.is_empty() {
-        entries.remove(0);
-        text = render(&entries);
+    // The file is "[" + the entries joined by "," + "]". Measure each entry once and drop from the
+    // front until it fits, instead of rendering the whole list again for every dropped entry.
+    let sizes: Vec<usize> = entries
+        .iter()
+        .map(|e| e.to_json().to_string().len())
+        .collect();
+    let mut total = 2 + sizes.iter().sum::<usize>() + sizes.len().saturating_sub(1);
+    let mut dropped = 0;
+    while total > MAX_BYTES && dropped < sizes.len() {
+        // Its own comma goes too, unless it was the last one left.
+        total -= sizes[dropped] + usize::from(dropped + 1 < sizes.len());
+        dropped += 1;
     }
+    entries.drain(..dropped);
+    let text = render(&entries);
     store.write(&text)?;
     Ok(entries.len())
 }
@@ -286,6 +310,10 @@ mod tests {
         assert!(kept.len() < 100, "byte cap never bit: {}", kept.len());
         assert_eq!(kept.last().unwrap().time, 99);
         assert_eq!(kept[0].time, 100 - kept.len() as u64);
+        // As many as fit: the next older entry would have gone over the cap.
+        let one_more: Vec<Entry> = (99 - kept.len() as u64..100).map(long).collect();
+        assert!(render(&one_more).len() > MAX_BYTES);
+        assert_eq!(store.text.as_ref().unwrap(), &render(&kept));
     }
 
     #[test]

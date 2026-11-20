@@ -29,6 +29,7 @@ mod trim;
 mod tutorial;
 mod workbench;
 
+use std::cell::OnceCell;
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -43,11 +44,11 @@ use self::engine::{RunJob, RunSummary, Settling};
 use self::growth::GrowthTracker;
 use self::memlist::Lists;
 use self::pressure::{Assessment, PressureModel, SignalSource, Verdict, WindowsSignals};
-use self::sampler::WindowsSampler;
+use self::sampler::VerifiedSampler;
 use self::scheduler::Scheduler;
 use self::stats::{Sampler, Snapshot, SortKey};
 use self::workbench::Selection;
-use toolboks_addon_sdk::{Finding, HostRequest, NativeAddon, StatusItem, TutorialStep};
+use toolboks_addon_sdk::{Finding, HostRequest, NativeAddon, StatusItem, TrayItem, TutorialStep};
 
 const REFRESH: Duration = Duration::from_secs(2);
 
@@ -74,6 +75,7 @@ pub struct Memory {
     refresh_worker: Option<RefreshWorker>,
     refresh_in_flight: usize,
     refresh_action_pending: bool,
+    /// Whether the page is shown. Starts `false`: see `Memory::build`.
     active: bool,
     /// Free/modified/standby sizes; `None` if the query is unavailable.
     lists: Option<Lists>,
@@ -111,7 +113,8 @@ pub struct Memory {
     regions: regions::Selection,
     preferences_loaded: bool,
     last_regions: Option<String>,
-    windows_version: Option<regions::WindowsVersion>,
+    /// Read on first use (`windows_version`), not at start-up.
+    windows_version: OnceCell<Option<regions::WindowsVersion>>,
     /// Result of the last action, shown above the table.
     status: Option<String>,
     /// The safe optimize run on a worker thread, what the last one did, and the settle
@@ -132,6 +135,8 @@ pub struct Memory {
     /// Pressure verdict: the model, the Windows readings and the latest assessment.
     pressure: PressureModel,
     signals: Option<Box<dyn SignalSource>>,
+    /// What the run path asks Windows about the app in front. Replaced in tests.
+    probes: Probes,
     assessment: Assessment,
     /// The `memory-pressure` finding for Home: what the last pressure reading said, and the
     /// reading kept for a minute at a time. In memory only.
@@ -139,7 +144,7 @@ pub struct Memory {
     health_source: health::Source,
     /// Automatic mode (off by default) and the advice shown instead of a run.
     scheduler: Scheduler,
-    /// The memory-limit and interval triggers (off by default) and the lists opt-in.
+    /// The memory-limit and interval triggers (off by default).
     auto: AutoTriggers,
     advice: Option<String>,
     advice_hidden: bool,
@@ -152,7 +157,7 @@ pub struct Memory {
     growth: GrowthTracker,
     last_growth: Option<Instant>,
     /// Reads the numbers a run report compares.
-    win_sampler: Option<WindowsSampler>,
+    win_sampler: Option<Box<dyn VerifiedSampler>>,
     /// "Where your memory goes" on Home; rebuilt with every refresh. Not stored anywhere.
     breakdown: groups::Breakdown,
     /// Commit charge on Home; refreshed with the sampler. `None` if the query fails.
@@ -179,16 +184,90 @@ pub struct Memory {
     log_note: Option<String>,
 }
 
+/// The small Windows questions about the app in front. Real ones by default; tests replace them
+/// so nothing depends on what is on the screen.
+struct Probes {
+    /// The file name of the app in front, read without a process list (page hidden).
+    foreground_name: Box<dyn Fn() -> Option<String> + Send>,
+    /// Whether the app in front covers its whole monitor.
+    fullscreen: Box<dyn Fn() -> bool + Send>,
+    /// Time since the last keyboard or mouse input.
+    system_idle: Box<dyn Fn() -> Option<Duration> + Send>,
+    /// A new pressure source, made when the page is shown again and none is kept.
+    signals: Box<dyn Fn() -> Box<dyn SignalSource> + Send>,
+}
+
+impl Probes {
+    fn windows() -> Self {
+        Self {
+            foreground_name: Box::new(activity::foreground_app_name),
+            fullscreen: Box::new(activity::foreground_is_fullscreen),
+            system_idle: Box::new(activity::system_idle),
+            signals: Box::new(|| Box::new(WindowsSignals::new())),
+        }
+    }
+
+    #[cfg(test)]
+    fn none() -> Self {
+        Self {
+            foreground_name: Box::new(|| None),
+            fullscreen: Box::new(|| false),
+            system_idle: Box::new(|| None),
+            signals: Box::new(|| Box::new(Unreadable)),
+        }
+    }
+}
+
+/// A pressure source that reads nothing, for `Probes::none`.
+#[cfg(test)]
+struct Unreadable;
+
+#[cfg(test)]
+impl SignalSource for Unreadable {
+    fn read(&mut self) -> Option<pressure::Signals> {
+        None
+    }
+}
+
 impl Memory {
     pub fn new() -> Self {
+        Self::build(
+            memlist::query(),
+            commit::query(),
+            Some(Box::new(WindowsSignals::new())),
+            Probes::windows(),
+        )
+    }
+
+    /// A `Memory` that asks Windows nothing: no memory lists, commit or pressure readings, and
+    /// no app in front, not full screen, no input idle time. Tests add the fakes they need.
+    #[cfg(test)]
+    fn for_test() -> Self {
+        let mut memory = Self::build(None, None, None, Probes::none());
+        memory.log_store = clean_log::FileStore::nowhere();
+        memory
+    }
+
+    fn build(
+        lists: Option<Lists>,
+        commit: Option<commit::Commit>,
+        signals: Option<Box<dyn SignalSource>>,
+        probes: Probes,
+    ) -> Self {
         let epoch = Instant::now();
         Self {
             sampler: None,
             refresh_worker: None,
             refresh_in_flight: 0,
             refresh_action_pending: false,
-            active: true,
-            lists: memlist::query(),
+            // Defensive: start hidden, so an add-on that has not been shown never behaves as
+            // shown. The host already sends `Suspend` right after the connection when the
+            // add-on was started hidden (toolboks `src/supervisor/mod.rs`, "if !managed.visible
+            // { send(Suspend) }"), so today this only matters for a host that does not. It is
+            // not sent when the page is opened first, so `tick` (which the runtime calls only
+            // while shown, before `ui` in the same frame) turns it on.
+            active: false,
+            lists,
             request: None,
             next_request: 0,
             refresh_after_purge: false,
@@ -210,7 +289,7 @@ impl Memory {
             regions: regions::Selection::default(),
             preferences_loaded: false,
             last_regions: None,
-            windows_version: regions::windows_version(),
+            windows_version: OnceCell::new(),
             status: None,
             run: None,
             last_run: None,
@@ -221,7 +300,8 @@ impl Memory {
             cooldowns: Cooldowns::new(),
             activity: Activity::new(0),
             pressure: PressureModel::new(),
-            signals: Some(Box::new(WindowsSignals::new())),
+            signals,
+            probes,
             health: {
                 // "Not checked yet" until the first pressure reading arrives.
                 let mut tracker = health::Tracker::new();
@@ -244,7 +324,7 @@ impl Memory {
             last_growth: None,
             win_sampler: None,
             breakdown: Default::default(),
-            commit: commit::query(),
+            commit,
             reports: VecDeque::new(),
             selected: home::Metric::Memory,
             range: series::Range::default(),
@@ -261,10 +341,10 @@ impl Memory {
     }
 
     fn request_refresh(&mut self, ctx: &egui::Context, action: Option<RefreshAction>) -> bool {
-        // Hidden, only an automatic run may start (the hidden tick); a plain refresh or a
-        // manual action waits for the window.
-        let automatic_run = matches!(&action, Some(RefreshAction::Optimize(t)) if t.is_automatic());
-        if (!self.active && !automatic_run) || (action.is_none() && self.refresh_in_flight != 0) {
+        // Hidden, only a run may start (the hidden tick, or the tray "Clean now", which asks
+        // first when it must). A plain refresh or a selected-rows trim waits for the window.
+        let run = matches!(&action, Some(RefreshAction::Optimize(_)));
+        if (!self.active && !run) || (action.is_none() && self.refresh_in_flight != 0) {
             return false;
         }
         if self.refresh_worker.is_none() {
@@ -409,6 +489,11 @@ impl Memory {
         }
     }
 
+    /// The Windows version, asked on first use (the Advanced page's regions).
+    fn windows_version(&self) -> Option<regions::WindowsVersion> {
+        *self.windows_version.get_or_init(regions::windows_version)
+    }
+
     fn tab_name(&self) -> &'static str {
         match self.tab {
             advanced::Tab::Selected => "selected",
@@ -475,6 +560,9 @@ impl NativeAddon for Memory {
         self.request.take()
     }
     fn tick(&mut self, ctx: &egui::Context) {
+        // The runtime calls `tick` only while the page is shown, before `ui` in the same frame,
+        // and sends no `Resume` to a page opened first: this is what turns the shown mode on.
+        self.active = true;
         self.ctx = Some(ctx.clone());
         if self.refresh_after_purge {
             self.refresh_after_purge = false;
@@ -508,7 +596,7 @@ impl NativeAddon for Memory {
     fn resume(&mut self) {
         self.active = true;
         if self.signals.is_none() {
-            self.signals = Some(Box::new(WindowsSignals::new()));
+            self.signals = Some((self.probes.signals)());
         }
     }
     /// A running trim or optimize keeps going, and finishes, while the window is hidden.
@@ -545,6 +633,12 @@ impl NativeAddon for Memory {
     }
     fn check_now(&mut self) {
         self.health_check_now();
+    }
+    fn tray_items(&self) -> Vec<TrayItem> {
+        self.clean_now_tray_items()
+    }
+    fn tray_action(&mut self, id: &str) {
+        self.clean_now_tray_action(id);
     }
     fn tutorial_steps(&self) -> Vec<TutorialStep> {
         tutorial::steps()

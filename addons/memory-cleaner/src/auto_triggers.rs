@@ -13,22 +13,20 @@
 //! decision runs from the page's frame and, with the window hidden, from the runtime's
 //! background tick (`Memory::automatic_check`).
 //!
-//! The "allow standby and modified lists in automatic cleaning" switch is stored, and
-//! `auto_regions` decides which "Clean selected regions" an automatic run may include. Every
-//! region is a system-wide call through the administrator helper, which shows a Confirm
-//! window, so none of them can run unattended and the filter is always empty for now.
+//! Automatic runs never include a "Clean selected regions" region: every region is a
+//! system-wide call through the administrator helper, whose Confirm window cannot appear
+//! unattended, so they only ever run the safe per-app trim. (A saved "allow lists" switch from
+//! an older version is ignored on load and dropped on the next save.)
 
 use std::collections::BTreeMap;
 
 use egui::{self, RichText};
 use serde_json::{json, Value};
 
-use super::regions::{Region, Selection};
 use super::report::Trigger;
 use super::scheduler::limits::COMMIT_NEAR_LIMIT;
 use super::style::{section, unproven_note, TRIM_EVIDENCE};
 use super::Memory;
-use toolboks_shared::ui::toggle_switch;
 
 const PREFERENCE_KEY: &str = "auto_triggers";
 
@@ -62,7 +60,6 @@ pub fn used_percent(total: u64, available: u64) -> f64 {
 pub struct Settings {
     pub limit: Option<u8>,
     pub interval: Option<u16>,
-    pub allow_lists: bool,
 }
 
 impl Settings {
@@ -74,10 +71,6 @@ impl Settings {
         Self {
             limit: number("limit").map(clamp_limit),
             interval: number("interval").map(clamp_interval),
-            allow_lists: saved
-                .and_then(|v| v.get("allow_lists"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
         }
     }
 
@@ -90,9 +83,6 @@ impl Settings {
         }
         if let Some(interval) = self.interval {
             value["interval"] = interval.into();
-        }
-        if self.allow_lists {
-            value["allow_lists"] = true.into();
         }
         let changed = match preferences.get(PREFERENCE_KEY) {
             Some(saved) => *saved != value,
@@ -170,10 +160,6 @@ impl AutoTriggers {
         self.settings.interval = interval;
     }
 
-    pub fn set_allow_lists(&mut self, on: bool) {
-        self.settings.allow_lists = on;
-    }
-
     /// Both triggers to Disable. The cooldown is kept, so toggling cannot beat it.
     pub fn disable_all(&mut self) {
         self.set_limit(None);
@@ -211,41 +197,10 @@ impl AutoTriggers {
     }
 }
 
-/// Every region is a system-wide call through the administrator helper, whose Confirm window
-/// cannot appear unattended.
-fn needs_helper(_region: Region) -> bool {
-    true
-}
-
-/// The ticked regions an automatic run may include. The standby (5) and modified (4) lists are
-/// left out unless `allow_lists` is on, and so is anything that needs the helper.
-pub fn auto_regions(selection: Selection, allow_lists: bool) -> Selection {
-    filter_regions(selection, allow_lists, needs_helper)
-}
-
-fn filter_regions(
-    selection: Selection,
-    allow_lists: bool,
-    needs_helper: impl Fn(Region) -> bool,
-) -> Selection {
-    let mut kept = selection;
-    for region in selection.regions() {
-        let is_list = matches!(region, Region::StandbyList | Region::ModifiedPageList);
-        if (is_list && !allow_lists) || needs_helper(region) {
-            kept.set(region, false);
-        }
-    }
-    kept
-}
-
 const LIMIT_NOTE: &str = "Starts a clean when the share of memory in use reaches the limit, at \
     most once every 30 seconds. It is checked before the interval.";
 const INTERVAL_NOTE: &str = "Starts a clean every so many minutes, whatever memory is doing. \
     Any automatic clean restarts the count.";
-const LISTS_NOTE: &str = "Off by default. Clearing the standby or modified list can freeze the \
-    PC for a moment. This only decides what automatic runs may include; every region needs the \
-    administrator window, so none runs automatically yet.";
-
 impl Memory {
     /// The "Rules" tab part of automatic cleaning: the two extra triggers and their notes.
     pub(super) fn auto_triggers_ui(&mut self, ui: &mut egui::Ui) {
@@ -284,33 +239,6 @@ impl Memory {
             self.auto.set_interval(interval);
         }
         ui.label(RichText::new(INTERVAL_NOTE).weak().small());
-
-        let mut allow = self.auto.settings().allow_lists;
-        ui.horizontal(|ui| {
-            ui.label("Allow standby and modified lists in automatic cleaning");
-            let response = toggle_switch(ui, &mut allow);
-            response.widget_info(|| {
-                egui::WidgetInfo::selected(
-                    egui::Role::Switch,
-                    true,
-                    allow,
-                    "Allow standby and modified lists in automatic cleaning",
-                )
-            });
-            if response.changed() {
-                self.auto.set_allow_lists(allow);
-            }
-        });
-        ui.label(RichText::new(LISTS_NOTE).weak().small());
-        let runnable = auto_regions(self.regions, self.auto.settings().allow_lists)
-            .regions()
-            .count();
-        ui.label(
-            RichText::new(format!(
-                "Ticked regions an automatic run would include: {runnable}"
-            ))
-            .small(),
-        );
     }
 }
 
@@ -354,11 +282,7 @@ mod tests {
     const MIN: u64 = 60_000;
 
     fn on(limit: Option<u8>, interval: Option<u16>) -> AutoTriggers {
-        AutoTriggers::new(Settings {
-            limit,
-            interval,
-            allow_lists: false,
-        })
+        AutoTriggers::new(Settings { limit, interval })
     }
 
     #[test]
@@ -542,7 +466,6 @@ mod tests {
         let picked = Settings {
             limit: Some(95),
             interval: Some(120),
-            allow_lists: true,
         };
         assert!(picked.store(&mut preferences));
         assert!(!picked.store(&mut preferences), "unchanged: no second save");
@@ -565,60 +488,39 @@ mod tests {
         let mut preferences = BTreeMap::new();
         preferences.insert(
             PREFERENCE_KEY.to_string(),
-            json!({"limit": 500, "interval": 0, "allow_lists": true}),
+            json!({"limit": 500, "interval": 0}),
         );
         let s = Settings::load(&preferences);
-        assert_eq!(
-            (s.limit, s.interval, s.allow_lists),
-            (Some(99), Some(1), true)
-        );
+        assert_eq!((s.limit, s.interval), (Some(99), Some(1)));
         for bad in [
             json!("x"),
             json!(7),
             json!(null),
-            json!({"limit": "90", "interval": -3, "allow_lists": "yes"}),
+            json!({"limit": "90", "interval": -3}),
         ] {
             preferences.insert(PREFERENCE_KEY.to_string(), bad);
             assert_eq!(Settings::load(&preferences), Settings::default());
         }
     }
 
-    fn picked(regions: &[Region]) -> Selection {
-        let mut s = Selection::from_bits(0);
-        for r in regions {
-            s.set(*r, true);
-        }
-        s
-    }
-
     #[test]
-    fn no_region_runs_automatically_while_all_need_the_helper() {
-        let all = Selection::from_bits(u8::MAX);
-        assert!(auto_regions(all, false).is_empty());
-        assert!(auto_regions(all, true).is_empty());
-        assert!(auto_regions(Selection::default(), true).is_empty());
-    }
-
-    #[test]
-    fn lists_stay_out_unless_allowed() {
-        let sel = picked(&[
-            Region::WorkingSet,
-            Region::ModifiedPageList,
-            Region::StandbyList,
-            Region::LowPriorityStandby,
-        ]);
-        let without = filter_regions(sel, false, |_| false);
-        assert_eq!(
-            without.regions().collect::<Vec<_>>(),
-            [Region::WorkingSet, Region::LowPriorityStandby]
+    fn a_saved_lists_switch_from_an_older_version_is_ignored_and_dropped() {
+        let mut preferences = BTreeMap::new();
+        preferences.insert(
+            PREFERENCE_KEY.to_string(),
+            json!({"limit": 80, "allow_lists": true}),
         );
-        assert_eq!(filter_regions(sel, true, |_| false), sel);
-    }
-
-    #[test]
-    fn helper_regions_stay_out_even_when_lists_are_allowed() {
-        let sel = picked(&[Region::WorkingSet, Region::StandbyList]);
-        let kept = filter_regions(sel, true, |r| r == Region::WorkingSet);
-        assert_eq!(kept.regions().collect::<Vec<_>>(), [Region::StandbyList]);
+        let loaded = Settings::load(&preferences);
+        assert_eq!(
+            loaded,
+            Settings {
+                limit: Some(80),
+                interval: None
+            }
+        );
+        // The next save writes the settings without the old key.
+        assert!(loaded.store(&mut preferences));
+        assert_eq!(preferences[PREFERENCE_KEY], json!({"limit": 80}));
+        assert!(!loaded.store(&mut preferences));
     }
 }

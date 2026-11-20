@@ -545,18 +545,26 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_add_on_starts_only_automatic_runs() {
+    fn a_hidden_add_on_starts_only_runs() {
         let mut m = Memory::for_test();
         m.suspend();
         let ctx = egui::Context::default();
+        // A plain refresh or a selected-rows trim waits for the window.
         assert!(!m.request_refresh(&ctx, None));
-        assert!(!m.request_refresh(&ctx, Some(crate::RefreshAction::Optimize(Trigger::Manual))));
         let trim = crate::RefreshAction::Trim {
             selection: Default::default(),
             grouped: false,
         };
         assert!(!m.request_refresh(&ctx, Some(trim)));
         assert!(!m.refresh_action_pending);
+        // A run (automatic, or the tray "Clean now", which is only offered hidden when it
+        // needs no prompt) may start.
+        let (request, _requests) = std::sync::mpsc::channel();
+        let (_results, result) = std::sync::mpsc::channel();
+        m.refresh_worker = Some(crate::RefreshWorker { request, result });
+        let run = crate::RefreshAction::Optimize(Trigger::Manual);
+        assert!(m.request_refresh(&ctx, Some(run)));
+        assert!(m.refresh_action_pending);
     }
 
     #[test]

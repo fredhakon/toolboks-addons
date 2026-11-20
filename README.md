@@ -207,6 +207,11 @@ it. Nothing is stored between runs, as before.
   runtime's 200 ms background tick takes one pressure reading every 10 s, decides with the same
   code the page uses, and starts the run through the same path. No process list is kept
   hidden; a run takes one when it starts. Between readings the tick costs two time comparisons.
+- **Tray.** One entry, "Clean now", runs the same trim of idle apps as Home's button, with the
+  same ask-before-a-manual-trim rule. With the ask switch on and the window hidden, the entry
+  is greyed out and says "open Memory Cleaner to confirm", because the add-on cannot show a
+  prompt it cannot raise; with the window shown it opens the prompt. With the switch off it
+  runs at once, hidden or not. It is also greyed out while another clean is running.
 - **Status bar.** The `RAM nn%` item is sent through the host's status services.
 - The guided tour has the same twelve steps.
 

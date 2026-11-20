@@ -48,7 +48,7 @@ use self::sampler::WindowsSampler;
 use self::scheduler::Scheduler;
 use self::stats::{Sampler, Snapshot, SortKey};
 use self::workbench::Selection;
-use toolboks_addon_sdk::{Finding, HostRequest, NativeAddon, StatusItem, TutorialStep};
+use toolboks_addon_sdk::{Finding, HostRequest, NativeAddon, StatusItem, TrayItem, TutorialStep};
 
 const REFRESH: Duration = Duration::from_secs(2);
 
@@ -295,10 +295,10 @@ impl Memory {
     }
 
     fn request_refresh(&mut self, ctx: &egui::Context, action: Option<RefreshAction>) -> bool {
-        // Hidden, only an automatic run may start (the hidden tick); a plain refresh or a
-        // manual action waits for the window.
-        let automatic_run = matches!(&action, Some(RefreshAction::Optimize(t)) if t.is_automatic());
-        if (!self.active && !automatic_run) || (action.is_none() && self.refresh_in_flight != 0) {
+        // Hidden, only a run may start (the hidden tick, or the tray "Clean now", which asks
+        // first when it must). A plain refresh or a selected-rows trim waits for the window.
+        let run = matches!(&action, Some(RefreshAction::Optimize(_)));
+        if (!self.active && !run) || (action.is_none() && self.refresh_in_flight != 0) {
             return false;
         }
         if self.refresh_worker.is_none() {
@@ -586,6 +586,12 @@ impl NativeAddon for Memory {
     }
     fn check_now(&mut self) {
         self.health_check_now();
+    }
+    fn tray_items(&self) -> Vec<TrayItem> {
+        self.clean_now_tray_items()
+    }
+    fn tray_action(&mut self, id: &str) {
+        self.clean_now_tray_action(id);
     }
     fn tutorial_steps(&self) -> Vec<TutorialStep> {
         tutorial::steps()

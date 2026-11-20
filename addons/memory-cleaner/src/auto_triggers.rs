@@ -300,7 +300,9 @@ impl Memory {
             }
         });
         ui.label(RichText::new(LISTS_NOTE).weak().small());
-        let runnable = auto_regions(self.regions, allow).regions().count();
+        let runnable = auto_regions(self.regions, self.auto.settings().allow_lists)
+            .regions()
+            .count();
         ui.label(
             RichText::new(format!(
                 "Ticked regions an automatic run would include: {runnable}"

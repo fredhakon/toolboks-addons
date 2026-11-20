@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use egui::{self, Align, Color32, Layout, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
+use super::clean_ui::Confirm;
 use super::engine::per_hour_text;
 use super::groups::Segment;
 use super::growth::{GrowthInfo, Hint};
@@ -54,7 +55,7 @@ const CACHE_NOTE: &str = "Cache is memory Windows keeps ready to reuse. It is no
 /// Shown under the "Clean automatically" switch.
 const AUTO_DESCRIPTION: &str = "Off by default. When on, it only cleans after memory has been \
     under pressure for a minute, at most once an hour, and never touches the app you are using. \
-    It pauses when you switch away from Memory Cleaner or hide Toolboks in the tray.";
+    It keeps working while Toolboks is hidden in the tray.";
 
 /// Colors of the "Where your memory goes" bar. The names sit next to them in the legend.
 const APPS_COLOR: Color32 = DATA_MEMORY;
@@ -538,7 +539,7 @@ impl Memory {
                 };
                 toolboks_addon_sdk::tutorial::mark(ui, "memory-optimize", response.rect);
                 if response.clicked() {
-                    self.start_run(ctx, Trigger::Manual);
+                    self.ask_or_run(ctx, Confirm::TrimIdle);
                 }
                 ui.label(RichText::new(TRIM_NOTE).weak().small());
                 unproven_note(ui, TRIM_EVIDENCE);
@@ -796,6 +797,7 @@ impl Memory {
     }
 
     fn last_run_card(&mut self, ui: &mut egui::Ui) {
+        self.result_line(ui);
         let running = self.run.is_some();
         let nothing = self.last_run.is_some_and(|r| r == Default::default());
         let report = self
@@ -810,7 +812,8 @@ impl Memory {
                     r.sentences().join(" "),
                     why_it_ran(r.trigger, self.run_note.as_deref()),
                     r.copy_text(),
-                    (r.automatic() || r.is_small()) && self.scheduler.is_enabled(),
+                    (r.automatic() || r.is_small())
+                        && (self.scheduler.is_enabled() || self.auto.any_on()),
                 )
             });
 
@@ -907,6 +910,7 @@ impl Memory {
             }
             if offer_off && ui.link("Turn off auto-clean").clicked() {
                 self.scheduler.set_enabled(false);
+                self.auto.disable_all();
             }
         });
         if restore {

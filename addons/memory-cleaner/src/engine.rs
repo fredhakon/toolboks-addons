@@ -12,19 +12,23 @@ use std::time::{Duration, Instant};
 use super::actions::{
     self, ActionResult, Candidate, Cooldowns, Identity, Kind, Policy, UndoLog, WindowsOps,
 };
-use super::activity::{self, Activity};
+use super::activity::Activity;
+use super::auto_triggers;
+use super::freed::{self, Change};
 use super::growth::{self, WindowsPrivateMemory};
-use super::pressure::{Assessment, Verdict};
+use super::pressure::{Assessment, Signals, Verdict};
 use super::report::{self, HonestReport, RunMeasurement, RunMeasurements, Trigger};
-use super::sampler::{WindowsSampler, WorkingSets};
+use super::sampler::{VerifiedSampler, WindowsSampler, WorkingSets};
 use super::scheduler::Decision;
 use super::stats::ProcInfo;
 use super::Memory;
 use toolboks_shared::format::size_plain;
 
-/// How often the pressure check runs while the memory page is open and while it is not.
+/// How often the pressure check runs while the memory page is open.
 const EVAL_OPEN: Duration = Duration::from_secs(1);
-const EVAL_BACKGROUND: Duration = Duration::from_secs(10);
+/// How often it runs while the page is hidden (the runtime's background tick, which itself
+/// fires every 200 ms, only checks the time).
+const EVAL_HIDDEN: Duration = Duration::from_secs(10);
 /// The page counts as open if it drew a frame this recently.
 const OPEN_GRACE: Duration = Duration::from_secs(3);
 /// The growth tracker is fed from the process refresh at most this often.
@@ -34,7 +38,7 @@ pub fn eval_interval(page_open: bool) -> Duration {
     if page_open {
         EVAL_OPEN
     } else {
-        EVAL_BACKGROUND
+        EVAL_HIDDEN
     }
 }
 
@@ -50,6 +54,10 @@ struct RunDone {
     results: Vec<ActionResult>,
     undo: UndoLog,
     cooldowns: Cooldowns,
+}
+
+fn windows_sampler() -> Box<dyn VerifiedSampler> {
+    Box::new(WindowsSampler::new())
 }
 
 fn paired_working_sets(before: &WorkingSets, after: &WorkingSets) -> (u64, u64, Vec<Identity>) {
@@ -331,24 +339,42 @@ impl Memory {
         });
     }
 
-    fn note_foreground(&mut self) {
-        let Some(sampler) = self.sampler.as_ref() else {
-            return;
+    /// Notes the app in front. Without a process list (the window is hidden) its name is read
+    /// directly, so an app used a moment ago is not mistaken for one that was idle all along.
+    pub(super) fn note_foreground(&mut self) {
+        let name = match self.sampler.as_ref() {
+            Some(sampler) => actions::foreground_pid()
+                .and_then(|pid| sampler.processes.iter().find(|p| p.pid == pid))
+                .map(|p| p.name.clone()),
+            None => (self.probes.foreground_name)(),
         };
-        let name = actions::foreground_pid()
-            .and_then(|pid| sampler.processes.iter().find(|p| p.pid == pid))
-            .map(|p| p.name.clone());
         let now = self.now_ms();
         self.activity.note_foreground(now, name.as_deref());
     }
 
-    /// One pressure reading, then the scheduler's answer to it.
+    /// One pressure reading, then the automatic decision on it.
     fn evaluate(&mut self, ctx: &egui::Context) {
         let now = self.now_ms();
         let Some((signals, assessment)) = self.read_pressure(now, super::health_feed::unix_now())
         else {
             return;
         };
+        self.automatic_check(now, &signals, assessment, &mut |m, trigger| {
+            m.start_run(ctx, trigger)
+        });
+    }
+
+    /// The scheduler's answer to a pressure reading, then the memory-limit and interval triggers
+    /// (the scheduler's run wins when both are due). Shared by the page's frame and the hidden
+    /// tick, so both decide the same way; `start` starts a run and says whether one was
+    /// attempted (`false` while another job is busy, so the run is retried on the next reading).
+    pub(super) fn automatic_check(
+        &mut self,
+        now: u64,
+        signals: &Signals,
+        assessment: Assessment,
+        start: &mut dyn FnMut(&mut Self, Trigger) -> bool,
+    ) {
         let commit_fraction = if signals.commit_limit > 0 {
             signals.commit_used as f64 / signals.commit_limit as f64
         } else {
@@ -357,6 +383,8 @@ impl Memory {
         self.hard_faults = signals.hard_faults_per_sec;
         let decision = self.scheduler.tick(now, &assessment, commit_fraction);
         self.assessment = assessment;
+        let used = auto_triggers::used_percent(signals.total_ram, signals.available);
+        let fire = self.auto.tick(now, used, commit_fraction);
         match decision {
             Decision::Idle => {
                 self.advice = None;
@@ -365,12 +393,27 @@ impl Memory {
             Decision::Advise(text) => self.advice = Some(text),
             Decision::Run { trigger } => {
                 self.advice = None;
-                if self.start_run(ctx, Trigger::Pressure) {
-                    self.scheduler.record_run(now);
-                    self.run_note = Some(trigger);
+                if start(self, Trigger::Pressure) {
+                    self.record_automatic_run(now, trigger);
+                    return;
                 }
             }
         }
+        // The pressure scheduler had nothing to run (or was busy): the user's own triggers.
+        if let Some(fire) = fire {
+            if start(self, fire.trigger()) {
+                self.record_automatic_run(now, fire.text());
+            }
+        }
+    }
+
+    /// Any automatic run, whichever rule started it, starts every automatic cooldown, so one
+    /// rule cannot run seconds after another. `note` is shown as "Why it ran" once the run has
+    /// something to report (see `run_from_snapshot`).
+    fn record_automatic_run(&mut self, now: u64, note: String) {
+        self.scheduler.record_run(now);
+        self.auto.record_run(now);
+        self.pending_note = Some(note);
     }
 
     /// Starts the safe plan (priority lowering, then targeted trim). Returns whether a run was
@@ -383,8 +426,8 @@ impl Memory {
     }
 
     pub(super) fn run_from_snapshot(&mut self, ctx: &egui::Context, trigger: Trigger) -> bool {
-        self.settling = None;
         if trigger == Trigger::Manual {
+            self.settling = None;
             self.run_note = None;
         }
         let Some(sampler) = self.sampler.as_ref() else {
@@ -401,8 +444,8 @@ impl Memory {
             activity: &self.activity,
             now_ms: self.now_ms(),
             foreground_pid: policy.foreground_pid,
-            fullscreen: activity::foreground_is_fullscreen(),
-            system_idle: activity::system_idle(),
+            fullscreen: (self.probes.fullscreen)(),
+            system_idle: (self.probes.system_idle)(),
             min_bytes: policy.min_priority_bytes,
         };
         // Read with this snapshot on the sampling thread; unknown means every app may play.
@@ -410,6 +453,16 @@ impl Memory {
         let cands = candidates(&inputs, &|pid| playing.contains(&pid));
         let plan = actions::plan(&cands, &policy, &self.cooldowns, now);
 
+        if plan.is_empty() && trigger.is_automatic() {
+            // Nothing to do: keep the last report, its settle readings and its reason.
+            self.pending_note = None;
+            return true;
+        }
+        self.settling = None;
+        let note = self.pending_note.take();
+        if let Some(note) = note.filter(|_| trigger.is_automatic()) {
+            self.run_note = Some(note);
+        }
         if plan.is_empty() {
             if sampler.audio.is_unknown() {
                 self.last_run = None;
@@ -427,7 +480,7 @@ impl Memory {
             .collect();
         let Some((before, before_sets)) = self
             .win_sampler
-            .get_or_insert_with(WindowsSampler::new)
+            .get_or_insert_with(windows_sampler)
             .sample_verified(&trim_processes)
         else {
             self.status = Some(
@@ -501,9 +554,11 @@ impl Memory {
             .collect();
         let Some((mut after, after_sets)) = self
             .win_sampler
-            .get_or_insert_with(WindowsSampler::new)
+            .get_or_insert_with(windows_sampler)
             .sample_verified(&trimmed)
         else {
+            // The run happened; say so, without claiming numbers that were never read.
+            self.record_result(job.trigger, vec!["Idle apps".to_string()], None, Vec::new());
             self.status = Some("Could not read the memory numbers after the run.".to_string());
             return;
         };
@@ -512,6 +567,7 @@ impl Memory {
             paired_working_sets(&job.before_sets, &after_sets);
         before.private_ws = before_ws;
         after.private_ws = after_ws;
+        let paired = trim_processes.len();
         let settling = Settling::new(
             job.trigger,
             summary.trimmed,
@@ -523,10 +579,17 @@ impl Memory {
                 at_120s: None,
             },
         );
+        self.record_result(
+            job.trigger,
+            vec!["Idle apps".to_string()],
+            Some(Change::from_readings(&before, &after)),
+            vec![freed::apps_text(paired, before_ws, after_ws)],
+        );
         report::push_report(&mut self.reports, settling.report());
         self.settling = Some(settling);
-        if job.trigger.is_automatic() {
-            // Flash the taskbar button so a minimized window still tells you.
+        if job.trigger.is_automatic() && self.active {
+            // Flash the taskbar button so a minimized window still tells you. Hidden in the
+            // tray there is no window to flash.
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                 egui::UserAttentionType::Informational,
             ));
@@ -539,7 +602,7 @@ impl Memory {
             return;
         };
         let elapsed = settling.started.elapsed();
-        let sampler = self.win_sampler.get_or_insert_with(WindowsSampler::new);
+        let sampler = self.win_sampler.get_or_insert_with(windows_sampler);
         match settling.poll(elapsed, |processes| {
             let (mut reading, sets) = sampler.sample_verified(processes)?;
             reading.private_ws = sets.values().sum();
@@ -577,6 +640,7 @@ mod tests {
 
     use super::*;
     use crate::audio::{AudioState, Session, SessionSource, SessionsUnavailable};
+    use crate::stats::Snapshot;
 
     const MB: u64 = 1024 * 1024;
 
@@ -912,6 +976,73 @@ mod tests {
         assert_eq!(auto.min_trim_bytes, 200 * MB);
         assert_eq!(auto.min_priority_bytes, 50 * MB);
         assert_eq!(auto.trim_cooldown, Duration::from_secs(45 * 60));
+        for trigger in [Trigger::MemoryLimit, Trigger::Interval] {
+            let p = policy_for(trigger, 1, Some(2));
+            assert_eq!(p.foreground_pid, Some(2));
+            assert_eq!(p.min_idle, auto.min_idle);
+            assert_eq!(p.min_trim_bytes, auto.min_trim_bytes);
+            assert_eq!(p.min_priority_bytes, auto.min_priority_bytes);
+            assert_eq!(p.trim_cooldown, auto.trim_cooldown);
+        }
+    }
+
+    fn memory_with_a_report() -> Memory {
+        let mut m = Memory::for_test();
+        m.sampler = Some(Snapshot {
+            totals: Default::default(),
+            processes: Vec::new(),
+            audio: AudioState::Read(Default::default()),
+        });
+        m.settling = Some(settling());
+        m.last_run = Some(RunSummary {
+            lowered: 1,
+            trimmed: 2,
+            failed: 0,
+        });
+        m.run_note = Some("old rule".to_string());
+        m.pending_note = Some("new rule".to_string());
+        m
+    }
+
+    #[test]
+    fn an_automatic_run_with_nothing_to_do_keeps_the_last_report() {
+        for trigger in [Trigger::Pressure, Trigger::MemoryLimit, Trigger::Interval] {
+            let mut m = memory_with_a_report();
+            assert!(m.run_from_snapshot(&egui::Context::default(), trigger));
+            assert!(m.settling.is_some(), "{trigger:?}");
+            assert_eq!(m.last_run.map(|r| r.trimmed), Some(2), "{trigger:?}");
+            assert_eq!(m.run_note.as_deref(), Some("old rule"), "{trigger:?}");
+            assert_eq!(m.pending_note, None, "{trigger:?}");
+        }
+    }
+
+    #[test]
+    fn a_manual_run_with_nothing_to_do_still_resets_the_card() {
+        let mut m = memory_with_a_report();
+        assert!(m.run_from_snapshot(&egui::Context::default(), Trigger::Manual));
+        assert!(m.settling.is_none());
+        assert_eq!(m.last_run, Some(RunSummary::default()));
+        assert_eq!(m.run_note, None);
+        assert_eq!(
+            m.pending_note, None,
+            "a manual run never takes an automatic note"
+        );
+    }
+
+    #[test]
+    fn a_trigger_run_starts_the_pressure_cooldown_too() {
+        let mut m = Memory::for_test();
+        m.scheduler.set_enabled(true);
+        m.auto.set_limit(Some(70));
+        m.record_automatic_run(1_000, "limit".to_string());
+        assert_eq!(m.pending_note.as_deref(), Some("limit"));
+        assert_eq!(m.auto.tick(2_000, 99.0, 0.5), None);
+        let pressure = Assessment {
+            verdict: Verdict::UnderPressure,
+            reasons: Vec::new(),
+        };
+        m.scheduler.tick(2_000, &pressure, 0.5);
+        assert_eq!(m.scheduler.tick(120_000, &pressure, 0.5), Decision::Idle);
     }
 
     #[test]
@@ -973,6 +1104,116 @@ mod tests {
                 failed: 1
             }
         );
+    }
+
+    #[test]
+    fn the_app_in_front_is_read_from_the_injected_source_without_a_process_list() {
+        let mut m = Memory::for_test();
+        // 1000 s on the tool's clock, so an app never seen has been idle for all of it.
+        m.epoch = Instant::now() - Duration::from_secs(1000);
+        m.probes.foreground_name = Box::new(|| Some("Chrome.exe".to_string()));
+        assert!(m.sampler.is_none());
+        m.note_foreground();
+        let now = m.now_ms();
+        let idle = |name| m.activity.idle_for(name, now, None, None).unwrap();
+        assert!(idle("chrome.exe") < Duration::from_secs(10));
+        assert!(idle("other.exe") >= Duration::from_secs(1000));
+    }
+
+    /// Pressure readings the test steers: little memory is ready, so a 10% limit is exceeded.
+    struct Fixed(Signals);
+
+    impl crate::pressure::SignalSource for Fixed {
+        fn read(&mut self) -> Option<Signals> {
+            Some(self.0)
+        }
+    }
+
+    fn half_full() -> Signals {
+        let gib = crate::pressure::limits::GIB;
+        Signals {
+            available: 8 * gib,
+            total_ram: 16 * gib,
+            commit_used: 10 * gib,
+            commit_limit: 40 * gib,
+            compressed: None,
+            hard_faults_per_sec: None,
+            low_memory_signalled: false,
+        }
+    }
+
+    /// A sampling worker whose requests the test reads, so no thread reads Windows.
+    fn fake_worker(m: &mut Memory) -> mpsc::Receiver<Option<crate::RefreshAction>> {
+        let (request, requests) = mpsc::channel();
+        let (_results, result) = mpsc::channel();
+        m.refresh_worker = Some(crate::RefreshWorker { request, result });
+        requests
+    }
+
+    #[test]
+    fn a_trigger_run_is_skipped_while_busy_and_retried_when_free() {
+        let mut m = Memory::for_test();
+        m.signals = Some(Box::new(Fixed(half_full())));
+        m.auto.set_limit(Some(10));
+        let requests = fake_worker(&mut m);
+        let ctx = egui::Context::default();
+
+        // Another job is going: nothing is asked of the worker and nothing is recorded, so the
+        // rule is not consumed.
+        m.refresh_action_pending = true;
+        m.evaluate(&ctx);
+        assert!(requests.try_recv().is_err());
+        assert!(m.pending_note.is_none());
+
+        m.refresh_action_pending = false;
+        m.evaluate(&ctx);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Some(crate::RefreshAction::Optimize(Trigger::MemoryLimit)))
+        ));
+        assert!(m.pending_note.is_some());
+    }
+
+    /// Readings that always fail, as when Windows will not give the memory numbers.
+    struct Unreadable;
+
+    impl VerifiedSampler for Unreadable {
+        fn sample_verified(&mut self, _: &[Identity]) -> Option<(RunMeasurement, WorkingSets)> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_finished_run_whose_after_reading_fails_says_so_without_numbers() {
+        let mut m = Memory::for_test();
+        assert!(!m.options.log, "the log is off, so nothing is written");
+        m.win_sampler = Some(Box::new(Unreadable));
+        let (tx, rx) = mpsc::channel();
+        tx.send(RunDone {
+            results: Vec::new(),
+            undo: UndoLog::new(),
+            cooldowns: Cooldowns::new(),
+        })
+        .unwrap();
+        m.run = Some(RunJob {
+            rx,
+            trigger: Trigger::Manual,
+            before: reading(100, 100, 1000),
+            before_sets: WorkingSets::new(),
+        });
+        m.poll_run(&egui::Context::default());
+        assert!(m.run.is_none());
+        assert_eq!(m.last_run, Some(RunSummary::default()));
+        assert_eq!(
+            m.status.as_deref(),
+            Some("Could not read the memory numbers after the run.")
+        );
+        let result = m.last_result.expect("the run is still recorded");
+        assert_eq!(
+            result.change, None,
+            "no numbers were read, so none are claimed"
+        );
+        assert!(m.settling.is_none() && m.reports.is_empty());
     }
 
     #[test]

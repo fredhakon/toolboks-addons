@@ -192,9 +192,26 @@ it. Nothing is stored between runs, as before.
   helper: a separate elevated process shows its own Confirm / Cancel window and only then runs
   the purge (capability `system_tuning`). The drawing process is never elevated. Trimming idle
   apps, process trims and automatic cleaning need no administrator rights.
+- **Clean selected regions.** On the Advanced page (System tab) the other Mem Reduct regions are
+  opt-in ticks under one "Clean selected regions" button: working set, system file cache,
+  modified file cache, modified page list, full standby list, low-priority standby list,
+  registry cache (Windows 8.1+) and combine memory lists (Windows 10+). Each has a plain note,
+  an "Unproven" evidence label and, for the modified and full standby lists, a freeze warning.
+  The ticks start as Mem Reduct's own set (1, 2, 3, 6, 7, 8) and are saved as a preference, but
+  nothing runs unless the button is pressed, and none of it is part of automatic cleaning. It
+  goes through the same administrator helper (operation `purge_standby`, payload
+  `{"regions": <mask>}`).
 - **Background.** `host-services.json` sets `background: true` so a trim or optimize that is
-  running finishes while the window is hidden. Sampling and automatic checks run while the
-  window is shown, as in the built-in tool.
+  running finishes while the window is hidden. Automatic cleaning (the pressure scheduler and
+  the user's memory-limit and interval triggers) keeps running while the window is hidden: the
+  runtime's 200 ms background tick takes one pressure reading every 10 s, decides with the same
+  code the page uses, and starts the run through the same path. No process list is kept
+  hidden; a run takes one when it starts. Between readings the tick costs two time comparisons.
+- **Tray.** One entry, "Clean now", runs the same trim of idle apps as Home's button, with the
+  same ask-before-a-manual-trim rule. With the ask switch on and the window hidden, the entry
+  is greyed out and says "open Memory Cleaner to confirm", because the add-on cannot show a
+  prompt it cannot raise; with the window shown it opens the prompt. With the switch off it
+  runs at once, hidden or not. It is also greyed out while another clean is running.
 - **Status bar.** The `RAM nn%` item is sent through the host's status services.
 - The guided tour has the same twelve steps.
 

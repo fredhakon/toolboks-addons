@@ -24,6 +24,14 @@ pub fn honest_note() -> &'static str {
     HONEST_NOTE
 }
 
+/// Said next to a "freed" number when part of it only moved to the standby cache.
+const CACHE_NOTE: &str =
+    "Cached pages are not gone: Windows gives them back to apps that ask for them.";
+
+pub fn cache_note() -> &'static str {
+    CACHE_NOTE
+}
+
 /// Commit moving by less than this is shown as "unchanged".
 const COMMIT_UNCHANGED: u64 = 64 * MB;
 /// Seconds after a run for the two settle checks.
@@ -91,6 +99,10 @@ pub enum Trigger {
     Manual,
     /// Memory pressure held for a minute.
     Pressure,
+    /// Memory in use reached the user's limit (`auto_triggers`).
+    MemoryLimit,
+    /// The user's interval passed (`auto_triggers`).
+    Interval,
 }
 
 impl Trigger {
@@ -98,11 +110,23 @@ impl Trigger {
         self != Trigger::Manual
     }
 
+    /// The source shown on Home and written to the clean log.
+    pub fn label(self) -> &'static str {
+        match self {
+            Trigger::Manual => "Manual",
+            Trigger::Pressure => "Auto pressure",
+            Trigger::MemoryLimit => "Auto limit",
+            Trigger::Interval => "Auto interval",
+        }
+    }
+
     /// The rule that started the run, in plain words.
     pub fn text(self) -> &'static str {
         match self {
             Trigger::Manual => "You started this run.",
             Trigger::Pressure => "Memory had been under pressure for a minute.",
+            Trigger::MemoryLimit => "Memory in use reached your limit.",
+            Trigger::Interval => "Your interval passed.",
         }
     }
 }
@@ -479,6 +503,32 @@ mod tests {
             .text()
             .contains("Why it ran"));
         assert!(r.one_line().starts_with("Auto:"));
+    }
+
+    #[test]
+    fn the_extra_triggers_are_automatic_and_say_why() {
+        for trigger in [Trigger::MemoryLimit, Trigger::Interval] {
+            assert!(trigger.is_automatic());
+            assert!(trigger.text().ends_with('.'));
+            assert!(HonestReport::compute(trigger, 1, RunMeasurements::default()).automatic());
+        }
+    }
+
+    #[test]
+    fn every_source_has_its_own_label() {
+        let labels: Vec<_> = [
+            Trigger::Manual,
+            Trigger::Pressure,
+            Trigger::MemoryLimit,
+            Trigger::Interval,
+        ]
+        .map(Trigger::label)
+        .into();
+        assert_eq!(
+            labels,
+            ["Manual", "Auto pressure", "Auto limit", "Auto interval"]
+        );
+        assert!(cache_note().contains("not gone"));
     }
 
     #[test]

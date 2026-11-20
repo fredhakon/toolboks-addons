@@ -9,9 +9,13 @@ use std::time::Duration;
 use egui::{self, Align, Color32, Layout, RichText, Sense, Vec2};
 use egui_extras::{Column, TableBuilder};
 
+use super::clean_ui::Confirm;
 use super::engine::per_hour_text;
+use super::freed::{self, Change};
 use super::groups::color_for;
 use super::growth::Hint;
+use super::memlist::{self, Lists};
+use super::report::Trigger;
 use super::stats::{format_bytes, group_by_name, sort_and_filter, ProcInfo, SortKey};
 use super::style::{panel, section, section_with_note, stat_row, unproven_note, TRIM_EVIDENCE};
 use super::trim::{skip_reason, trim_process, SkipReason, TrimError};
@@ -48,6 +52,8 @@ struct TrimResult {
 /// A "Trim selected" run on a worker thread.
 pub struct TrimJob {
     rx: Receiver<TrimResult>,
+    /// The memory lists when the trim started, for the freed number.
+    lists_before: Option<Lists>,
 }
 
 fn sort_arrow(active: bool, descending: bool) -> &'static str {
@@ -189,7 +195,7 @@ impl Memory {
         unproven_note(ui, TRIM_EVIDENCE);
         if trim {
             let ctx = ui.ctx().clone();
-            self.start_trim(&ctx);
+            self.ask_or_run(&ctx, Confirm::TrimSelected);
         }
     }
 
@@ -391,18 +397,20 @@ impl Memory {
             Tab::Rules => {
                 self.automatic_status(ui);
                 ui.separator();
+                self.clean_options_ui(ui);
+                ui.separator();
                 self.exclusions_list(ui);
             }
         }
     }
 
     /// The state of automatic cleaning; the switch itself is on the Home page.
-    fn automatic_status(&self, ui: &mut egui::Ui) {
+    fn automatic_status(&mut self, ui: &mut egui::Ui) {
         section(ui, "Automatic cleaning");
         stat_row(ui, "Status", self.scheduler.status(self.now_ms()));
         ui.label(
             RichText::new(
-                "Switch it on from the Home page. It is off by default and only acts when                  memory is really short, at most once an hour.",
+                "Switch it on from the Home page. It is off by default and only acts when memory is really short, at most once an hour. Any automatic clean, including the ones started by the limit or interval below, also holds this one back for that hour. The memory-limit and interval triggers below have their own settings.",
             )
             .weak()
             .small(),
@@ -410,6 +418,8 @@ impl Memory {
         if let Some(line) = super::engine::verdict_line(&self.assessment) {
             ui.label(RichText::new(line).small());
         }
+        ui.separator();
+        self.auto_triggers_ui(ui);
     }
 
     fn selected_tab(&mut self, ui: &mut egui::Ui) {
@@ -549,7 +559,7 @@ impl Memory {
         }
         if trim {
             let ctx = ui.ctx().clone();
-            self.start_trim(&ctx);
+            self.ask_or_run(&ctx, Confirm::TrimSelected);
         }
     }
 
@@ -588,7 +598,7 @@ impl Memory {
     }
 
     /// Trims every trimmable process of the selected rows on a worker thread.
-    fn start_trim(&mut self, ctx: &egui::Context) {
+    pub(super) fn start_trim(&mut self, ctx: &egui::Context) {
         if self.busy() || self.selection.len() == 0 {
             return;
         }
@@ -657,7 +667,10 @@ impl Memory {
             let _ = tx.send(result);
             wake.request_repaint();
         });
-        self.trim_job = Some(TrimJob { rx });
+        self.trim_job = Some(TrimJob {
+            rx,
+            lists_before: memlist::query(),
+        });
     }
 
     /// Picks up a finished trim run. Runs every frame via `background`.
@@ -666,8 +679,12 @@ impl Memory {
             None => return,
             Some(job) => job.rx.try_recv(),
         };
+        let mut finished = None;
         let text = match outcome {
             Ok(r) => {
+                if r.trimmed > 0 {
+                    finished = Some((r.trimmed, r.before, r.after));
+                }
                 let mut text = trim_summary(r.trimmed, r.groups, r.before, r.after, r.skipped);
                 if r.failed > 0 {
                     text += &format!(", {} could not be trimmed", r.failed);
@@ -680,8 +697,19 @@ impl Memory {
             }
             Err(TryRecvError::Disconnected) => "Trimming stopped unexpectedly.".to_string(),
         };
-        self.trim_job = None;
+        let lists_before = self.trim_job.take().and_then(|job| job.lists_before);
         self.last_trim = Some(text);
+        if let Some((trimmed, ws_before, ws_after)) = finished {
+            let change = lists_before
+                .zip(memlist::query())
+                .map(|(b, a)| Change::between(b, a, self.hard_faults));
+            self.record_result(
+                Trigger::Manual,
+                vec!["Selected apps".to_string()],
+                change,
+                vec![freed::apps_text(trimmed, ws_before, ws_after)],
+            );
+        }
         self.refresh_now(ctx);
     }
 }

@@ -96,6 +96,54 @@ pub fn foreground_is_fullscreen() -> bool {
     }
 }
 
+/// File name of the app in front (for example `chrome.exe`), read without a process list. Used
+/// while the window is hidden, where no list is kept; `None` if there is no foreground app or
+/// Windows does not let it be read.
+pub fn foreground_app_name() -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    struct Guard(HANDLE);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from OpenProcess and is closed exactly once.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    let pid = super::actions::foreground_pid()?;
+    // SAFETY: plain FFI call; the returned handle is wrapped for closing right away.
+    let handle = Guard(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?);
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` is valid for `len` UTF-16 units and `len` is a valid in/out size.
+    unsafe {
+        QueryFullProcessImageNameW(
+            handle.0,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+    }
+    .ok()?;
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    app_name_from_path(&path)
+}
+
+/// The app's display name from its image path: the file name after the last separator, as
+/// Windows spells it (`C:\Apps\Chrome.exe` is `Chrome.exe`). `None` if the path is empty or ends
+/// with a separator, since there is no file name then.
+fn app_name_from_path(path: &str) -> Option<String> {
+    path.rsplit(['\\', '/'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
 /// Time since the last keyboard or mouse input, or `None` if Windows does not say.
 pub fn system_idle() -> Option<Duration> {
     let mut info = LASTINPUTINFO {
@@ -124,6 +172,27 @@ mod tests {
             right: r,
             bottom: b,
         }
+    }
+
+    #[test]
+    fn the_app_name_is_the_file_name_of_the_image_path() {
+        let name = app_name_from_path;
+        assert_eq!(
+            name(r"C:\Program Files\Google\Chrome.exe").as_deref(),
+            Some("Chrome.exe")
+        );
+        assert_eq!(name("notepad.exe").as_deref(), Some("notepad.exe"));
+        // Not changed or guessed: no extension, or not an .exe.
+        assert_eq!(name(r"C:\bin\tool").as_deref(), Some("tool"));
+        assert_eq!(name(r"C:\bin\run.scr").as_deref(), Some("run.scr"));
+        assert_eq!(
+            name("C:\\Brukere\\Sn\u{f8}\\Lyd \u{2013} spiller.exe").as_deref(),
+            Some("Lyd \u{2013} spiller.exe")
+        );
+        // Nothing to name.
+        assert_eq!(name(""), None);
+        assert_eq!(name(r"C:\Apps\"), None);
+        assert_eq!(name(r"\"), None);
     }
 
     #[test]

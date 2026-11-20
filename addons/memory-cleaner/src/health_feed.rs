@@ -78,7 +78,10 @@ impl Memory {
             self.last_eval = Instant::now();
             let now_ms = self.now_ms();
             if let Some((signals, assessment)) = self.read_pressure(now_ms, unix_now()) {
-                self.note_foreground();
+                // Only an automatic rule needs to know which app was in front.
+                if self.scheduler.is_enabled() || self.auto.any_on() {
+                    self.note_foreground();
+                }
                 self.automatic_check(now_ms, &signals, assessment, start);
             }
         }
@@ -515,6 +518,11 @@ mod tests {
         let ctx = egui::Context::default();
         assert!(!m.request_refresh(&ctx, None));
         assert!(!m.request_refresh(&ctx, Some(crate::RefreshAction::Optimize(Trigger::Manual))));
+        let trim = crate::RefreshAction::Trim {
+            selection: Default::default(),
+            grouped: false,
+        };
+        assert!(!m.request_refresh(&ctx, Some(trim)));
         assert!(!m.refresh_action_pending);
     }
 

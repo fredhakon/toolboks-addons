@@ -581,8 +581,9 @@ impl Memory {
         );
         report::push_report(&mut self.reports, settling.report());
         self.settling = Some(settling);
-        if job.trigger.is_automatic() {
-            // Flash the taskbar button so a minimized window still tells you.
+        if job.trigger.is_automatic() && self.active {
+            // Flash the taskbar button so a minimized window still tells you. Hidden in the
+            // tray there is no window to flash.
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                 egui::UserAttentionType::Informational,
             ));

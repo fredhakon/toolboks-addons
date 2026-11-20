@@ -25,7 +25,8 @@ use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use toolboks_shared::win::Handle;
 
 use super::admin::failure_text;
-use super::memlist::{self, Command, MemListError};
+use super::freed::Change;
+use super::memlist::{self, Command, Lists, MemListError};
 
 /// `GetDriveTypeW` result for a fixed disk (documented value 3). The crate has it only behind the
 /// `Win32_System_WindowsProgramming` feature, which is not enabled here.
@@ -344,6 +345,8 @@ pub struct Outcome {
     /// Drives that refused the flush while at least one other drive was flushed (EFI, Recovery
     /// and locked volumes can refuse); the region still counts as done.
     pub drives_failed: u32,
+    /// The lists read right before and after this region; `None` if either read failed.
+    pub change: Option<Change>,
 }
 
 /// The result line, and whether at least one region worked (so something changed).
@@ -378,6 +381,8 @@ pub fn summary(outcomes: &[Outcome]) -> (String, bool) {
 /// touching the system.
 trait Backend {
     fn version(&self) -> Option<WindowsVersion>;
+    /// The memory list sizes now.
+    fn lists(&mut self) -> Option<Lists>;
     fn list_command(&mut self, command: Command) -> Result<(), MemListError>;
     fn set_info(&mut self, info: Info) -> Result<(), MemListError>;
     /// `Ok` holds the number of drives that failed while at least one other was flushed.
@@ -391,6 +396,7 @@ fn run_selected(backend: &mut dyn Backend, selection: Selection) -> Vec<Outcome>
         .regions()
         .map(|region| {
             let mut drives_failed = 0;
+            let before = backend.lists();
             let result = match region.unavailable(version) {
                 Some(reason) => Err(RegionError::Unavailable(reason)),
                 None => match region.action() {
@@ -401,10 +407,15 @@ fn run_selected(backend: &mut dyn Backend, selection: Selection) -> Vec<Outcome>
                     Action::FlushVolumes => backend.flush_volumes().map(|n| drives_failed = n),
                 },
             };
+            // Disk reads come from the add-on's sampler, which the helper does not have.
+            let change = before
+                .zip(backend.lists())
+                .map(|(b, a)| Change::between(b, a, None));
             Outcome {
                 region,
                 result,
                 drives_failed,
+                change,
             }
         })
         .collect()
@@ -447,6 +458,10 @@ struct RealBackend;
 impl Backend for RealBackend {
     fn version(&self) -> Option<WindowsVersion> {
         windows_version()
+    }
+
+    fn lists(&mut self) -> Option<Lists> {
+        memlist::query()
     }
 
     fn list_command(&mut self, command: Command) -> Result<(), MemListError> {
@@ -593,6 +608,8 @@ mod tests {
         calls: Vec<Call>,
         error: Option<MemListError>,
         volumes: Result<u32, RegionError>,
+        /// What `lists` returns, front first; empty means the read fails.
+        readings: Vec<Lists>,
     }
 
     fn fake(version: Option<WindowsVersion>) -> Fake {
@@ -601,12 +618,16 @@ mod tests {
             calls: Vec::new(),
             error: None,
             volumes: Ok(0),
+            readings: Vec::new(),
         }
     }
 
     impl Backend for Fake {
         fn version(&self) -> Option<WindowsVersion> {
             self.version
+        }
+        fn lists(&mut self) -> Option<Lists> {
+            (!self.readings.is_empty()).then(|| self.readings.remove(0))
         }
         fn list_command(&mut self, command: Command) -> Result<(), MemListError> {
             self.calls.push(Call::List(command));
@@ -620,6 +641,25 @@ mod tests {
             self.calls.push(Call::Volumes);
             self.volumes
         }
+    }
+
+    #[test]
+    fn each_region_is_measured_around_itself_and_a_failed_read_means_not_measured() {
+        let at = |free_mb: u64| Lists {
+            free: free_mb * 1024 * 1024,
+            ..Default::default()
+        };
+        let mut backend = fake(Some(WINDOWS_10));
+        let mut selection = Selection::from_bits(0);
+        selection.set(Region::WorkingSet, true);
+        selection.set(Region::StandbyList, true);
+        selection.set(Region::LowPriorityStandby, true);
+        // Two reads per region: working set 100 -> 400, standby 400 -> 400, then the reads fail.
+        backend.readings = vec![at(100), at(400), at(400), at(400)];
+        let outcomes = run_selected(&mut backend, selection);
+        assert_eq!(outcomes[0].change.unwrap().freed, 300 * 1024 * 1024);
+        assert_eq!(outcomes[1].change.unwrap().freed, 0);
+        assert_eq!(outcomes[2].change, None);
     }
 
     #[test]

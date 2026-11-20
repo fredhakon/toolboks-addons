@@ -4,8 +4,10 @@
 
 use toolboks_addon_sdk::{admin::AdminChange, AdminOutcome, AdminRequest, HostRequest};
 
+use super::freed::{self, Change};
 use super::memlist::{self, MemListError, StandbyBreakdown};
 use super::regions::{self, Selection, WindowsVersion};
+use super::report;
 use super::style::{section, unproven_note, PURGE_EVIDENCE};
 use super::Memory;
 use toolboks_shared::format::size_plain;
@@ -132,16 +134,28 @@ impl Memory {
         let text = match outcome {
             AdminOutcome::Cancelled => "Cancelled. Nothing was changed.".to_string(),
             AdminOutcome::Failed { reason } => reason,
-            AdminOutcome::Completed { json } => serde_json::from_str::<serde_json::Value>(&json)
-                .ok()
-                .and_then(|v| v["text"].as_str().map(str::to_string))
-                .unwrap_or_else(|| {
-                    if regions {
-                        "The selected regions were cleaned.".to_string()
-                    } else {
-                        "The cache was cleared.".to_string()
-                    }
-                }),
+            AdminOutcome::Completed { json } => {
+                let value = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
+                if regions {
+                    let (whole, parts) = freed::measured_from_json(&value["measured"]);
+                    self.record_result(
+                        report::Trigger::Manual,
+                        parts.iter().map(|(label, _)| label.clone()).collect(),
+                        whole,
+                        freed::parts_text(&parts),
+                    );
+                }
+                value["text"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        if regions {
+                            "The selected regions were cleaned.".to_string()
+                        } else {
+                            "The cache was cleared.".to_string()
+                        }
+                    })
+            }
         };
         let line = Some(format!(
             "{}  {}",
@@ -288,9 +302,23 @@ impl AdminChange for RegionsChange {
         text
     }
     fn apply(self: Box<Self>) -> Result<String, String> {
-        let (text, any_done) = regions::summary(&regions::clean(self.selection));
+        let before = memlist::query();
+        let outcomes = regions::clean(self.selection);
+        let whole = before
+            .zip(memlist::query())
+            .map(|(b, a)| Change::between(b, a, None));
+        let (text, any_done) = regions::summary(&outcomes);
         if any_done {
-            Ok(serde_json::json!({ "text": text }).to_string())
+            let parts: Vec<_> = outcomes
+                .iter()
+                .filter(|o| o.result.is_ok())
+                .map(|o| (o.region.label(), o.change))
+                .collect();
+            Ok(serde_json::json!({
+                "text": text,
+                "measured": freed::measured_to_json(whole, &parts),
+            })
+            .to_string())
         } else {
             Err(text)
         }

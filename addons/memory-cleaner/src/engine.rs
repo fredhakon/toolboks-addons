@@ -14,6 +14,7 @@ use super::actions::{
 };
 use super::activity::{self, Activity};
 use super::auto_triggers;
+use super::freed::{self, Change};
 use super::growth::{self, WindowsPrivateMemory};
 use super::pressure::{Assessment, Verdict};
 use super::report::{self, HonestReport, RunMeasurement, RunMeasurements, Trigger};
@@ -535,6 +536,12 @@ impl Memory {
                 at_30s: None,
                 at_120s: None,
             },
+        );
+        self.record_result(
+            job.trigger,
+            vec!["Idle apps".to_string()],
+            Some(Change::from_readings(&before, &after)),
+            vec![freed::apps_text(summary.trimmed, before_ws, after_ws)],
         );
         report::push_report(&mut self.reports, settling.report());
         self.settling = Some(settling);

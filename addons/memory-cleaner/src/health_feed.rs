@@ -430,6 +430,13 @@ mod tests {
     fn the_first_frame_shows_the_page_and_starts_sampling_at_once() {
         let (mut m, _) = memory(Some(calm()));
         m.preferences_loaded = true; // nothing is read from disk
+                                     // A fake sampling worker, so no thread reads Windows. A tick only asks it for a reading
+                                     // when something is due (here: a finished purge wants fresh numbers), and the request
+                                     // is refused while the add-on is not shown, which is what this test is about.
+        let (request, requests) = std::sync::mpsc::channel();
+        let (_results, result) = std::sync::mpsc::channel();
+        m.refresh_worker = Some(crate::RefreshWorker { request, result });
+        m.refresh_after_purge = true;
         let mut preferences = Default::default();
         let ctx = egui::Context::default();
         // The runtime ticks, then draws, in the same frame.
@@ -439,8 +446,9 @@ mod tests {
         });
         output.drop_without_applying_deltas();
         assert!(m.active);
-        // The first tick asked for a reading (a real, read-only sampling thread), so the page
-        // says it is collecting instead of "not available" for two seconds.
+        // The first tick got its request through, so the page says it is collecting instead
+        // of "not available" for two seconds.
+        assert!(matches!(requests.try_recv(), Ok(None)));
         assert_eq!(m.refresh_in_flight, 1);
         // Shown: the hidden tick no longer reads on its own.
         m.last_eval = Instant::now() - eval_interval(false) - Duration::from_millis(1);
@@ -598,6 +606,15 @@ mod tests {
         let run = crate::RefreshAction::Optimize(Trigger::Manual);
         assert!(m.request_refresh(&ctx, Some(run)));
         assert!(m.refresh_action_pending);
+    }
+
+    #[test]
+    fn resuming_makes_the_source_from_the_probe_not_from_windows() {
+        let mut m = Memory::for_test();
+        m.signals = None;
+        m.resume();
+        let mut source = m.signals.expect("a source was made");
+        assert!(source.read().is_none(), "the test probe reads nothing");
     }
 
     #[test]

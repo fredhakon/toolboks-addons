@@ -193,6 +193,8 @@ struct Probes {
     fullscreen: Box<dyn Fn() -> bool + Send>,
     /// Time since the last keyboard or mouse input.
     system_idle: Box<dyn Fn() -> Option<Duration> + Send>,
+    /// A new pressure source, made when the page is shown again and none is kept.
+    signals: Box<dyn Fn() -> Box<dyn SignalSource> + Send>,
 }
 
 impl Probes {
@@ -201,6 +203,7 @@ impl Probes {
             foreground_name: Box::new(activity::foreground_app_name),
             fullscreen: Box::new(activity::foreground_is_fullscreen),
             system_idle: Box::new(activity::system_idle),
+            signals: Box::new(|| Box::new(WindowsSignals::new())),
         }
     }
 
@@ -210,7 +213,19 @@ impl Probes {
             foreground_name: Box::new(|| None),
             fullscreen: Box::new(|| false),
             system_idle: Box::new(|| None),
+            signals: Box::new(|| Box::new(Unreadable)),
         }
+    }
+}
+
+/// A pressure source that reads nothing, for `Probes::none`.
+#[cfg(test)]
+struct Unreadable;
+
+#[cfg(test)]
+impl SignalSource for Unreadable {
+    fn read(&mut self) -> Option<pressure::Signals> {
+        None
     }
 }
 
@@ -581,7 +596,7 @@ impl NativeAddon for Memory {
     fn resume(&mut self) {
         self.active = true;
         if self.signals.is_none() {
-            self.signals = Some(Box::new(WindowsSignals::new()));
+            self.signals = Some((self.probes.signals)());
         }
     }
     /// A running trim or optimize keeps going, and finishes, while the window is hidden.

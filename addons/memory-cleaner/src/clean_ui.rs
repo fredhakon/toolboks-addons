@@ -27,6 +27,8 @@ const TRAY_LABEL: &str = "Clean now";
 const TRAY_LABEL_BUSY: &str = "Clean now (running)";
 /// Said in the entry itself: a prompt cannot be seen while the page is hidden, and the add-on
 /// has no way to raise its page, so the entry waits for the page instead of cleaning unasked.
+/// A prompt is already open (on the page), so a second one would replace it.
+const TRAY_LABEL_PROMPT: &str = "Clean now (answer the question first)";
 const TRAY_LABEL_CONFIRM: &str = "Clean now (open Memory Cleaner to confirm)";
 
 const BUSY_TEXT: &str = "A run is already going. Try again when it has finished.";
@@ -87,6 +89,8 @@ impl Memory {
             Some(TRAY_LABEL_BUSY)
         } else if self.options.confirm_manual && !self.active {
             Some(TRAY_LABEL_CONFIRM)
+        } else if self.pending_confirm.is_some() {
+            Some(TRAY_LABEL_PROMPT)
         } else {
             None
         }
@@ -105,11 +109,8 @@ impl Memory {
     /// The user chose a tray entry: ask first or run, exactly like the Home button. An unknown
     /// id, or a state the entry was offered disabled in, does nothing.
     pub(super) fn clean_now_tray_action(&mut self, id: &str) {
-        // An open prompt (for example "Trim selected") is left alone, not swapped for this one.
-        if id != TRAY_CLEAN_NOW
-            || self.clean_now_blocked().is_some()
-            || self.pending_confirm.is_some()
-        {
+        // Also blocked while a prompt is open: it is left alone, not swapped for this one.
+        if id != TRAY_CLEAN_NOW || self.clean_now_blocked().is_some() {
             return;
         }
         // Never ticked (started hidden): a throwaway context. Nothing is lost, because
@@ -331,6 +332,10 @@ mod tests {
         let mut memory = Memory::for_test();
         memory.active = true;
         memory.pending_confirm = Some(Confirm::TrimSelected);
+        let offered = entry(&memory);
+        assert!(!offered.enabled);
+        assert_eq!(offered.label, "Clean now (answer the question first)");
+        assert!(offered.label.chars().count() <= 60);
         memory.clean_now_tray_action("clean-now");
         assert_eq!(memory.pending_confirm, Some(Confirm::TrimSelected));
     }

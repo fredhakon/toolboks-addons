@@ -135,9 +135,8 @@ pub struct Memory {
     /// Pressure verdict: the model, the Windows readings and the latest assessment.
     pressure: PressureModel,
     signals: Option<Box<dyn SignalSource>>,
-    /// The file name of the app in front, read without a process list while the page is
-    /// hidden. Replaced in tests.
-    foreground_name: Box<dyn Fn() -> Option<String> + Send>,
+    /// What the run path asks Windows about the app in front. Replaced in tests.
+    probes: Probes,
     assessment: Assessment,
     /// The `memory-pressure` finding for Home: what the last pressure reading said, and the
     /// reading kept for a minute at a time. In memory only.
@@ -185,21 +184,51 @@ pub struct Memory {
     log_note: Option<String>,
 }
 
+/// The small Windows questions about the app in front. Real ones by default; tests replace them
+/// so nothing depends on what is on the screen.
+struct Probes {
+    /// The file name of the app in front, read without a process list (page hidden).
+    foreground_name: Box<dyn Fn() -> Option<String> + Send>,
+    /// Whether the app in front covers its whole monitor.
+    fullscreen: Box<dyn Fn() -> bool + Send>,
+    /// Time since the last keyboard or mouse input.
+    system_idle: Box<dyn Fn() -> Option<Duration> + Send>,
+}
+
+impl Probes {
+    fn windows() -> Self {
+        Self {
+            foreground_name: Box::new(activity::foreground_app_name),
+            fullscreen: Box::new(activity::foreground_is_fullscreen),
+            system_idle: Box::new(activity::system_idle),
+        }
+    }
+
+    #[cfg(test)]
+    fn none() -> Self {
+        Self {
+            foreground_name: Box::new(|| None),
+            fullscreen: Box::new(|| false),
+            system_idle: Box::new(|| None),
+        }
+    }
+}
+
 impl Memory {
     pub fn new() -> Self {
         Self::build(
             memlist::query(),
             commit::query(),
             Some(Box::new(WindowsSignals::new())),
-            Box::new(activity::foreground_app_name),
+            Probes::windows(),
         )
     }
 
     /// A `Memory` that asks Windows nothing: no memory lists, commit or pressure readings, and
-    /// no app in front. Tests add the fakes they need.
+    /// no app in front, not full screen, no input idle time. Tests add the fakes they need.
     #[cfg(test)]
     fn for_test() -> Self {
-        let mut memory = Self::build(None, None, None, Box::new(|| None));
+        let mut memory = Self::build(None, None, None, Probes::none());
         memory.log_store = clean_log::FileStore::nowhere();
         memory
     }
@@ -208,7 +237,7 @@ impl Memory {
         lists: Option<Lists>,
         commit: Option<commit::Commit>,
         signals: Option<Box<dyn SignalSource>>,
-        foreground_name: Box<dyn Fn() -> Option<String> + Send>,
+        probes: Probes,
     ) -> Self {
         let epoch = Instant::now();
         Self {
@@ -216,12 +245,12 @@ impl Memory {
             refresh_worker: None,
             refresh_in_flight: 0,
             refresh_action_pending: false,
-            // Hidden until the first frame is drawn. The host sends `Suspend` right after the
-            // connection when the add-on was started hidden (toolboks `src/supervisor/mod.rs`,
-            // "if !managed.visible { send(Suspend) }"), but not when the page is opened first,
-            // and a `Resume` only follows a `Suspend`. So `ui` turns this on, and an add-on that
-            // never drew already runs the hidden tick (automatic cleaning) without any
-            // `suspend` call.
+            // Defensive: start hidden, so an add-on that has not been shown never behaves as
+            // shown. The host already sends `Suspend` right after the connection when the
+            // add-on was started hidden (toolboks `src/supervisor/mod.rs`, "if !managed.visible
+            // { send(Suspend) }"), so today this only matters for a host that does not. It is
+            // not sent when the page is opened first, so `tick` (which the runtime calls only
+            // while shown, before `ui` in the same frame) turns it on.
             active: false,
             lists,
             request: None,
@@ -257,7 +286,7 @@ impl Memory {
             activity: Activity::new(0),
             pressure: PressureModel::new(),
             signals,
-            foreground_name,
+            probes,
             health: {
                 // "Not checked yet" until the first pressure reading arrives.
                 let mut tracker = health::Tracker::new();
@@ -476,8 +505,6 @@ impl NativeAddon for Memory {
         preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
     ) -> bool {
         style_once(ui.ctx());
-        // The page is shown (a page opened first gets no `Resume`).
-        self.active = true;
         self.load_prefs(preferences);
         self.draw(ui, self.page);
         self.confirm_ui(ui.ctx());
@@ -518,6 +545,9 @@ impl NativeAddon for Memory {
         self.request.take()
     }
     fn tick(&mut self, ctx: &egui::Context) {
+        // The runtime calls `tick` only while the page is shown, before `ui` in the same frame,
+        // and sends no `Resume` to a page opened first: this is what turns the shown mode on.
+        self.active = true;
         self.ctx = Some(ctx.clone());
         if self.refresh_after_purge {
             self.refresh_after_purge = false;

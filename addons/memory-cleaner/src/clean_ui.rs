@@ -105,9 +105,15 @@ impl Memory {
     /// The user chose a tray entry: ask first or run, exactly like the Home button. An unknown
     /// id, or a state the entry was offered disabled in, does nothing.
     pub(super) fn clean_now_tray_action(&mut self, id: &str) {
-        if id != TRAY_CLEAN_NOW || self.clean_now_blocked().is_some() {
+        // An open prompt (for example "Trim selected") is left alone, not swapped for this one.
+        if id != TRAY_CLEAN_NOW
+            || self.clean_now_blocked().is_some()
+            || self.pending_confirm.is_some()
+        {
             return;
         }
+        // Never ticked (started hidden): a throwaway context. Nothing is lost, because
+        // `tick_background` polls the run every 200 ms.
         let ctx = self.ctx.clone().unwrap_or_default();
         self.ask_or_run(&ctx, Confirm::TrimIdle);
     }
@@ -318,6 +324,15 @@ mod tests {
             Ok(Some(RefreshAction::Optimize(Trigger::Manual)))
         ));
         assert!(memory.busy());
+    }
+
+    #[test]
+    fn a_tray_click_leaves_an_open_prompt_alone() {
+        let mut memory = Memory::for_test();
+        memory.active = true;
+        memory.pending_confirm = Some(Confirm::TrimSelected);
+        memory.clean_now_tray_action("clean-now");
+        assert_eq!(memory.pending_confirm, Some(Confirm::TrimSelected));
     }
 
     #[test]

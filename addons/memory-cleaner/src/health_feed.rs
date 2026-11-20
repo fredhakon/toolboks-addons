@@ -78,10 +78,9 @@ impl Memory {
             self.last_eval = Instant::now();
             let now_ms = self.now_ms();
             if let Some((signals, assessment)) = self.read_pressure(now_ms, unix_now()) {
-                // Only an automatic rule needs to know which app was in front.
-                if self.scheduler.is_enabled() || self.auto.any_on() {
-                    self.note_foreground();
-                }
+                // Every reading, rule or not: a run started from the tray while hidden judges
+                // idleness by it. One foreground query every 10 s.
+                self.note_foreground();
                 self.automatic_check(now_ms, &signals, assessment, start);
             }
         }
@@ -405,7 +404,7 @@ mod tests {
         let mut starts = Vec::new();
         hidden_at(&mut m, 100, true, &mut starts);
         assert_eq!(starts, vec![Trigger::MemoryLimit]);
-        // Hidden: a plain refresh or a manual action still waits for the window.
+        // Hidden: a plain refresh still waits for the window.
         let ctx = egui::Context::default();
         assert!(!m.request_refresh(&ctx, None));
     }
@@ -428,21 +427,38 @@ mod tests {
     }
 
     #[test]
-    fn the_first_frame_shows_the_page_without_a_resume() {
+    fn the_first_frame_shows_the_page_and_starts_sampling_at_once() {
         let (mut m, _) = memory(Some(calm()));
         m.preferences_loaded = true; // nothing is read from disk
-        m.refresh_in_flight = 1; // only the "collecting" note is drawn, no sampling thread
         let mut preferences = Default::default();
         let ctx = egui::Context::default();
+        // The runtime ticks, then draws, in the same frame.
+        m.tick(&ctx);
         let output = ctx.run_ui(Default::default(), |ui| {
             m.ui(ui, &mut preferences);
         });
         output.drop_without_applying_deltas();
         assert!(m.active);
+        // The first tick asked for a reading (a real, read-only sampling thread), so the page
+        // says it is collecting instead of "not available" for two seconds.
+        assert_eq!(m.refresh_in_flight, 1);
         // Shown: the hidden tick no longer reads on its own.
         m.last_eval = Instant::now() - eval_interval(false) - Duration::from_millis(1);
         m.hidden_tick(&mut |_, _| panic!("no run while the page is shown"));
-        assert!(m.signals.is_some());
+    }
+
+    #[test]
+    fn a_hidden_reading_notes_the_app_in_front_even_with_no_rule_on() {
+        let (mut m, _) = memory(Some(calm()));
+        m.probes.foreground_name = Box::new(|| Some("Notes.exe".to_string()));
+        assert!(!m.scheduler.is_enabled() && !m.auto.any_on());
+        m.epoch = Instant::now() - Duration::from_secs(1000);
+        m.last_eval = Instant::now() - eval_interval(false) - Duration::from_millis(1);
+        m.hidden_tick(&mut |_, _| true);
+        let now = m.now_ms();
+        let idle = |name| m.activity.idle_for(name, now, None, None).unwrap();
+        assert!(idle("notes.exe") < Duration::from_secs(10));
+        assert!(idle("other.exe") >= Duration::from_secs(1000));
     }
 
     #[test]

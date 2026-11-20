@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use super::actions::{
     self, ActionResult, Candidate, Cooldowns, Identity, Kind, Policy, UndoLog, WindowsOps,
 };
-use super::activity::{self, Activity};
+use super::activity::Activity;
 use super::auto_triggers;
 use super::freed::{self, Change};
 use super::growth::{self, WindowsPrivateMemory};
@@ -346,7 +346,7 @@ impl Memory {
             Some(sampler) => actions::foreground_pid()
                 .and_then(|pid| sampler.processes.iter().find(|p| p.pid == pid))
                 .map(|p| p.name.clone()),
-            None => (self.foreground_name)(),
+            None => (self.probes.foreground_name)(),
         };
         let now = self.now_ms();
         self.activity.note_foreground(now, name.as_deref());
@@ -444,8 +444,8 @@ impl Memory {
             activity: &self.activity,
             now_ms: self.now_ms(),
             foreground_pid: policy.foreground_pid,
-            fullscreen: activity::foreground_is_fullscreen(),
-            system_idle: activity::system_idle(),
+            fullscreen: (self.probes.fullscreen)(),
+            system_idle: (self.probes.system_idle)(),
             min_bytes: policy.min_priority_bytes,
         };
         // Read with this snapshot on the sampling thread; unknown means every app may play.
@@ -1111,7 +1111,7 @@ mod tests {
         let mut m = Memory::for_test();
         // 1000 s on the tool's clock, so an app never seen has been idle for all of it.
         m.epoch = Instant::now() - Duration::from_secs(1000);
-        m.foreground_name = Box::new(|| Some("Chrome.exe".to_string()));
+        m.probes.foreground_name = Box::new(|| Some("Chrome.exe".to_string()));
         assert!(m.sampler.is_none());
         m.note_foreground();
         let now = m.now_ms();

@@ -140,11 +140,18 @@ impl FileStore {
         )
     }
 
-    /// A store whose folder does not exist: it reads as an empty log, so a test never touches
-    /// the real log.
+    /// A store in a temp folder that is never created: it reads as an empty log, so a test never
+    /// touches the real log. A test that turns the log on would create (only) that temp folder.
     #[cfg(test)]
     pub fn nowhere() -> Self {
-        Self(PathBuf::from("memory-cleaner-test-no-such-folder").join(FILE_NAME))
+        Self(
+            std::env::temp_dir()
+                .join(format!(
+                    "memory-cleaner-test-{}-no-folder",
+                    std::process::id()
+                ))
+                .join(FILE_NAME),
+        )
     }
 }
 

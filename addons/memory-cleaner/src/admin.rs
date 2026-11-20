@@ -4,8 +4,10 @@
 
 use toolboks_addon_sdk::{admin::AdminChange, AdminOutcome, AdminRequest, HostRequest};
 
+use super::freed::{self, Change};
 use super::memlist::{self, MemListError, StandbyBreakdown};
 use super::regions::{self, Selection, WindowsVersion};
+use super::report;
 use super::style::{section, unproven_note, PURGE_EVIDENCE};
 use super::Memory;
 use toolboks_shared::format::size_plain;
@@ -132,16 +134,29 @@ impl Memory {
         let text = match outcome {
             AdminOutcome::Cancelled => "Cancelled. Nothing was changed.".to_string(),
             AdminOutcome::Failed { reason } => reason,
-            AdminOutcome::Completed { json } => serde_json::from_str::<serde_json::Value>(&json)
-                .ok()
-                .and_then(|v| v["text"].as_str().map(str::to_string))
-                .unwrap_or_else(|| {
-                    if regions {
-                        "The selected regions were cleaned.".to_string()
-                    } else {
-                        "The cache was cleared.".to_string()
-                    }
-                }),
+            AdminOutcome::Completed { json } => {
+                let value = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
+                let (whole, parts) = freed::measured_from_json(&value["measured"]);
+                let (what, detail) = if regions {
+                    (
+                        parts.iter().map(|(label, _)| label.clone()).collect(),
+                        freed::parts_text(&parts),
+                    )
+                } else {
+                    (vec!["Low-priority cache".to_string()], Vec::new())
+                };
+                self.record_result(report::Trigger::Manual, what, whole, detail);
+                value["text"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        if regions {
+                            "The selected regions were cleaned.".to_string()
+                        } else {
+                            "The cache was cleared.".to_string()
+                        }
+                    })
+            }
         };
         let line = Some(format!(
             "{}  {}",
@@ -288,9 +303,23 @@ impl AdminChange for RegionsChange {
         text
     }
     fn apply(self: Box<Self>) -> Result<String, String> {
-        let (text, any_done) = regions::summary(&regions::clean(self.selection));
+        let before = memlist::query();
+        let outcomes = regions::clean(self.selection);
+        let whole = before
+            .zip(memlist::query())
+            .map(|(b, a)| Change::between(b, a, None));
+        let (text, any_done) = regions::summary(&outcomes);
         if any_done {
-            Ok(serde_json::json!({ "text": text }).to_string())
+            let parts: Vec<_> = outcomes
+                .iter()
+                .filter(|o| o.result.is_ok())
+                .map(|o| (o.region.label(), o.change))
+                .collect();
+            Ok(serde_json::json!({
+                "text": text,
+                "measured": freed::measured_to_json(whole, &parts),
+            })
+            .to_string())
         } else {
             Err(text)
         }
@@ -306,11 +335,19 @@ impl AdminChange for PurgeChange {
     }
     fn apply(self: Box<Self>) -> Result<String, String> {
         let before = memlist::standby_breakdown();
+        let lists_before = memlist::query();
         let result = memlist::purge_low_priority_standby();
         let after = memlist::standby_breakdown();
+        let whole = lists_before
+            .zip(memlist::query())
+            .map(|(b, a)| Change::between(b, a, None));
         let text = purge_text(result, before, after);
         match result {
-            Ok(()) => Ok(serde_json::json!({ "text": text }).to_string()),
+            Ok(()) => Ok(serde_json::json!({
+                "text": text,
+                "measured": freed::measured_to_json(whole, &[]),
+            })
+            .to_string()),
             Err(_) => Err(text),
         }
     }
@@ -482,5 +519,31 @@ mod tests {
         memory.regions = Selection::from_bits(0b1100_0000);
         memory.start_regions();
         assert!(memory.purge.is_none() && memory.take_request_for_test().is_none());
+    }
+
+    #[test]
+    fn a_finished_purge_reaches_the_home_line_and_a_reply_without_numbers_claims_none() {
+        let lists = |free: u64, standby: u64| memlist::Lists {
+            free: free << 20,
+            standby: standby << 20,
+            modified: 0,
+        };
+        let change = Change::between(lists(100, 900), lists(100, 300), None);
+        let reply = |measured: serde_json::Value| AdminOutcome::Completed {
+            json: serde_json::json!({ "text": "done", "measured": measured }).to_string(),
+        };
+        let mut memory = Memory::new();
+        memory.start_purge();
+        let id = memory.next_request;
+        memory.purge_finished(id, reply(freed::measured_to_json(Some(change), &[])));
+        let result = memory.last_result.clone().unwrap();
+        assert_eq!(result.what, ["Low-priority cache"]);
+        assert_eq!(result.change, Some(change));
+        assert_eq!(result.change.unwrap().standby, -(600 << 20));
+
+        memory.start_purge();
+        let id = memory.next_request;
+        memory.purge_finished(id, reply(serde_json::Value::Null));
+        assert_eq!(memory.last_result.unwrap().change, None);
     }
 }

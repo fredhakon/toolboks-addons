@@ -24,6 +24,14 @@ pub fn honest_note() -> &'static str {
     HONEST_NOTE
 }
 
+/// Said next to a "freed" number when part of it only moved to the standby cache.
+const CACHE_NOTE: &str =
+    "Cached pages are not gone: Windows gives them back to apps that ask for them.";
+
+pub fn cache_note() -> &'static str {
+    CACHE_NOTE
+}
+
 /// Commit moving by less than this is shown as "unchanged".
 const COMMIT_UNCHANGED: u64 = 64 * MB;
 /// Seconds after a run for the two settle checks.
@@ -100,6 +108,16 @@ pub enum Trigger {
 impl Trigger {
     pub fn is_automatic(self) -> bool {
         self != Trigger::Manual
+    }
+
+    /// The source shown on Home and written to the clean log.
+    pub fn label(self) -> &'static str {
+        match self {
+            Trigger::Manual => "Manual",
+            Trigger::Pressure => "Auto pressure",
+            Trigger::MemoryLimit => "Auto limit",
+            Trigger::Interval => "Auto interval",
+        }
     }
 
     /// The rule that started the run, in plain words.
@@ -494,6 +512,23 @@ mod tests {
             assert!(trigger.text().ends_with('.'));
             assert!(HonestReport::compute(trigger, 1, RunMeasurements::default()).automatic());
         }
+    }
+
+    #[test]
+    fn every_source_has_its_own_label() {
+        let labels: Vec<_> = [
+            Trigger::Manual,
+            Trigger::Pressure,
+            Trigger::MemoryLimit,
+            Trigger::Interval,
+        ]
+        .map(Trigger::label)
+        .into();
+        assert_eq!(
+            labels,
+            ["Manual", "Auto pressure", "Auto limit", "Auto interval"]
+        );
+        assert!(cache_note().contains("not gone"));
     }
 
     #[test]

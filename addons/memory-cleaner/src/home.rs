@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use egui::{self, Align, Color32, Layout, Pos2, Rect, RichText, Sense, Stroke, Vec2};
 
+use super::clean_ui::Confirm;
 use super::engine::per_hour_text;
 use super::groups::Segment;
 use super::growth::{GrowthInfo, Hint};
@@ -538,7 +539,7 @@ impl Memory {
                 };
                 toolboks_addon_sdk::tutorial::mark(ui, "memory-optimize", response.rect);
                 if response.clicked() {
-                    self.start_run(ctx, Trigger::Manual);
+                    self.ask_or_run(ctx, Confirm::TrimIdle);
                 }
                 ui.label(RichText::new(TRIM_NOTE).weak().small());
                 unproven_note(ui, TRIM_EVIDENCE);
@@ -796,6 +797,7 @@ impl Memory {
     }
 
     fn last_run_card(&mut self, ui: &mut egui::Ui) {
+        self.result_line(ui);
         let running = self.run.is_some();
         let nothing = self.last_run.is_some_and(|r| r == Default::default());
         let report = self

@@ -6,8 +6,11 @@ mod audio;
 mod auto_triggers;
 #[cfg(test)]
 mod bench;
+mod clean_log;
+mod clean_ui;
 mod commit;
 mod engine;
+mod freed;
 mod groups;
 mod growth;
 mod health;
@@ -35,6 +38,7 @@ use self::activity::Activity;
 pub use self::admin::prepare_admin;
 use self::admin::PurgeJob;
 use self::auto_triggers::{AutoTriggers, Settings as AutoSettings};
+use self::clean_ui::Confirm;
 use self::engine::{RunJob, RunSummary, Settling};
 use self::growth::GrowthTracker;
 use self::memlist::Lists;
@@ -62,8 +66,8 @@ struct RefreshWorker {
 
 /// Live RAM usage, a per-process table, manual per-process trimming, a pressure verdict, the
 /// safe optimize run and an automatic mode that only acts under real memory pressure.
-/// Only the "Clean selected regions" ticks and the automatic trigger settings are saved (as
-/// preferences): exclusions and filters reset when the app closes.
+/// Only the "Clean selected regions" ticks, the automatic trigger settings and the confirm and
+/// log switches are saved (as preferences): exclusions and filters reset when the app closes.
 pub struct Memory {
     /// `None` if the platform refused to provide system info.
     sampler: Option<Snapshot>,
@@ -163,6 +167,16 @@ pub struct Memory {
     hard_faults: Option<f64>,
     /// Home shows the Advanced tools instead of the overview.
     advanced_open: bool,
+    /// Ask-before-trim and keep-a-log switches (saved), the prompt waiting for an answer, and
+    /// the last clean for the Home line.
+    options: clean_log::Options,
+    pending_confirm: Option<Confirm>,
+    last_result: Option<freed::RunResult>,
+    /// The optional clean log, how many entries it holds, and why the last write or delete
+    /// failed.
+    log_store: clean_log::FileStore,
+    log_count: usize,
+    log_note: Option<String>,
 }
 
 impl Memory {
@@ -237,6 +251,12 @@ impl Memory {
             history: series::History::new(),
             hard_faults: None,
             advanced_open: false,
+            options: clean_log::Options::default(),
+            pending_confirm: None,
+            last_result: None,
+            log_store: clean_log::FileStore::default_location(),
+            log_count: 0,
+            log_note: None,
         }
     }
 
@@ -404,12 +424,16 @@ impl NativeAddon for Memory {
         if !self.preferences_loaded {
             self.regions = regions::Selection::load(preferences);
             self.auto = AutoTriggers::new(AutoSettings::load(preferences));
+            self.options = clean_log::Options::load(preferences);
+            self.log_count = clean_log::load(&self.log_store).len();
             self.preferences_loaded = true;
         }
         self.draw(ui, self.page);
+        self.confirm_ui(ui.ctx());
         let regions_changed = self.regions.store(preferences);
         let auto_changed = self.auto.settings().store(preferences);
-        regions_changed || auto_changed
+        let options_changed = self.options.store(preferences);
+        regions_changed || auto_changed || options_changed
     }
     fn navigate(&mut self, page: &str) {
         self.page = page

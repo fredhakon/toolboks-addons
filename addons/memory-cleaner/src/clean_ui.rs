@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn asking_is_the_default_and_starts_nothing_until_answered() {
-        let mut memory = Memory::new();
+        let mut memory = Memory::for_test();
         memory.ask_or_run(&egui::Context::default(), Confirm::TrimIdle);
         assert_eq!(memory.pending_confirm, Some(Confirm::TrimIdle));
         assert!(!memory.busy());
@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn answering_while_another_job_runs_says_so_instead_of_doing_nothing() {
-        let mut memory = Memory::new();
+        let mut memory = Memory::for_test();
         memory.options.confirm_manual = false;
         memory.refresh_action_pending = true;
         memory.ask_or_run(&egui::Context::default(), Confirm::TrimSelected);
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn a_run_without_readable_numbers_is_recorded_without_claims() {
-        let mut memory = Memory::new();
+        let mut memory = Memory::for_test();
         memory.record_result(
             Trigger::Interval,
             vec!["Idle apps".into()],

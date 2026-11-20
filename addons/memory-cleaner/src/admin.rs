@@ -95,7 +95,7 @@ impl Memory {
     /// Asks for the ticked regions that can run on this Windows. Ignored while busy or when
     /// none is left to run.
     fn start_regions(&mut self) {
-        let selection = self.regions.available(self.windows_version);
+        let selection = self.regions.available(self.windows_version());
         if selection.is_empty() {
             return;
         }
@@ -205,7 +205,7 @@ impl Memory {
         section(ui, "Clean selected regions");
         ui.label(egui::RichText::new(REGIONS_INTRO).weak().small());
         for region in regions::ALL {
-            let reason = region.unavailable(self.windows_version);
+            let reason = region.unavailable(self.windows_version());
             let mut on = reason.is_none() && self.regions.contains(region);
             ui.add_enabled_ui(reason.is_none(), |ui| {
                 if ui.checkbox(&mut on, region.label()).changed() {
@@ -221,7 +221,7 @@ impl Memory {
             }
             unproven_note(ui, region.evidence());
         }
-        let ready = !self.regions.available(self.windows_version).is_empty();
+        let ready = !self.regions.available(self.windows_version()).is_empty();
         let button = ui
             .add_enabled(
                 ready && !self.busy(),
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn a_stale_or_cancelled_answer_changes_nothing_wrong() {
-        let mut memory = Memory::new();
+        let mut memory = Memory::for_test();
         memory.start_purge();
         let id = memory.next_request;
         assert!(memory.busy());
@@ -497,8 +497,8 @@ mod tests {
 
     #[test]
     fn the_region_button_sends_only_what_can_run_and_its_answer_lands_under_it() {
-        let mut memory = Memory::new();
-        memory.windows_version = Some(WindowsVersion { major: 6, minor: 1 });
+        let mut memory = Memory::for_test();
+        memory.windows_version = Some(WindowsVersion { major: 6, minor: 1 }).into();
         memory.regions = Selection::from_bits(0xFF);
         memory.start_regions();
         let id = memory.next_request;
@@ -532,7 +532,7 @@ mod tests {
         let reply = |measured: serde_json::Value| AdminOutcome::Completed {
             json: serde_json::json!({ "text": "done", "measured": measured }).to_string(),
         };
-        let mut memory = Memory::new();
+        let mut memory = Memory::for_test();
         memory.start_purge();
         let id = memory.next_request;
         memory.purge_finished(id, reply(freed::measured_to_json(Some(change), &[])));

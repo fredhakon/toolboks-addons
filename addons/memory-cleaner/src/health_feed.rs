@@ -150,7 +150,7 @@ mod tests {
 
     fn memory(initial: Option<Signals>) -> (Memory, Arc<Mutex<Option<Signals>>>) {
         let shared = Arc::new(Mutex::new(initial));
-        let mut m = Memory::new();
+        let mut m = Memory::for_test();
         m.signals = Some(Box::new(Fake(shared.clone())));
         (m, shared)
     }
@@ -363,7 +363,7 @@ mod tests {
             }
         }
         let count = Arc::new(Mutex::new(0));
-        let mut m = Memory::new();
+        let mut m = Memory::for_test();
         m.signals = Some(Box::new(Counting(count.clone())));
         m.suspend();
         // Fresh: the last reading was just now, so 200 ms ticks read nothing.
@@ -393,6 +393,39 @@ mod tests {
         let (mut m, _) = memory(Some(initial));
         m.suspend();
         m
+    }
+
+    #[test]
+    fn a_memory_that_never_drew_runs_the_hidden_tick_without_a_suspend() {
+        // No `suspend`, no frame: the host sends `Suspend` only after the add-on is already
+        // running, so a fresh one has to be hidden by itself.
+        let (mut m, _) = memory(Some(calm()));
+        assert!(!m.active);
+        m.auto.set_limit(Some(10));
+        let mut starts = Vec::new();
+        hidden_at(&mut m, 100, true, &mut starts);
+        assert_eq!(starts, vec![Trigger::MemoryLimit]);
+        // Hidden: a plain refresh or a manual action still waits for the window.
+        let ctx = egui::Context::default();
+        assert!(!m.request_refresh(&ctx, None));
+    }
+
+    #[test]
+    fn the_first_frame_shows_the_page_without_a_resume() {
+        let (mut m, _) = memory(Some(calm()));
+        m.preferences_loaded = true; // nothing is read from disk
+        m.refresh_in_flight = 1; // only the "collecting" note is drawn, no sampling thread
+        let mut preferences = Default::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(Default::default(), |ui| {
+            m.ui(ui, &mut preferences);
+        });
+        output.drop_without_applying_deltas();
+        assert!(m.active);
+        // Shown: the hidden tick no longer reads on its own.
+        m.last_eval = Instant::now() - eval_interval(false) - Duration::from_millis(1);
+        m.hidden_tick(&mut |_, _| panic!("no run while the page is shown"));
+        assert!(m.signals.is_some());
     }
 
     #[test]
@@ -494,7 +527,7 @@ mod tests {
             }
         }
         let count = Arc::new(Mutex::new(0));
-        let mut m = Memory::new();
+        let mut m = Memory::for_test();
         m.signals = Some(Box::new(Counting(count.clone())));
         m.auto.set_limit(Some(1));
         m.auto.set_interval(Some(1));
@@ -513,7 +546,7 @@ mod tests {
 
     #[test]
     fn a_hidden_add_on_starts_only_automatic_runs() {
-        let mut m = Memory::new();
+        let mut m = Memory::for_test();
         m.suspend();
         let ctx = egui::Context::default();
         assert!(!m.request_refresh(&ctx, None));

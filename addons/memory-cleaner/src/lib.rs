@@ -29,6 +29,7 @@ mod trim;
 mod tutorial;
 mod workbench;
 
+use std::cell::OnceCell;
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -74,6 +75,7 @@ pub struct Memory {
     refresh_worker: Option<RefreshWorker>,
     refresh_in_flight: usize,
     refresh_action_pending: bool,
+    /// Whether the page is shown. Starts `false`: see `Memory::build`.
     active: bool,
     /// Free/modified/standby sizes; `None` if the query is unavailable.
     lists: Option<Lists>,
@@ -111,7 +113,8 @@ pub struct Memory {
     regions: regions::Selection,
     preferences_loaded: bool,
     last_regions: Option<String>,
-    windows_version: Option<regions::WindowsVersion>,
+    /// Read on first use (`windows_version`), not at start-up.
+    windows_version: OnceCell<Option<regions::WindowsVersion>>,
     /// Result of the last action, shown above the table.
     status: Option<String>,
     /// The safe optimize run on a worker thread, what the last one did, and the settle
@@ -132,6 +135,9 @@ pub struct Memory {
     /// Pressure verdict: the model, the Windows readings and the latest assessment.
     pressure: PressureModel,
     signals: Option<Box<dyn SignalSource>>,
+    /// The file name of the app in front, read without a process list while the page is
+    /// hidden. Replaced in tests.
+    foreground_name: Box<dyn Fn() -> Option<String> + Send>,
     assessment: Assessment,
     /// The `memory-pressure` finding for Home: what the last pressure reading said, and the
     /// reading kept for a minute at a time. In memory only.
@@ -181,14 +187,41 @@ pub struct Memory {
 
 impl Memory {
     pub fn new() -> Self {
+        Self::build(
+            memlist::query(),
+            commit::query(),
+            Some(Box::new(WindowsSignals::new())),
+            Box::new(activity::foreground_app_name),
+        )
+    }
+
+    /// A `Memory` that asks Windows nothing: no memory lists, commit or pressure readings, and
+    /// no app in front. Tests add the fakes they need.
+    #[cfg(test)]
+    fn for_test() -> Self {
+        Self::build(None, None, None, Box::new(|| None))
+    }
+
+    fn build(
+        lists: Option<Lists>,
+        commit: Option<commit::Commit>,
+        signals: Option<Box<dyn SignalSource>>,
+        foreground_name: Box<dyn Fn() -> Option<String> + Send>,
+    ) -> Self {
         let epoch = Instant::now();
         Self {
             sampler: None,
             refresh_worker: None,
             refresh_in_flight: 0,
             refresh_action_pending: false,
-            active: true,
-            lists: memlist::query(),
+            // Hidden until the first frame is drawn. The host sends `Suspend` right after the
+            // connection when the add-on was started hidden (toolboks `src/supervisor/mod.rs`,
+            // "if !managed.visible { send(Suspend) }"), but not when the page is opened first,
+            // and a `Resume` only follows a `Suspend`. So `ui` turns this on, and an add-on that
+            // never drew already runs the hidden tick (automatic cleaning) without any
+            // `suspend` call.
+            active: false,
+            lists,
             request: None,
             next_request: 0,
             refresh_after_purge: false,
@@ -210,7 +243,7 @@ impl Memory {
             regions: regions::Selection::default(),
             preferences_loaded: false,
             last_regions: None,
-            windows_version: regions::windows_version(),
+            windows_version: OnceCell::new(),
             status: None,
             run: None,
             last_run: None,
@@ -221,7 +254,8 @@ impl Memory {
             cooldowns: Cooldowns::new(),
             activity: Activity::new(0),
             pressure: PressureModel::new(),
-            signals: Some(Box::new(WindowsSignals::new())),
+            signals,
+            foreground_name,
             health: {
                 // "Not checked yet" until the first pressure reading arrives.
                 let mut tracker = health::Tracker::new();
@@ -244,7 +278,7 @@ impl Memory {
             last_growth: None,
             win_sampler: None,
             breakdown: Default::default(),
-            commit: commit::query(),
+            commit,
             reports: VecDeque::new(),
             selected: home::Metric::Memory,
             range: series::Range::default(),
@@ -409,6 +443,11 @@ impl Memory {
         }
     }
 
+    /// The Windows version, asked on first use (the Advanced page's regions).
+    fn windows_version(&self) -> Option<regions::WindowsVersion> {
+        *self.windows_version.get_or_init(regions::windows_version)
+    }
+
     fn tab_name(&self) -> &'static str {
         match self.tab {
             advanced::Tab::Selected => "selected",
@@ -435,6 +474,8 @@ impl NativeAddon for Memory {
         preferences: &mut std::collections::BTreeMap<String, serde_json::Value>,
     ) -> bool {
         style_once(ui.ctx());
+        // The page is shown (a page opened first gets no `Resume`).
+        self.active = true;
         self.load_prefs(preferences);
         self.draw(ui, self.page);
         self.confirm_ui(ui.ctx());

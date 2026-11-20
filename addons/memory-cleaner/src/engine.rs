@@ -24,9 +24,11 @@ use super::stats::ProcInfo;
 use super::Memory;
 use toolboks_shared::format::size_plain;
 
-/// How often the pressure check runs while the memory page is open and while it is not.
+/// How often the pressure check runs while the memory page is open.
 const EVAL_OPEN: Duration = Duration::from_secs(1);
-const EVAL_BACKGROUND: Duration = Duration::from_secs(10);
+/// How often it runs while the page is hidden (the runtime's background tick, which itself
+/// fires every 200 ms, only checks the time).
+const EVAL_HIDDEN: Duration = Duration::from_secs(10);
 /// The page counts as open if it drew a frame this recently.
 const OPEN_GRACE: Duration = Duration::from_secs(3);
 /// The growth tracker is fed from the process refresh at most this often.
@@ -36,7 +38,7 @@ pub fn eval_interval(page_open: bool) -> Duration {
     if page_open {
         EVAL_OPEN
     } else {
-        EVAL_BACKGROUND
+        EVAL_HIDDEN
     }
 }
 
@@ -340,7 +342,7 @@ impl Memory {
             Some(sampler) => actions::foreground_pid()
                 .and_then(|pid| sampler.processes.iter().find(|p| p.pid == pid))
                 .map(|p| p.name.clone()),
-            None => activity::foreground_app_name(),
+            None => (self.foreground_name)(),
         };
         let now = self.now_ms();
         self.activity.note_foreground(now, name.as_deref());
@@ -981,7 +983,7 @@ mod tests {
     }
 
     fn memory_with_a_report() -> Memory {
-        let mut m = Memory::new();
+        let mut m = Memory::for_test();
         m.sampler = Some(Snapshot {
             totals: Default::default(),
             processes: Vec::new(),
@@ -1025,7 +1027,7 @@ mod tests {
 
     #[test]
     fn a_trigger_run_starts_the_pressure_cooldown_too() {
-        let mut m = Memory::new();
+        let mut m = Memory::for_test();
         m.scheduler.set_enabled(true);
         m.auto.set_limit(Some(70));
         m.record_automatic_run(1_000, "limit".to_string());
@@ -1098,6 +1100,20 @@ mod tests {
                 failed: 1
             }
         );
+    }
+
+    #[test]
+    fn the_app_in_front_is_read_from_the_injected_source_without_a_process_list() {
+        let mut m = Memory::for_test();
+        // 1000 s on the tool's clock, so an app never seen has been idle for all of it.
+        m.epoch = Instant::now() - Duration::from_secs(1000);
+        m.foreground_name = Box::new(|| Some("Chrome.exe".to_string()));
+        assert!(m.sampler.is_none());
+        m.note_foreground();
+        let now = m.now_ms();
+        let idle = |name| m.activity.idle_for(name, now, None, None).unwrap();
+        assert!(idle("chrome.exe") < Duration::from_secs(10));
+        assert!(idle("other.exe") >= Duration::from_secs(1000));
     }
 
     #[test]

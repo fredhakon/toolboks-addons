@@ -192,6 +192,15 @@ it. Nothing is stored between runs, as before.
   helper: a separate elevated process shows its own Confirm / Cancel window and only then runs
   the purge (capability `system_tuning`). The drawing process is never elevated. Trimming idle
   apps, process trims and automatic cleaning need no administrator rights.
+- **Clean selected regions.** On the Advanced page (System tab) the other Mem Reduct regions are
+  opt-in ticks under one "Clean selected regions" button: working set, system file cache,
+  modified file cache, modified page list, full standby list, low-priority standby list,
+  registry cache (Windows 8.1+) and combine memory lists (Windows 10+). Each has a plain note,
+  an "Unproven" evidence label and, for the modified and full standby lists, a freeze warning.
+  The ticks start as Mem Reduct's own set (1, 2, 3, 6, 7, 8) and are saved as a preference, but
+  nothing runs unless the button is pressed, and none of it is part of automatic cleaning. It
+  goes through the same administrator helper (operation `purge_standby`, payload
+  `{"regions": <mask>}`).
 - **Background.** `host-services.json` sets `background: true` so a trim or optimize that is
   running finishes while the window is hidden. Sampling and automatic checks run while the
   window is shown, as in the built-in tool.

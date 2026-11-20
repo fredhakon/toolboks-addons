@@ -24,11 +24,19 @@ use toolboks_shared::win::Handle;
 const SYSTEM_MEMORY_LIST_INFORMATION_CLASS: u32 = 80;
 const STATUS_PRIVILEGE_NOT_HELD: i32 = 0xC000_0061_u32 as i32;
 
-/// `SYSTEM_MEMORY_LIST_COMMAND` values. Only the gentlest one is offered: emptying every
-/// working set, a full standby purge and a modified-list flush are deliberately not available.
+/// `SYSTEM_MEMORY_LIST_COMMAND` values. The three heavier ones are only reachable through the
+/// opt-in "Clean selected regions" action (`regions.rs`), never from automatic mode.
+/// Values checked against the `ntapi` 0.4.3 crate (`MemoryEmptyWorkingSets = 2` to
+/// `MemoryPurgeLowPriorityStandbyList = 5`) and the phnt headers named above.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Command {
+    /// Empty the working set of every process.
+    EmptyWorkingSets = 2,
+    /// Write the modified page list to disk.
+    FlushModifiedList = 3,
+    /// Drop the whole standby list.
+    PurgeStandbyList = 4,
     /// Drop only the lowest-priority cached pages.
     PurgeLowPriorityStandbyList = 5,
 }
@@ -68,7 +76,9 @@ pub enum MemListError {
 type NtQuery = unsafe extern "system" fn(u32, *mut c_void, u32, *mut u32) -> i32;
 type NtSet = unsafe extern "system" fn(u32, *mut c_void, u32) -> i32;
 
-fn ntdll_export(name: windows::core::PCSTR) -> Option<unsafe extern "system" fn() -> isize> {
+pub(crate) fn ntdll_export(
+    name: windows::core::PCSTR,
+) -> Option<unsafe extern "system" fn() -> isize> {
     // SAFETY: ntdll is always loaded; the returned pointer is only used with the matching type.
     unsafe {
         let module = GetModuleHandleW(w!("ntdll.dll")).ok()?;
@@ -149,7 +159,7 @@ pub fn standby_breakdown() -> Option<StandbyBreakdown> {
     Some(StandbyBreakdown::from_raw(&raw, page_size()))
 }
 
-fn enable_privilege(name: PCWSTR) -> bool {
+pub(crate) fn enable_privilege(name: PCWSTR) -> bool {
     let mut token = HANDLE::default();
     // SAFETY: `token` is a valid out-parameter; the handle is wrapped for closing right away.
     if unsafe {
@@ -186,7 +196,7 @@ fn enable_privilege(name: PCWSTR) -> bool {
     }
 }
 
-fn classify(status: i32) -> Result<(), MemListError> {
+pub(crate) fn classify(status: i32) -> Result<(), MemListError> {
     match status {
         s if s >= 0 => Ok(()),
         STATUS_PRIVILEGE_NOT_HELD => Err(MemListError::NotElevated),
@@ -241,7 +251,13 @@ fn run_with(backend: &mut dyn CommandBackend, command: Command) -> Result<(), Me
 /// process: returns `Err(MemListError::NotElevated)` otherwise, so the UI can hide or disable
 /// the action and explain why. Never changes commit. Never call this automatically.
 pub fn purge_low_priority_standby() -> Result<(), MemListError> {
-    run_with(&mut RealBackend, Command::PurgeLowPriorityStandbyList)
+    run(Command::PurgeLowPriorityStandbyList)
+}
+
+/// Sends one memory list command with the same privilege and error handling as the purge above.
+/// Only the opt-in "Clean selected regions" action calls this. Never call it automatically.
+pub fn run(command: Command) -> Result<(), MemListError> {
+    run_with(&mut RealBackend, command)
 }
 
 #[cfg(test)]
@@ -252,7 +268,23 @@ mod tests {
     fn command_values_match_the_nt_enum() {
         // SYSTEM_MEMORY_LIST_COMMAND: ... MemoryEmptyWorkingSets = 2, MemoryFlushModifiedList = 3,
         // MemoryPurgeStandbyList = 4, MemoryPurgeLowPriorityStandbyList = 5.
+        assert_eq!(Command::EmptyWorkingSets as u32, 2);
+        assert_eq!(Command::FlushModifiedList as u32, 3);
+        assert_eq!(Command::PurgeStandbyList as u32, 4);
         assert_eq!(Command::PurgeLowPriorityStandbyList as u32, 5);
+    }
+
+    #[test]
+    fn every_command_sends_exactly_its_own_value() {
+        for (command, value) in [
+            (Command::EmptyWorkingSets, 2),
+            (Command::FlushModifiedList, 3),
+            (Command::PurgeStandbyList, 4),
+        ] {
+            let mut f = fake(true, Some(0));
+            assert_eq!(run_with(&mut f, command), Ok(()));
+            assert_eq!(f.sent, vec![value]);
+        }
     }
 
     #[test]

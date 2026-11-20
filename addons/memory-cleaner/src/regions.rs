@@ -27,7 +27,8 @@ use toolboks_shared::win::Handle;
 use super::admin::failure_text;
 use super::memlist::{self, Command, MemListError};
 
-/// `GetDriveTypeW` result for a fixed disk (documented value 3; the crate has no constant).
+/// `GetDriveTypeW` result for a fixed disk (documented value 3). The crate has it only behind the
+/// `Win32_System_WindowsProgramming` feature, which is not enabled here.
 const DRIVE_FIXED: u32 = 3;
 
 /// The preference key the selection is saved under (a number: bit 0 is region 1).
@@ -159,7 +160,7 @@ impl Region {
     /// One plain sentence on what the region is and what it does.
     pub fn note(self) -> &'static str {
         match self {
-            Region::WorkingSet => "Asks Windows to move the memory every app is not using right now out of RAM. Apps can be slower for a moment when they need it back.",
+            Region::WorkingSet => "Asks Windows to take every page out of every app's working set. The pages go to the cache lists and stay in RAM, and apps read them back when they need them, so they can be slower for a moment. This includes games that are running (the per-app rule that skips games cannot apply here); they can stutter while they read their memory back.",
             Region::SystemFileCache => "Shrinks the memory Windows itself uses to keep recently read files at hand. Windows refills it as files are used.",
             Region::ModifiedFileCache => "Writes file data that is still waiting in memory out to every fixed drive. Nothing is lost; it only moves the writing forward.",
             Region::ModifiedPageList => "Writes memory pages that changed but were not saved yet out to disk, so they can be reused.",
@@ -298,8 +299,8 @@ pub enum RegionError {
     Memory(MemListError),
     /// The region cannot run on this Windows version (the clause from `Region::unavailable`).
     Unavailable(&'static str),
-    /// Flushing the drives did not fully work. `code` is the last failing HRESULT, or 0 if no
-    /// error was reported (no fixed drive was found).
+    /// No drive could be flushed. `code` is the last failing HRESULT, or 0 if no error was
+    /// reported (no fixed drive was found). Flushing some drives and not others is not an error.
     Volumes {
         flushed: u32,
         failed: u32,
@@ -340,14 +341,21 @@ impl RegionError {
 pub struct Outcome {
     pub region: Region,
     pub result: Result<(), RegionError>,
+    /// Drives that refused the flush while at least one other drive was flushed (EFI, Recovery
+    /// and locked volumes can refuse); the region still counts as done.
+    pub drives_failed: u32,
 }
 
 /// The result line, and whether at least one region worked (so something changed).
 pub fn summary(outcomes: &[Outcome]) -> (String, bool) {
-    let done: Vec<&str> = outcomes
+    let done: Vec<String> = outcomes
         .iter()
         .filter(|o| o.result.is_ok())
-        .map(|o| o.region.label())
+        .map(|o| match o.drives_failed {
+            0 => o.region.label().to_string(),
+            1 => format!("{} (1 drive could not be flushed)", o.region.label()),
+            n => format!("{} ({n} drives could not be flushed)", o.region.label()),
+        })
         .collect();
     let failed: Vec<String> = outcomes
         .iter()
@@ -372,7 +380,8 @@ trait Backend {
     fn version(&self) -> Option<WindowsVersion>;
     fn list_command(&mut self, command: Command) -> Result<(), MemListError>;
     fn set_info(&mut self, info: Info) -> Result<(), MemListError>;
-    fn flush_volumes(&mut self) -> Result<(), RegionError>;
+    /// `Ok` holds the number of drives that failed while at least one other was flushed.
+    fn flush_volumes(&mut self) -> Result<u32, RegionError>;
 }
 
 /// Runs the ticked regions in order. A failing region never stops the ones after it.
@@ -381,6 +390,7 @@ fn run_selected(backend: &mut dyn Backend, selection: Selection) -> Vec<Outcome>
     selection
         .regions()
         .map(|region| {
+            let mut drives_failed = 0;
             let result = match region.unavailable(version) {
                 Some(reason) => Err(RegionError::Unavailable(reason)),
                 None => match region.action() {
@@ -388,10 +398,14 @@ fn run_selected(backend: &mut dyn Backend, selection: Selection) -> Vec<Outcome>
                         backend.list_command(command).map_err(RegionError::Memory)
                     }
                     Action::Info(info) => backend.set_info(info).map_err(RegionError::Memory),
-                    Action::FlushVolumes => backend.flush_volumes(),
+                    Action::FlushVolumes => backend.flush_volumes().map(|n| drives_failed = n),
                 },
             };
-            Outcome { region, result }
+            Outcome {
+                region,
+                result,
+                drives_failed,
+            }
         })
         .collect()
 }
@@ -485,7 +499,7 @@ impl Backend for RealBackend {
         memlist::classify(status)
     }
 
-    fn flush_volumes(&mut self) -> Result<(), RegionError> {
+    fn flush_volumes(&mut self) -> Result<u32, RegionError> {
         // `\\?\Volume{GUID}\` is 49 characters; 64 leaves room for the terminator.
         let mut name = [0u16; 64];
         // SAFETY: `name` is a valid buffer; the find handle is closed below.
@@ -511,8 +525,8 @@ impl Backend for RealBackend {
         }
         // SAFETY: `find` is closed exactly once, and not used afterwards.
         let _ = unsafe { FindVolumeClose(find) };
-        if failed == 0 && flushed > 0 {
-            Ok(())
+        if flushed > 0 {
+            Ok(failed)
         } else {
             Err(RegionError::Volumes {
                 flushed,
@@ -578,7 +592,7 @@ mod tests {
         version: Option<WindowsVersion>,
         calls: Vec<Call>,
         error: Option<MemListError>,
-        volumes: Result<(), RegionError>,
+        volumes: Result<u32, RegionError>,
     }
 
     fn fake(version: Option<WindowsVersion>) -> Fake {
@@ -586,7 +600,7 @@ mod tests {
             version,
             calls: Vec::new(),
             error: None,
-            volumes: Ok(()),
+            volumes: Ok(0),
         }
     }
 
@@ -602,7 +616,7 @@ mod tests {
             self.calls.push(Call::Info(info));
             self.error.map_or(Ok(()), Err)
         }
-        fn flush_volumes(&mut self) -> Result<(), RegionError> {
+        fn flush_volumes(&mut self) -> Result<u32, RegionError> {
             self.calls.push(Call::Volumes);
             self.volumes
         }
@@ -812,8 +826,8 @@ mod tests {
     fn one_failure_does_not_stop_the_rest_and_the_text_names_it() {
         let mut backend = fake(Some(V11));
         backend.volumes = Err(RegionError::Volumes {
-            flushed: 1,
-            failed: 1,
+            flushed: 0,
+            failed: 2,
             code: 0x8007_0005_u32 as i32,
         });
         let outcomes = run_selected(&mut backend, Selection::default());
@@ -821,11 +835,31 @@ mod tests {
         let (text, any_ok) = summary(&outcomes);
         assert!(any_ok);
         assert!(
-            text.contains("Modified file cache flushed 1 of 2 drives: Windows error 0x80070005"),
+            text.contains("Modified file cache flushed 0 of 2 drives: Windows error 0x80070005"),
             "{text}"
         );
         assert!(
             text.starts_with("Cleaned: Working set (all apps), System file cache, "),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_region_is_done_when_one_drive_flushed_and_the_text_counts_the_others() {
+        let mut backend = fake(Some(V11));
+        backend.volumes = Ok(2);
+        let outcomes = run_selected(&mut backend, Selection::default());
+        let (text, any_ok) = summary(&outcomes);
+        assert!(any_ok);
+        assert!(!text.contains("Not done"), "{text}");
+        assert!(
+            text.contains("Modified file cache (2 drives could not be flushed)"),
+            "{text}"
+        );
+        backend.volumes = Ok(1);
+        let (text, _) = summary(&run_selected(&mut backend, Selection::default()));
+        assert!(
+            text.contains("Modified file cache (1 drive could not be flushed)"),
             "{text}"
         );
     }

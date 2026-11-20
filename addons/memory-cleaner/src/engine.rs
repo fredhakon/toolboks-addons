@@ -16,7 +16,7 @@ use super::activity::{self, Activity};
 use super::auto_triggers;
 use super::freed::{self, Change};
 use super::growth::{self, WindowsPrivateMemory};
-use super::pressure::{Assessment, Verdict};
+use super::pressure::{Assessment, Signals, Verdict};
 use super::report::{self, HonestReport, RunMeasurement, RunMeasurements, Trigger};
 use super::sampler::{WindowsSampler, WorkingSets};
 use super::scheduler::Decision;
@@ -333,25 +333,42 @@ impl Memory {
         });
     }
 
-    fn note_foreground(&mut self) {
-        let Some(sampler) = self.sampler.as_ref() else {
-            return;
+    /// Notes the app in front. Without a process list (the window is hidden) its name is read
+    /// directly, so an app used a moment ago is not mistaken for one that was idle all along.
+    pub(super) fn note_foreground(&mut self) {
+        let name = match self.sampler.as_ref() {
+            Some(sampler) => actions::foreground_pid()
+                .and_then(|pid| sampler.processes.iter().find(|p| p.pid == pid))
+                .map(|p| p.name.clone()),
+            None => activity::foreground_app_name(),
         };
-        let name = actions::foreground_pid()
-            .and_then(|pid| sampler.processes.iter().find(|p| p.pid == pid))
-            .map(|p| p.name.clone());
         let now = self.now_ms();
         self.activity.note_foreground(now, name.as_deref());
     }
 
-    /// One pressure reading, then the scheduler's answer to it, then the memory-limit and
-    /// interval triggers (the scheduler's run wins when both are due).
+    /// One pressure reading, then the automatic decision on it.
     fn evaluate(&mut self, ctx: &egui::Context) {
         let now = self.now_ms();
         let Some((signals, assessment)) = self.read_pressure(now, super::health_feed::unix_now())
         else {
             return;
         };
+        self.automatic_check(now, &signals, assessment, &mut |m, trigger| {
+            m.start_run(ctx, trigger)
+        });
+    }
+
+    /// The scheduler's answer to a pressure reading, then the memory-limit and interval triggers
+    /// (the scheduler's run wins when both are due). Shared by the page's frame and the hidden
+    /// tick, so both decide the same way; `start` starts a run and says whether one was
+    /// attempted (`false` while another job is busy, so the run is retried on the next reading).
+    pub(super) fn automatic_check(
+        &mut self,
+        now: u64,
+        signals: &Signals,
+        assessment: Assessment,
+        start: &mut dyn FnMut(&mut Self, Trigger) -> bool,
+    ) {
         let commit_fraction = if signals.commit_limit > 0 {
             signals.commit_used as f64 / signals.commit_limit as f64
         } else {
@@ -370,7 +387,7 @@ impl Memory {
             Decision::Advise(text) => self.advice = Some(text),
             Decision::Run { trigger } => {
                 self.advice = None;
-                if self.start_run(ctx, Trigger::Pressure) {
+                if start(self, Trigger::Pressure) {
                     self.record_automatic_run(now, trigger);
                     return;
                 }
@@ -378,7 +395,7 @@ impl Memory {
         }
         // The pressure scheduler had nothing to run (or was busy): the user's own triggers.
         if let Some(fire) = fire {
-            if self.start_run(ctx, fire.trigger()) {
+            if start(self, fire.trigger()) {
                 self.record_automatic_run(now, fire.text());
             }
         }

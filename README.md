@@ -202,8 +202,11 @@ it. Nothing is stored between runs, as before.
   goes through the same administrator helper (operation `purge_standby`, payload
   `{"regions": <mask>}`).
 - **Background.** `host-services.json` sets `background: true` so a trim or optimize that is
-  running finishes while the window is hidden. Sampling and automatic checks run while the
-  window is shown, as in the built-in tool.
+  running finishes while the window is hidden. Automatic cleaning (the pressure scheduler and
+  the user's memory-limit and interval triggers) keeps running while the window is hidden: the
+  runtime's 200 ms background tick takes one pressure reading every 10 s, decides with the same
+  code the page uses, and starts the run through the same path. No process list is kept
+  hidden; a run takes one when it starts. Between readings the tick costs two time comparisons.
 - **Status bar.** The `RAM nn%` item is sent through the host's status services.
 - The guided tour has the same twelve steps.
 

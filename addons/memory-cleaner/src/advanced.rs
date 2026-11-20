@@ -397,12 +397,12 @@ impl Memory {
     }
 
     /// The state of automatic cleaning; the switch itself is on the Home page.
-    fn automatic_status(&self, ui: &mut egui::Ui) {
+    fn automatic_status(&mut self, ui: &mut egui::Ui) {
         section(ui, "Automatic cleaning");
         stat_row(ui, "Status", self.scheduler.status(self.now_ms()));
         ui.label(
             RichText::new(
-                "Switch it on from the Home page. It is off by default and only acts when                  memory is really short, at most once an hour.",
+                "Switch it on from the Home page. It is off by default and only acts when memory is really short, at most once an hour. Any automatic clean, including the ones started by the limit or interval below, also holds this one back for that hour. The memory-limit and interval triggers below have their own settings.",
             )
             .weak()
             .small(),
@@ -410,6 +410,8 @@ impl Memory {
         if let Some(line) = super::engine::verdict_line(&self.assessment) {
             ui.label(RichText::new(line).small());
         }
+        ui.separator();
+        self.auto_triggers_ui(ui);
     }
 
     fn selected_tab(&mut self, ui: &mut egui::Ui) {

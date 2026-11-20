@@ -13,8 +13,6 @@
 //! caller reports the run with `record_run`. A manual run never calls `record_run`, so it
 //! never consumes the automatic cooldown.
 
-#![allow(dead_code)] // wired in by the integration slice
-
 use super::pressure::{Assessment, Verdict};
 
 /// Every tunable number in one place.

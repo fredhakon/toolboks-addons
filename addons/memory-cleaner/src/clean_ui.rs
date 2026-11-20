@@ -20,6 +20,8 @@ pub enum Confirm {
     TrimSelected,
 }
 
+const BUSY_TEXT: &str = "A run is already going. Try again when it has finished.";
+
 impl Confirm {
     fn title(self, selected: usize) -> String {
         match self {
@@ -55,6 +57,11 @@ impl Memory {
     }
 
     fn run_confirmed(&mut self, ctx: &egui::Context, action: Confirm) {
+        // An automatic run can start while the prompt is open; say why nothing happens.
+        if self.busy() {
+            self.status = Some(BUSY_TEXT.to_string());
+            return;
+        }
         match action {
             Confirm::TrimIdle => {
                 self.start_run(ctx, Trigger::Manual);
@@ -176,5 +183,42 @@ impl Memory {
             }
             Err(e) => self.log_note = Some(format!("Could not delete the clean log: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asking_is_the_default_and_starts_nothing_until_answered() {
+        let mut memory = Memory::new();
+        memory.ask_or_run(&egui::Context::default(), Confirm::TrimIdle);
+        assert_eq!(memory.pending_confirm, Some(Confirm::TrimIdle));
+        assert!(!memory.busy());
+    }
+
+    #[test]
+    fn answering_while_another_job_runs_says_so_instead_of_doing_nothing() {
+        let mut memory = Memory::new();
+        memory.options.confirm_manual = false;
+        memory.refresh_action_pending = true;
+        memory.ask_or_run(&egui::Context::default(), Confirm::TrimSelected);
+        assert_eq!(memory.pending_confirm, None);
+        assert_eq!(memory.status.as_deref(), Some(BUSY_TEXT));
+    }
+
+    #[test]
+    fn a_run_without_readable_numbers_is_recorded_without_claims() {
+        let mut memory = Memory::new();
+        memory.record_result(
+            Trigger::Interval,
+            vec!["Idle apps".into()],
+            None,
+            Vec::new(),
+        );
+        let result = memory.last_result.unwrap();
+        assert_eq!(result.change, None);
+        assert!(result.headline().starts_with("Auto interval, "));
     }
 }

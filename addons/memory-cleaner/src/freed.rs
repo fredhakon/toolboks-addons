@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 
 use toolboks_shared::format::size_plain;
 
+use super::clean_log::MAX_FIELD;
 use super::memlist::Lists;
+use super::regions::ALL;
 use super::report::{self, RunMeasurement, Trigger};
 
 /// Memory in use before minus memory in use after; 0 if it rose.
@@ -25,7 +27,7 @@ pub fn freed(used_before: u64, used_after: u64) -> u64 {
 }
 
 fn signed(before: u64, after: u64) -> i64 {
-    after as i64 - before as i64
+    (i128::from(after) - i128::from(before)).clamp(i64::MIN.into(), i64::MAX.into()) as i64
 }
 
 fn signed_size(bytes: i64) -> String {
@@ -96,7 +98,7 @@ impl Change {
             signed_size(self.modified)
         ));
         match self.disk_reads {
-            Some(v) => text.push_str(&format!(" Disk reads after the run: {v:.0} pages/s.")),
+            Some(v) => text.push_str(&format!(" Disk reads (latest reading): {v:.0} pages/s.")),
             None => text.push_str(" Disk reads were not measured."),
         }
         text
@@ -137,9 +139,10 @@ pub fn parts_text(parts: &[(String, Option<Change>)]) -> Vec<String> {
         .iter()
         .map(|(label, change)| match change {
             Some(c) => format!(
-                "{label}: freed {}, standby {}.",
+                "{label}: freed {}, standby {}, modified {}.",
                 size_plain(c.freed),
-                signed_size(c.standby)
+                signed_size(c.standby),
+                signed_size(c.modified)
             ),
             None => format!("{label}: not measured."),
         })
@@ -174,8 +177,10 @@ pub fn measured_from_json(value: &Value) -> (Option<Change>, Vec<(String, Option
         .map(|parts| {
             parts
                 .iter()
+                // The helper is a separate process: bound what it can make us show and log.
+                .take(ALL.len())
                 .filter_map(|p| {
-                    let label = p.get("label")?.as_str()?.to_string();
+                    let label = p.get("label")?.as_str()?.chars().take(MAX_FIELD).collect();
                     Some((label, p.get("change").and_then(Change::from_json)))
                 })
                 .collect()
@@ -282,7 +287,7 @@ mod tests {
         let plain = Change::between(lists(1000, 500, 0), lists(1100, 500, 0), Some(7.4)).text();
         assert!(!plain.contains("standby cache"), "{plain}");
         assert!(
-            plain.ends_with("Disk reads after the run: 7 pages/s."),
+            plain.ends_with("Disk reads (latest reading): 7 pages/s."),
             "{plain}"
         );
     }
@@ -302,7 +307,10 @@ mod tests {
             ("Working set".to_string(), Some(c)),
             ("Combine".to_string(), None),
         ]);
-        assert_eq!(lines[0], "Working set: freed 200 MB, standby +100 MB.");
+        assert_eq!(
+            lines[0],
+            "Working set: freed 200 MB, standby +100 MB, modified +0 MB."
+        );
         assert_eq!(lines[1], "Combine: not measured.");
         assert!(lines[2].contains("other programs"));
         assert!(parts_text(&[]).is_empty());
@@ -326,6 +334,23 @@ mod tests {
         assert_eq!(measured_from_json(&Value::Null), (None, Vec::new()));
         let (_, parts) = measured_from_json(&json!({"parts": [{"label": 5}, {"label": "A"}]}));
         assert_eq!(parts, vec![("A".to_string(), None)]);
+    }
+
+    #[test]
+    fn helper_labels_are_cut_and_counted() {
+        let many: Vec<Value> = (0..20)
+            .map(|i| json!({"label": format!("{i}{}", "x".repeat(500))}))
+            .collect();
+        let (_, parts) = measured_from_json(&json!({ "parts": many }));
+        assert_eq!(parts.len(), ALL.len());
+        assert!(parts.iter().all(|(l, _)| l.chars().count() == MAX_FIELD));
+    }
+
+    #[test]
+    fn signed_change_never_wraps() {
+        assert_eq!(signed(0, u64::MAX), i64::MAX);
+        assert_eq!(signed(u64::MAX, 0), i64::MIN);
+        assert_eq!(signed(10, 4), -6);
     }
 
     #[test]

@@ -18,7 +18,9 @@ use super::ID;
 pub const MAX_ENTRIES: usize = 200;
 pub const MAX_BYTES: usize = 32 * 1024;
 /// Longest text kept per field when reading, so a hand-edited file cannot grow the log.
-const MAX_FIELD: usize = 64;
+pub const MAX_FIELD: usize = 64;
+/// A log file above this is not ours (we write at most `MAX_BYTES`): it is not read.
+const MAX_READ: u64 = 4 * MAX_BYTES as u64;
 const FILE_NAME: &str = "clean-log.json";
 const PREFERENCE_KEY: &str = "clean_options";
 
@@ -141,6 +143,9 @@ impl FileStore {
 
 impl Store for FileStore {
     fn read(&self) -> Option<String> {
+        if std::fs::metadata(&self.0).ok()?.len() > MAX_READ {
+            return None;
+        }
         std::fs::read_to_string(&self.0).ok()
     }
 
@@ -149,10 +154,16 @@ impl Store for FileStore {
     }
 
     fn delete(&mut self) -> Result<(), String> {
-        match std::fs::remove_file(&self.0) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
-            _ => Ok(()),
+        // `write_atomic` stages in `<name>.pending`; an interrupted write can leave it behind.
+        let mut pending = self.0.clone().into_os_string();
+        pending.push(".pending");
+        for path in [self.0.clone(), PathBuf::from(pending)] {
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
+                _ => {}
+            }
         }
+        Ok(())
     }
 }
 
@@ -345,6 +356,24 @@ mod tests {
         assert_eq!(load(&store), vec![entry(1)]);
         store.delete().unwrap();
         assert!(load(&store).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_over_the_read_cap_is_an_empty_log_and_delete_clears_a_leftover_pending_file() {
+        let dir = std::env::temp_dir().join(format!("tb-memory-log-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(FILE_NAME);
+        let pending = dir.join(format!("{FILE_NAME}.pending"));
+        std::fs::write(&path, " ".repeat(MAX_READ as usize + 1)).unwrap();
+        std::fs::write(&pending, "[]").unwrap();
+        let mut store = FileStore(path.clone());
+        assert!(load(&store).is_empty());
+        // The next clean replaces the oversized file with a normal one.
+        append(&mut store, entry(1)).unwrap();
+        assert_eq!(load(&store), vec![entry(1)]);
+        store.delete().unwrap();
+        assert!(!path.exists() && !pending.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

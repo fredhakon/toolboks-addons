@@ -136,15 +136,16 @@ impl Memory {
             AdminOutcome::Failed { reason } => reason,
             AdminOutcome::Completed { json } => {
                 let value = serde_json::from_str::<serde_json::Value>(&json).unwrap_or_default();
-                if regions {
-                    let (whole, parts) = freed::measured_from_json(&value["measured"]);
-                    self.record_result(
-                        report::Trigger::Manual,
+                let (whole, parts) = freed::measured_from_json(&value["measured"]);
+                let (what, detail) = if regions {
+                    (
                         parts.iter().map(|(label, _)| label.clone()).collect(),
-                        whole,
                         freed::parts_text(&parts),
-                    );
-                }
+                    )
+                } else {
+                    (vec!["Low-priority cache".to_string()], Vec::new())
+                };
+                self.record_result(report::Trigger::Manual, what, whole, detail);
                 value["text"]
                     .as_str()
                     .map(str::to_string)
@@ -334,11 +335,19 @@ impl AdminChange for PurgeChange {
     }
     fn apply(self: Box<Self>) -> Result<String, String> {
         let before = memlist::standby_breakdown();
+        let lists_before = memlist::query();
         let result = memlist::purge_low_priority_standby();
         let after = memlist::standby_breakdown();
+        let whole = lists_before
+            .zip(memlist::query())
+            .map(|(b, a)| Change::between(b, a, None));
         let text = purge_text(result, before, after);
         match result {
-            Ok(()) => Ok(serde_json::json!({ "text": text }).to_string()),
+            Ok(()) => Ok(serde_json::json!({
+                "text": text,
+                "measured": freed::measured_to_json(whole, &[]),
+            })
+            .to_string()),
             Err(_) => Err(text),
         }
     }
@@ -510,5 +519,31 @@ mod tests {
         memory.regions = Selection::from_bits(0b1100_0000);
         memory.start_regions();
         assert!(memory.purge.is_none() && memory.take_request_for_test().is_none());
+    }
+
+    #[test]
+    fn a_finished_purge_reaches_the_home_line_and_a_reply_without_numbers_claims_none() {
+        let lists = |free: u64, standby: u64| memlist::Lists {
+            free: free << 20,
+            standby: standby << 20,
+            modified: 0,
+        };
+        let change = Change::between(lists(100, 900), lists(100, 300), None);
+        let reply = |measured: serde_json::Value| AdminOutcome::Completed {
+            json: serde_json::json!({ "text": "done", "measured": measured }).to_string(),
+        };
+        let mut memory = Memory::new();
+        memory.start_purge();
+        let id = memory.next_request;
+        memory.purge_finished(id, reply(freed::measured_to_json(Some(change), &[])));
+        let result = memory.last_result.clone().unwrap();
+        assert_eq!(result.what, ["Low-priority cache"]);
+        assert_eq!(result.change, Some(change));
+        assert_eq!(result.change.unwrap().standby, -(600 << 20));
+
+        memory.start_purge();
+        let id = memory.next_request;
+        memory.purge_finished(id, reply(serde_json::Value::Null));
+        assert_eq!(memory.last_result.unwrap().change, None);
     }
 }

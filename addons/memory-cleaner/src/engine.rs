@@ -534,6 +534,8 @@ impl Memory {
             .get_or_insert_with(WindowsSampler::new)
             .sample_verified(&trimmed)
         else {
+            // The run happened; say so, without claiming numbers that were never read.
+            self.record_result(job.trigger, vec!["Idle apps".to_string()], None, Vec::new());
             self.status = Some("Could not read the memory numbers after the run.".to_string());
             return;
         };
@@ -542,6 +544,7 @@ impl Memory {
             paired_working_sets(&job.before_sets, &after_sets);
         before.private_ws = before_ws;
         after.private_ws = after_ws;
+        let paired = trim_processes.len();
         let settling = Settling::new(
             job.trigger,
             summary.trimmed,
@@ -557,7 +560,7 @@ impl Memory {
             job.trigger,
             vec!["Idle apps".to_string()],
             Some(Change::from_readings(&before, &after)),
-            vec![freed::apps_text(summary.trimmed, before_ws, after_ws)],
+            vec![freed::apps_text(paired, before_ws, after_ws)],
         );
         report::push_report(&mut self.reports, settling.report());
         self.settling = Some(settling);

@@ -16,7 +16,6 @@ use toolchain::{Status, Toolchain};
 pub const ID: &str = "toolboks.sdk-addon";
 /// The saved preference: the folder chosen last.
 const LAST_FOLDER: &str = "last_folder";
-const RUSTUP: &str = "https://rustup.rs";
 /// The widest the page's column grows.
 const COLUMN: f32 = 680.0;
 const LABEL_WIDTH: f32 = 110.0;
@@ -35,6 +34,8 @@ pub struct SdkAddon {
     outcome: Option<Result<PathBuf, String>>,
     opening: Option<Receiver<Result<(), String>>>,
     open_error: Option<String>,
+    /// What happened when Install Rust was pressed: `Ok` once its PowerShell window opened.
+    install: Option<Result<(), String>>,
 }
 
 /// A worker's answer, once it is there. A worker that ended without one counts as `gone`.
@@ -119,24 +120,44 @@ impl SdkAddon {
         ui::card(ui, width, 0.0, |ui| {
             status_row(ui, "Rust", &toolchain.rust);
             status_row(ui, "Visual C++ build tools", &toolchain.build_tools);
-            if toolchain.rust == Status::Missing || toolchain.build_tools == Status::Missing {
-                ui.label(
-                    RichText::new(
-                        "Install Rust from rustup.rs; its installer also offers the Visual C++ \
-                         build tools. Toolboks does not install them for you. Then press Check again.",
-                    )
-                    .size(ui::TEXT_CAPTION)
-                    .color(ui::MUTED),
+            let rust_missing = toolchain.rust == Status::Missing;
+            if rust_missing {
+                note(
+                    ui,
+                    "Press Install Rust: a PowerShell window opens and runs the official Rust \
+                     installer (rustup), which also offers the Visual C++ build tools if they \
+                     are missing. Nothing is installed until you press the button. When the \
+                     window says it is done, press Check again.",
+                    ui::MUTED,
+                );
+            } else if toolchain.build_tools == Status::Missing {
+                note(
+                    ui,
+                    "Install the Visual Studio Build Tools with the \"Desktop development with \
+                     C++\" workload, then press Check again.",
+                    ui::MUTED,
                 );
             }
+            match &self.install {
+                Some(Ok(())) => note(
+                    ui,
+                    "The installer is open in a PowerShell window. Follow it there.",
+                    ui::MUTED,
+                ),
+                Some(Err(error)) => note(ui, error, ui::RED),
+                None => {}
+            }
             ui.horizontal(|ui| {
-                ui.hyperlink_to("Get Rust from rustup.rs", RUSTUP);
-                ui.add_space(ui::SPACE_M);
+                if rust_missing && ui.add(primary("Install Rust")).clicked() {
+                    self.install = Some(shell::install_rust());
+                    ui.ctx().request_repaint();
+                }
                 let checking = self.toolchain_check.is_some();
                 again = ui.add_enabled(!checking, outlined("Check again")).clicked();
             });
         });
         if again {
+            self.install = None;
             self.check_toolchain(ui.ctx());
         }
     }
@@ -543,6 +564,26 @@ mod tests {
         assert!(addon.can_create());
         addon.form.accent = "green".into();
         assert!(!addon.can_create());
+    }
+
+    /// With Rust missing the page offers Install Rust, and draws both with and without an error
+    /// from the installer window. Nothing is installed by drawing.
+    #[test]
+    fn a_missing_rust_offers_the_install_button_without_installing() {
+        let mut addon = SdkAddon {
+            toolchain: Some(Toolchain {
+                rust: Status::Missing,
+                build_tools: Status::Missing,
+            }),
+            ..SdkAddon::default()
+        };
+        let mut preferences = BTreeMap::new();
+        frame(&mut addon, &mut preferences);
+        assert!(addon.install.is_none());
+        addon.install = Some(Err("Could not open PowerShell: gone".into()));
+        frame(&mut addon, &mut preferences);
+        addon.install = Some(Ok(()));
+        frame(&mut addon, &mut preferences);
     }
 
     /// The page draws headlessly with nothing chosen and with a result, and the toolchain check

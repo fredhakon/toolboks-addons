@@ -48,6 +48,15 @@ jobs:
           "$hash  $env:ADDON.exe" | Set-Content -LiteralPath "$exe.sha256" -Encoding ascii
           $size = (Get-Item -LiteralPath $exe).Length
           "### $env:ADDON`nExecutable size: $size bytes" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          # An add-on with its own picture ("icon": "custom") ships addons/<name>/icon.png next to
+          # the exe; the catalog entry points at that release asset. Other add-ons upload no icon.
+          $manifest = Get-Content -Raw -LiteralPath "addons/$env:ADDON/$env:ADDON.tbaddon" | ConvertFrom-Json
+          if ($manifest.manifest.icon -ceq 'custom') {
+            $icon = "addons/$env:ADDON/icon.png"
+            if (!(Test-Path -LiteralPath $icon -PathType Leaf)) { throw "$icon is missing; the manifest's icon is custom" }
+            Copy-Item -LiteralPath $icon dist/icon.png
+            "Icon: $((Get-Item -LiteralPath dist/icon.png).Length) bytes" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: verified-addon
@@ -110,6 +119,13 @@ jobs:
           # Use the released manifest, protocol pin and tooling against main's index.
           Copy-Item catalog/index.json release-source/catalog/index.json
           $exe = (Resolve-Path "dist/$env:ADDON.exe").Path
+          # catalog-update reads a custom icon from addons/<name>/icon.png of the released commit;
+          # it must be the file the publish job uploaded.
+          if (Test-Path -LiteralPath dist/icon.png) {
+            $uploaded = (Get-FileHash -LiteralPath dist/icon.png -Algorithm SHA256).Hash
+            $source = (Get-FileHash -LiteralPath "release-source/addons/$env:ADDON/icon.png" -Algorithm SHA256).Hash
+            if ($uploaded -ne $source) { throw 'The uploaded icon.png differs from the released source' }
+          }
           Push-Location release-source
           cargo run --locked -p addon-repo -- catalog-update $env:ADDON $env:VERSION $env:REPOSITORY $exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -335,3 +335,127 @@ fn checks_and_minimum_host_are_copied_and_validated() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("0.16.0"));
 }
+
+/// A PNG signature and header for a `side` x `side` picture: what the host's checker reads.
+fn png(side: u32) -> Vec<u8> {
+    let mut bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+    bytes.extend(13u32.to_be_bytes());
+    bytes.extend(b"IHDR");
+    bytes.extend(side.to_be_bytes());
+    bytes.extend(side.to_be_bytes());
+    bytes.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    bytes
+}
+
+/// An add-on with its own picture: `catalog-update` refuses it without a good `icon.png`, then
+/// fills the three icon fields from that file and raises the minimum host to the first that draws
+/// it; `validate` fails when the file and the entry of the current version no longer agree, or
+/// when the entry allows an older host. A named icon still gets none of the fields.
+#[test]
+fn custom_icon_is_checked_copied_and_validated() {
+    let tmp = tempfile::Builder::new()
+        .prefix("toolboks-addon-custom-icon-")
+        .tempdir()
+        .unwrap();
+    let root = tmp.path().to_path_buf();
+    fs::create_dir_all(root.join("addons/hello")).unwrap();
+    fs::create_dir(root.join("catalog")).unwrap();
+    fs::write(root.join("hello.exe"), b"release fixture").unwrap();
+    let empty: &[u8] = br#"{"format_version":1,"entries":[]}"#;
+    fs::write(root.join("catalog/index.json"), empty).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(include_bytes!("../../../addons/hello/hello.tbaddon")).unwrap();
+    manifest["manifest"]["min_toolboks_version"] = "0.12.5".into();
+    manifest["manifest"]["icon"] = "custom".into();
+    manifest["manifest"]["version"] = "1.0.0".into();
+    let write = |manifest: &serde_json::Value| {
+        fs::write(
+            root.join("addons/hello/hello.tbaddon"),
+            serde_json::to_vec(manifest).unwrap(),
+        )
+        .unwrap()
+    };
+    write(&manifest);
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_addon-repo"))
+            .current_dir(&root)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let update = |version: &str| {
+        run(&[
+            "catalog-update",
+            "hello",
+            version,
+            "owner/addons",
+            "hello.exe",
+        ])
+    };
+    let list = || fs::read(root.join("catalog/index.json")).unwrap();
+
+    // No icon.png, or one the host would refuse: nothing is written.
+    let out = update("1.0.0");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("icon.png"));
+    for bad in [png(200), png(8), b"not a picture".to_vec()] {
+        fs::write(root.join("addons/hello/icon.png"), &bad).unwrap();
+        assert!(!update("1.0.0").status.success());
+        assert_eq!(list(), empty);
+    }
+    // validate also refuses an add-on with a custom icon and a bad icon.png.
+    assert!(!run(&["validate"]).status.success());
+
+    let icon = png(64);
+    fs::write(root.join("addons/hello/icon.png"), &icon).unwrap();
+    assert!(update("1.0.0").status.success());
+    let entry = &Index::parse(&list()).unwrap().entries[0];
+    assert_eq!(entry.icon, "custom");
+    assert_eq!(
+        entry.icon_url.as_deref(),
+        Some("https://github.com/owner/addons/releases/download/hello-v1.0.0/icon.png")
+    );
+    assert_eq!(
+        entry.icon_sha256.as_deref(),
+        Some(toolboks_catalog::sha256_hex(&icon).as_str())
+    );
+    assert_eq!(entry.icon_size, Some(icon.len() as u64));
+    assert_eq!(entry.min_toolboks_version, "0.21.0");
+    assert!(run(&["validate"]).status.success());
+
+    // Another picture in the repository than the one in the list for the current version.
+    fs::write(root.join("addons/hello/icon.png"), png(32)).unwrap();
+    let out = run(&["validate"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("icon_sha256"));
+    fs::remove_file(root.join("addons/hello/icon.png")).unwrap();
+    assert!(!run(&["validate"]).status.success());
+    fs::write(root.join("addons/hello/icon.png"), &icon).unwrap();
+
+    // A custom icon offered to a host older than 0.21.0 fails, whatever the version.
+    let mut value: serde_json::Value = serde_json::from_slice(&list()).unwrap();
+    value["entries"][0]["min_toolboks_version"] = "0.16.0".into();
+    fs::write(
+        root.join("catalog/index.json"),
+        serde_json::to_vec_pretty(&value).unwrap(),
+    )
+    .unwrap();
+    let out = run(&["validate"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("0.21.0"));
+    manifest["manifest"]["version"] = "2.0.0".into();
+    write(&manifest);
+    assert!(!run(&["validate"]).status.success());
+
+    // A named icon gets none of the three fields, even with an icon.png beside it.
+    fs::write(root.join("catalog/index.json"), empty).unwrap();
+    manifest["manifest"]["icon"] = "chip".into();
+    write(&manifest);
+    assert!(update("2.0.0").status.success());
+    let text = String::from_utf8(list()).unwrap();
+    assert!(
+        !text.contains("icon_url") && !text.contains("icon_sha256") && !text.contains("icon_size")
+    );
+    assert!(text.contains("\"min_toolboks_version\": \"0.16.0\""));
+    assert!(run(&["validate"]).status.success());
+}

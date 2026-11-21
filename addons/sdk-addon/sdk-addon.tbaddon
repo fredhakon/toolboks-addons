@@ -5,8 +5,8 @@
     "title": "SDK Add-on",
     "native_provider": "toolboks.sdk-addon",
     "description": "Start your own Toolboks add-on: creates a complete project in a folder you choose.",
-    "long_description": "For people who want to make an add-on. Fill in a name, a title and your name, choose a folder and press Create: SDK Add-on writes a complete Rust project there that builds and passes its tests, with a README that shows which files to edit first and notes for AI coding assistants (AGENTS.md and CLAUDE.md). It checks whether Rust and the Visual C++ build tools are installed. If Rust is missing, an Install Rust button opens a PowerShell window and runs the official Rust installer (downloaded from rust-lang.org) only when you press it; it never installs anything on its own. It writes files only into the new project folder inside the folder you choose, only when you press Create, and never replaces a file. It remembers the last folder you chose. Nothing about you is sent anywhere.",
-    "version": "0.1.1",
+    "long_description": "For people who want to make an add-on. Fill in a name, a title and your name, choose a folder and press Create: SDK Add-on writes a complete Rust project there that builds and passes its tests, with a README that shows which files to edit first and notes for AI coding assistants (AGENTS.md and CLAUDE.md). It checks whether Rust and the Visual C++ build tools are installed. If Rust is missing, an Install Rust button opens a PowerShell window and runs the official Rust installer (downloaded from rust-lang.org) only when you press it; it never installs anything on its own. It writes files only into the new project folder inside the folder you choose, only when you press Create, and never replaces a file. Get started (README) then shows the new README in a reader inside the add-on, and Open Markdown file shows any Markdown file you pick there. In the reader, only web links (https or http) open, in your browser, and a link to another Markdown file in the same folder opens in the reader; other links are refused. The reader reads only the files you open, writes nothing, never downloads images or anything else, and remembers no file. It remembers the last folder you chose. The Rust installer download, only when you press Install Rust, is its only use of the network; nothing about you is sent anywhere.",
+    "version": "0.2.0",
     "author": "Toolboks team",
     "publisher": "Toolboks",
     "category": "Developer tools",
@@ -21,7 +21,7 @@
       "local_preferences",
       "user_exports"
     ],
-    "data_note": "Creates files only in a folder you choose, when you press Create. Installs Rust only if you press Install Rust. Remembers the last folder."
+    "data_note": "Creates files only in a folder you choose. Reads only Markdown files you open. Remembers the last folder. Goes online only when you press Install Rust."
   },
   "pages": []
 }

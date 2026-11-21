@@ -460,6 +460,12 @@ and on Create writes a new project with `toolboks_addon_templates::write_project
 `<chosen folder>/<name>`, never into a drive root, the Windows folder or Program Files, and never
 over a folder with files in it. The project's SDK comes from `HOST_REV` in `src/project.rs`, the
 workspace pin. The folder picker, the README and the folder open on worker threads, so the add-on
-keeps answering the host. It remembers only the last folder. Its own `icon.png` is drawn by
+keeps answering the host. It remembers only the last folder. A Create / Reader switch at the top
+adds a Markdown reader (`src/reader.rs`, drawn from `pulldown-cmark` in `src/markdown.rs`): Get
+started (README) shows the new README there ("Open in another app" still hands it to Windows), and
+Open Markdown file reads any file up to 2 MiB; only http(s) links leave the add-on, relative links
+open `.md`/`.markdown`/`.txt` files inside the first file's folder, images become a text
+placeholder and HTML stays text. Its own `icon.png` is drawn by
 `make-icon.py` (Python 3, standard library). The page is drawn by headless tests only; the
-folder dialog, opening the README and the page in a real Toolboks window have not been checked yet.
+folder and file dialogs, opening the README and the page in a real Toolboks window have not been
+checked yet.

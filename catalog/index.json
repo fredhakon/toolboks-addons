@@ -1393,6 +1393,37 @@
       "release_notes": "Release sdk-addon-v0.1.0.",
       "verified": true,
       "channel": "stable"
+    },
+    {
+      "id": "toolboks.sdk-addon",
+      "title": "SDK Add-on",
+      "short_description": "Start your own Toolboks add-on: creates a complete project in a folder you choose.",
+      "long_description": "For people who want to make an add-on. Fill in a name, a title and your name, choose a folder and press Create: SDK Add-on writes a complete Rust project there that builds and passes its tests, with a README that shows which files to edit first and notes for AI coding assistants (AGENTS.md and CLAUDE.md). It checks whether Rust and the Visual C++ build tools are installed. If Rust is missing, an Install Rust button opens a PowerShell window and runs the official Rust installer (downloaded from rust-lang.org) only when you press it; it never installs anything on its own. It writes files only into the new project folder inside the folder you choose, only when you press Create, and never replaces a file. It remembers the last folder you chose. Nothing about you is sent anywhere.",
+      "publisher": "Toolboks",
+      "category": "Developer tools",
+      "icon": "custom",
+      "icon_url": "https://github.com/fredhakon/toolboks-addons/releases/download/sdk-addon-v0.1.1/icon.png",
+      "icon_sha256": "0e640d23172b72c0b55b1fdc426c2bc81cae0bb1e380c46e4105eb1a0bff9e8f",
+      "icon_size": 465,
+      "accent": "#A48ACA",
+      "screenshots": [],
+      "capabilities": [
+        "local_preferences",
+        "user_exports"
+      ],
+      "pages": [],
+      "background": false,
+      "data_note": "Creates files only in a folder you choose, when you press Create. Installs Rust only if you press Install Rust. Remembers the last folder.",
+      "kind": "native",
+      "version": "0.1.1",
+      "min_toolboks_version": "0.21.0",
+      "protocol_version": 5,
+      "download_url": "https://github.com/fredhakon/toolboks-addons/releases/download/sdk-addon-v0.1.1/sdk-addon.exe",
+      "size": 3331072,
+      "sha256": "ce4bb63077358b0b58864292325aa030d8f99aa5bd184d93c2ac77601ee30c2c",
+      "release_notes": "Release sdk-addon-v0.1.1.",
+      "verified": true,
+      "channel": "stable"
     }
   ]
 }

@@ -4,9 +4,19 @@ First-party native add-ons live here and release independently. The host keeps t
 wire protocol, shared UI and catalog entry/download checks. Disk Manager is the first migrated tool (host #88); Hello
 is only a small pipeline fixture.
 
+## Make a new add-on
+
+Copy `addons/hello`, rename it, and follow the
+[add-on author guide](https://github.com/Gusseti/toolboks/blob/main/docs/ADDON-AUTHOR-GUIDE.md):
+it covers the manifest, the page, testing and what a release involves. One thing to know first:
+a new crate changes `Cargo.lock`, so run `cargo metadata --format-version 1` once without
+`--locked` before the commands below.
+
 ## Layout
 
-- `addons/<name>/`: one crate, one `<name>.tbaddon` SDK manifest, and `tests/protocol.rs`.
+- `addons/<name>/`: one crate, one `<name>.tbaddon` SDK manifest, `tests/protocol.rs`, and an
+  optional `host-services.json` (page names, and `"background": true` for an add-on that keeps
+  working while hidden).
 - `catalog/index.json`: the host's format 1, initially empty and unsigned.
 - `tools/repo/`: manifest/index validation, release-to-catalog automation using host types,
   and the `measure` command.
@@ -20,8 +30,9 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `164a20ff3d0ba0b3f33605bb22fcc1a049bcc54f`, the commit of host release **v0.18.0**: it
-adds the `developer_integration` capability that Testdeck declares (host PR #226), after the Debloater evidence labels
+Host dependencies pin commit `d4aab7ccf5abea21a963d7fe17e1d30f9d220922`, the commit of host release **v0.19.0** (it
+adds the Ctrl+C hover copy every add-on gets from the SDK). The pin before it, host release **v0.18.0**,
+added the `developer_integration` capability that Testdeck declares (host PR #226), after the Debloater evidence labels
 in the shared engine (host PR #214, v0.17.2). Protocol 5 and the SDK have not changed since
 the released host **v0.16.0** (`63beeb11`; its SDK still agrees on 4 or 3 with a host that speaks those, and
 sends a protocol 4 host its findings without `why` and `evidence`), and only the statically linked engine crate

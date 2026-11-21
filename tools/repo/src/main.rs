@@ -1,11 +1,11 @@
 //! Repository automation; catalog types and validation belong to the host, not this repo.
-use std::{env, fs, path::Path};
+use std::{collections::BTreeMap, env, fs, path::Path};
 use toolboks_addon_proto::PROTOCOL_VERSION;
 use toolboks_addon_sdk::{
     valid_check_names, valid_data_note, version, Manifest, Package, MAX_CHECKS,
     MAX_CHECK_NAME_CHARS, MAX_DATA_NOTE_CHARS,
 };
-use toolboks_catalog::{Channel, Entry, Index, Kind};
+use toolboks_catalog::{check_icon_header, Channel, Entry, Index, Kind, CUSTOM_ICON};
 mod measure;
 
 fn host_services(name: &str) -> (Vec<String>, bool) {
@@ -44,13 +44,18 @@ fn package(name: &str) -> Package {
 
 /// The host release the workspace is pinned to (README, "When to move the pin"). Manifests are
 /// checked as this host checks them, so an add-on may need this host but nothing newer.
-const PINNED_HOST: &str = "0.18.0";
+const PINNED_HOST: &str = "0.21.0";
 
 /// The first host release that speaks each protocol newer than 3. A catalog entry at one of these
 /// protocols needs at least that host, so no older host offers it. When the pin moves to a host
 /// with a new protocol, add its row (a test fails until then). Entries at protocol 3 predate this
 /// rule and keep the minimum they were released with.
 const PROTOCOL_HOSTS: [(u32, &str); 2] = [(4, "0.15.0"), (5, "0.16.0")];
+
+/// The first host release that draws an add-on's own picture (`"icon": "custom"` with `icon_url`,
+/// `icon_sha256` and `icon_size`). Older hosts draw the default glyph instead, so an entry with a
+/// custom icon needs at least this host. Applies to every entry, old versions included.
+const CUSTOM_ICON_HOST: &str = "0.21.0";
 
 fn first_host(protocol: u32) -> Option<&'static str> {
     PROTOCOL_HOSTS
@@ -59,18 +64,28 @@ fn first_host(protocol: u32) -> Option<&'static str> {
         .map(|(_, host)| *host)
 }
 
-/// The `min_toolboks_version` of an entry at `protocol` for a manifest that needs
-/// `manifest_min`: the newer of the two, so the entry is offered only to hosts that can both
-/// install the manifest and speak the protocol.
-fn entry_min_host(manifest_min: &str, protocol: u32) -> String {
-    match first_host(protocol) {
-        Some(host) if version(host) > version(manifest_min) => host.into(),
-        _ => manifest_min.into(),
+/// The `min_toolboks_version` of an entry at `protocol` with `icon` for a manifest that needs
+/// `manifest_min`: the newest of the three, so the entry is offered only to hosts that can
+/// install the manifest, speak the protocol and draw the icon.
+fn entry_min_host(manifest_min: &str, protocol: u32, icon: &str) -> String {
+    let mut min = manifest_min;
+    for host in [
+        first_host(protocol),
+        (icon == CUSTOM_ICON).then_some(CUSTOM_ICON_HOST),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if version(host) > version(min) {
+            min = host;
+        }
     }
+    min.into()
 }
 
 /// An entry whose protocol the pinned SDK does not speak, or whose minimum host is older than
-/// the first host that speaks its protocol. Applies to every entry, old versions included.
+/// the first host that speaks its protocol, or (for a custom icon) the first host that draws it.
+/// Applies to every entry, old versions included.
 fn protocol_problem(e: &Entry) -> Option<String> {
     let (id, v, protocol) = (&e.id, &e.version, e.protocol_version);
     if protocol > PROTOCOL_VERSION {
@@ -83,6 +98,14 @@ fn protocol_problem(e: &Entry) -> Option<String> {
             "{id} {v}: protocol {protocol} needs min_toolboks_version {host} or later (the first host that speaks it), not {}",
             e.min_toolboks_version
         )),
+        _ if e.icon == CUSTOM_ICON
+            && version(&e.min_toolboks_version) < version(CUSTOM_ICON_HOST) =>
+        {
+            Some(format!(
+                "{id} {v}: a custom icon needs min_toolboks_version {CUSTOM_ICON_HOST} or later (the first host that draws it), not {}",
+                e.min_toolboks_version
+            ))
+        }
         _ => None,
     }
 }
@@ -114,10 +137,16 @@ fn data_note(m: &Manifest) -> Result<Option<String>, String> {
 
 /// Every entry must pass [`protocol_problem`]. The entry for the version that is current in
 /// `addons/<name>/<name>.tbaddon` must also carry exactly what `catalog-update` copies from that
-/// manifest: its data note (both set and equal, or both absent), its health check names, and the
-/// minimum host [`entry_min_host`] gives for the entry's protocol. Entries for older versions are
-/// not compared with the manifest: theirs is the one at their release tag, not the one here.
-fn entry_problem(entries: &[Entry], manifests: &[Manifest]) -> Option<String> {
+/// manifest: its data note (both set and equal, or both absent), its health check names, the
+/// minimum host [`entry_min_host`] gives for the entry's protocol and icon, and for a custom icon
+/// the address, SHA-256 and size of `addons/<name>/icon.png` (`icons`, by manifest id). Entries
+/// for older versions are not compared with the manifest: theirs is the one at their release
+/// tag, not the one here.
+fn entry_problem(
+    entries: &[Entry],
+    manifests: &[Manifest],
+    icons: &BTreeMap<String, Vec<u8>>,
+) -> Option<String> {
     for e in entries {
         if let Some(problem) = protocol_problem(e) {
             return Some(problem);
@@ -138,13 +167,62 @@ fn entry_problem(entries: &[Entry], manifests: &[Manifest]) -> Option<String> {
                 e.checks, m.checks
             ));
         }
-        let min = entry_min_host(&m.min_toolboks_version, e.protocol_version);
+        let min = entry_min_host(&m.min_toolboks_version, e.protocol_version, &m.icon);
         if e.min_toolboks_version != min {
             return Some(format!(
                 "{id} {v}: the catalog entry's min_toolboks_version {} differs from {min} (the manifest's {} at protocol {})",
                 e.min_toolboks_version, m.min_toolboks_version, e.protocol_version
             ));
         }
+        if let Some(problem) = custom_icon_problem(e, m, icons.get(id).map(Vec::as_slice)) {
+            return Some(problem);
+        }
+    }
+    None
+}
+
+/// The current version's entry `e` against its manifest `m` and `png`, the add-on's
+/// `icon.png`: a custom icon on either side needs it on both, and then the entry's address,
+/// SHA-256 and size must be the ones `catalog-update` gives for that file. A named icon carries
+/// none of the three fields.
+fn custom_icon_problem(e: &Entry, m: &Manifest, png: Option<&[u8]>) -> Option<String> {
+    let (id, v) = (&e.id, &e.version);
+    if e.icon != m.icon && (e.icon == CUSTOM_ICON || m.icon == CUSTOM_ICON) {
+        return Some(format!(
+            "{id} {v}: the catalog entry's icon `{}` differs from the manifest's `{}`",
+            e.icon, m.icon
+        ));
+    }
+    if m.icon != CUSTOM_ICON {
+        if e.icon_url.is_some() || e.icon_sha256.is_some() || e.icon_size.is_some() {
+            return Some(format!(
+                "{id} {v}: the catalog entry has icon_url, icon_sha256 or icon_size, but its icon is `{}`, not custom",
+                e.icon
+            ));
+        }
+        return None;
+    }
+    let Some(png) = png else {
+        return Some(format!(
+            "{id} {v}: the icon is custom, but the add-on has no icon.png"
+        ));
+    };
+    let url = e
+        .download_url
+        .rsplit_once('/')
+        .map(|(folder, _)| format!("{folder}/icon.png"));
+    if e.icon_url != url {
+        return Some(format!(
+            "{id} {v}: the catalog entry's icon_url {:?} is not {url:?}, next to its download",
+            e.icon_url
+        ));
+    }
+    if e.icon_sha256.as_deref() != Some(toolboks_catalog::sha256_hex(png).as_str())
+        || e.icon_size != Some(png.len() as u64)
+    {
+        return Some(format!(
+            "{id} {v}: the catalog entry's icon_sha256 or icon_size does not match the add-on's icon.png"
+        ));
     }
     None
 }
@@ -156,28 +234,44 @@ const ICONS: [&str; 9] = [
 ];
 
 /// Every add-on in the catalog needs an icon the host can draw, and no two may share one: the
-/// sidebar is scanned by icon first. `list` is (add-on id, icon).
-fn icon_problem(list: &[(&str, &str)]) -> Option<String> {
-    let mut seen: Vec<(&str, &str)> = Vec::new();
-    for (id, icon) in list {
-        if !ICONS.contains(icon) {
-            return Some(format!(
-                "{id}: icon `{icon}` is not one the host draws (use one of {ICONS:?})"
-            ));
+/// sidebar is scanned by icon first. A named icon belongs to one add-on; add-ons with their own
+/// picture (`custom`) share that word, but not the picture, told apart by its SHA-256.
+/// `list` is (add-on id, icon, icon_sha256).
+fn icon_problem(list: &[(&str, &str, Option<&str>)]) -> Option<String> {
+    let mut seen: Vec<(&str, &str, Option<&str>)> = Vec::new();
+    for &(id, icon, sha) in list {
+        if icon == CUSTOM_ICON {
+            let Some(sha) = sha else {
+                return Some(format!("{id}: a custom icon needs its icon_sha256"));
+            };
+            if let Some((other, ..)) = seen
+                .iter()
+                .find(|(o, i, s)| *i == CUSTOM_ICON && *s == Some(sha) && *o != id)
+            {
+                return Some(format!(
+                    "{id} and {other} both use the same custom icon (icon_sha256 {sha})"
+                ));
+            }
+        } else {
+            if !ICONS.contains(&icon) {
+                return Some(format!(
+                    "{id}: icon `{icon}` is not one the host draws (use one of {ICONS:?}, or `{CUSTOM_ICON}` with the add-on's own icon.png)"
+                ));
+            }
+            if let Some((other, ..)) = seen.iter().find(|(o, i, _)| *i == icon && *o != id) {
+                return Some(format!("{id} and {other} both use the icon `{icon}`"));
+            }
         }
-        if let Some((other, _)) = seen.iter().find(|(o, i)| i == icon && o != id) {
-            return Some(format!("{id} and {other} both use the icon `{icon}`"));
-        }
-        seen.push((id, icon));
+        seen.push((id, icon, sha));
     }
     None
 }
 
 fn check_icons(index: &Index) {
-    let list: Vec<(&str, &str)> = index
+    let list: Vec<(&str, &str, Option<&str>)> = index
         .entries
         .iter()
-        .map(|e| (e.id.as_str(), e.icon.as_str()))
+        .map(|e| (e.id.as_str(), e.icon.as_str(), e.icon_sha256.as_deref()))
         .collect();
     if let Some(problem) = icon_problem(&list) {
         panic!("{problem}");
@@ -189,15 +283,42 @@ fn validate() {
         Index::parse(&fs::read("catalog/index.json").unwrap()).expect("host catalog validation");
     check_icons(&index);
     let mut manifests = Vec::new();
+    let mut icons = BTreeMap::new();
     for dir in fs::read_dir("addons").unwrap() {
         let dir = dir.unwrap();
         if dir.file_type().unwrap().is_dir() {
-            manifests.push(package(dir.file_name().to_str().unwrap()).manifest);
+            let name = dir.file_name().to_str().unwrap().to_string();
+            let manifest = package(&name).manifest;
+            // Every add-on with its own picture must ship a good one, released or not.
+            if manifest.icon == CUSTOM_ICON {
+                let png = icon_png(&name).unwrap_or_else(|problem| panic!("{problem}"));
+                icons.insert(manifest.id.clone(), png);
+            }
+            manifests.push(manifest);
         }
     }
-    if let Some(problem) = entry_problem(&index.entries, &manifests) {
+    if let Some(problem) = entry_problem(&index.entries, &manifests, &icons) {
         panic!("{problem}");
     }
+}
+
+/// `addons/<name>/icon.png`, the picture of an add-on whose icon is `custom`, checked with the
+/// host's rule for custom icons (a square PNG of 16 to 128 pixels, at most 32 KiB).
+fn icon_png(name: &str) -> Result<Vec<u8>, String> {
+    let path = format!("addons/{name}/icon.png");
+    let png = fs::read(&path).map_err(|e| {
+        format!(
+            "{path}: {e}. An add-on whose icon is \"{CUSTOM_ICON}\" needs its own icon.png there."
+        )
+    })?;
+    check_custom_icon(name, &png)?;
+    Ok(png)
+}
+
+fn check_custom_icon(name: &str, png: &[u8]) -> Result<(), String> {
+    check_icon_header(png)
+        .map(drop)
+        .map_err(|problem| format!("addons/{name}/icon.png: {problem}"))
 }
 
 fn update(name: &str, version: &str, repository: &str, exe: &Path) {
@@ -208,8 +329,20 @@ fn update(name: &str, version: &str, repository: &str, exe: &Path) {
     let m = package(name).manifest;
     assert_eq!(m.version, version);
     let bytes = fs::read(exe).expect("release executable");
-    let entry = new_entry(name, m, host_services(name), repository, &bytes)
-        .unwrap_or_else(|problem| panic!("{problem}"));
+    let png = if m.icon == CUSTOM_ICON {
+        Some(icon_png(name).unwrap_or_else(|problem| panic!("{problem}")))
+    } else {
+        None
+    };
+    let entry = new_entry(
+        name,
+        m,
+        host_services(name),
+        repository,
+        &bytes,
+        png.as_deref(),
+    )
+    .unwrap_or_else(|problem| panic!("{problem}"));
     let mut index = Index::parse(&fs::read("catalog/index.json").unwrap()).unwrap();
     // Retain other versions and add-ons; replace only this exact id/version when retried.
     index
@@ -225,20 +358,37 @@ fn update(name: &str, version: &str, repository: &str, exe: &Path) {
 }
 
 /// The catalog entry for a release of add-on `name` (its folder) with manifest `m`, whose
-/// executable is `bytes`. It speaks the pinned protocol and copies the manifest's data note and
-/// health checks; its minimum host covers both the manifest and that protocol. Checked as the
-/// host checks entries.
+/// executable is `bytes` and, for a custom icon, whose `icon.png` is `png` (uploaded next to the
+/// executable). It speaks the pinned protocol and copies the manifest's data note and health
+/// checks; its minimum host covers the manifest, that protocol and the icon. Checked as the host
+/// checks entries.
 fn new_entry(
     name: &str,
     m: Manifest,
     (pages, background): (Vec<String>, bool),
     repository: &str,
     bytes: &[u8],
+    png: Option<&[u8]>,
 ) -> Result<Entry, String> {
     let data_note = data_note(&m)?;
     let checks = checks(&m)?;
-    let min_toolboks_version = entry_min_host(&m.min_toolboks_version, PROTOCOL_VERSION);
+    let min_toolboks_version = entry_min_host(&m.min_toolboks_version, PROTOCOL_VERSION, &m.icon);
     let v = m.version;
+    let (icon_url, icon_sha256, icon_size) = if m.icon == CUSTOM_ICON {
+        let png = png.ok_or_else(|| {
+            format!("addons/{name}/icon.png is missing; an add-on whose icon is \"{CUSTOM_ICON}\" needs it")
+        })?;
+        check_custom_icon(name, png)?;
+        (
+            Some(format!(
+                "https://github.com/{repository}/releases/download/{name}-v{v}/icon.png"
+            )),
+            Some(toolboks_catalog::sha256_hex(png)),
+            Some(png.len() as u64),
+        )
+    } else {
+        (None, None, None)
+    };
     let entry = Entry {
         id: m.id,
         title: m.title,
@@ -248,6 +398,9 @@ fn new_entry(
         byline: m.byline,
         category: m.category,
         icon: m.icon,
+        icon_url,
+        icon_sha256,
+        icon_size,
         accent: m.accent,
         screenshots: m.screenshots,
         capabilities: serde_json::from_value(serde_json::to_value(m.capabilities).unwrap())
@@ -300,16 +453,46 @@ mod tests {
 
     #[test]
     fn icons_must_be_known_and_unique() {
-        assert_eq!(icon_problem(&[("a", "chip"), ("b", "mic")]), None);
+        assert_eq!(
+            icon_problem(&[("a", "chip", None), ("b", "mic", None)]),
+            None
+        );
         // The same add-on may list several versions with one icon.
-        assert_eq!(icon_problem(&[("a", "chip"), ("a", "chip")]), None);
-        assert!(icon_problem(&[("a", "chip"), ("b", "chip")])
+        assert_eq!(
+            icon_problem(&[("a", "chip", None), ("a", "chip", None)]),
+            None
+        );
+        assert!(icon_problem(&[("a", "chip", None), ("b", "chip", None)])
             .unwrap()
             .contains("both use the icon"));
-        assert!(icon_problem(&[("a", "grid")])
+        assert!(icon_problem(&[("a", "grid", None)])
             .unwrap()
             .contains("not one the host draws"));
-        assert!(icon_problem(&[("a", "gear")]).is_some());
+        assert!(icon_problem(&[("a", "gear", None)]).is_some());
+    }
+
+    #[test]
+    fn custom_icons_are_told_apart_by_their_picture() {
+        let (one, two) = (Some("11"), Some("22"));
+        // Two add-ons may both have their own picture, when the pictures differ.
+        assert_eq!(
+            icon_problem(&[("a", "custom", one), ("b", "custom", two)]),
+            None
+        );
+        // One add-on may change its picture between versions.
+        assert_eq!(
+            icon_problem(&[("a", "custom", one), ("a", "custom", two)]),
+            None
+        );
+        // A named icon next to a custom one is fine.
+        assert_eq!(
+            icon_problem(&[("a", "custom", one), ("b", "chip", None)]),
+            None
+        );
+        assert!(icon_problem(&[("a", "custom", one), ("b", "custom", one)])
+            .unwrap()
+            .contains("same custom icon"));
+        assert!(icon_problem(&[("a", "custom", None)]).is_some());
     }
 
     const NOTE: &str = "Keeps your last scan of each drive on this PC (file and folder names).";
@@ -355,7 +538,30 @@ mod tests {
 
     /// The entry `catalog-update` makes for the manifest.
     fn entry(m: &Manifest) -> Entry {
-        new_entry("hello", m.clone(), (vec![], false), "owner/addons", b"exe").unwrap()
+        new_entry(
+            "hello",
+            m.clone(),
+            (vec![], false),
+            "owner/addons",
+            b"exe",
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A PNG signature and header for a `side` x `side` picture: what the host's checker reads.
+    fn png(side: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        bytes.extend(13u32.to_be_bytes());
+        bytes.extend(b"IHDR");
+        bytes.extend(side.to_be_bytes());
+        bytes.extend(side.to_be_bytes());
+        bytes.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        bytes
+    }
+
+    fn no_icons() -> BTreeMap<String, Vec<u8>> {
+        BTreeMap::new()
     }
 
     #[test]
@@ -368,13 +574,16 @@ mod tests {
         assert_eq!(e.min_toolboks_version, "0.16.0");
         assert_eq!(protocol_problem(&e), None);
         // A manifest that needs a newer host keeps its own minimum.
-        assert_eq!(entry_min_host("0.16.2", 5), "0.16.2");
-        assert_eq!(entry_min_host("0.15.0", 5), "0.16.0");
+        assert_eq!(entry_min_host("0.16.2", 5, "chip"), "0.16.2");
+        assert_eq!(entry_min_host("0.15.0", 5, "chip"), "0.16.0");
         // Entries released at protocol 4 keep needing the first host that speaks 4.
-        assert_eq!(entry_min_host("0.12.5", 4), "0.15.0");
-        assert_eq!(entry_min_host("0.16.2", 4), "0.16.2");
+        assert_eq!(entry_min_host("0.12.5", 4, "chip"), "0.15.0");
+        assert_eq!(entry_min_host("0.16.2", 4, "chip"), "0.16.2");
         // Protocol 3 adds nothing: released entries keep the minimum they were released with.
-        assert_eq!(entry_min_host("0.12.0", 3), "0.12.0");
+        assert_eq!(entry_min_host("0.12.0", 3, "chip"), "0.12.0");
+        // A custom icon needs the first host that draws it.
+        assert_eq!(entry_min_host("0.12.0", 5, "custom"), "0.21.0");
+        assert_eq!(entry_min_host("0.22.1", 5, "custom"), "0.22.1");
     }
 
     #[test]
@@ -384,6 +593,133 @@ mod tests {
             assert!(version(host).is_some() && version(host) <= version(PINNED_HOST));
         }
         assert_eq!(first_host(3), None);
+        // The pinned host draws custom icons, and the SDK accepts them in a manifest.
+        assert!(version(CUSTOM_ICON_HOST).is_some());
+        assert!(version(CUSTOM_ICON_HOST) <= version(PINNED_HOST));
+    }
+
+    #[test]
+    fn custom_icon_entries_carry_the_picture_and_need_the_host_that_draws_it() {
+        let mut m = manifest("1.0.0", None);
+        m.icon = "custom".into();
+        m.min_toolboks_version = "0.12.5".into();
+        let icon = png(64);
+        let e = new_entry(
+            "hello",
+            m.clone(),
+            (vec![], false),
+            "owner/addons",
+            b"exe",
+            Some(icon.as_slice()),
+        )
+        .unwrap();
+        assert_eq!(e.min_toolboks_version, "0.21.0");
+        assert_eq!(
+            e.icon_url.as_deref(),
+            Some("https://github.com/owner/addons/releases/download/hello-v1.0.0/icon.png")
+        );
+        assert_eq!(e.icon_sha256, Some(toolboks_catalog::sha256_hex(&icon)));
+        assert_eq!(e.icon_size, Some(icon.len() as u64));
+        assert_eq!(protocol_problem(&e), None);
+        // No icon.png, or one the host's checker refuses: no entry.
+        let refused = |png: Option<&[u8]>| {
+            new_entry("hello", m.clone(), (vec![], false), "o/r", b"exe", png).unwrap_err()
+        };
+        assert!(refused(None).contains("icon.png is missing"));
+        assert!(refused(Some(png(200).as_slice())).contains("must be 16 to 128"));
+        assert!(refused(Some(&b"GIF89a"[..])).contains("not a PNG"));
+        // A named icon carries none of the three fields, even when a picture is given.
+        m.icon = "chip".into();
+        let named = new_entry(
+            "hello",
+            m.clone(),
+            (vec![], false),
+            "o/r",
+            b"exe",
+            Some(icon.as_slice()),
+        )
+        .unwrap();
+        assert_eq!(
+            (named.icon_url, named.icon_sha256, named.icon_size),
+            (None, None, None)
+        );
+        assert_eq!(named.min_toolboks_version, "0.16.0");
+        // Any entry with a custom icon that allows an older host fails, old versions too.
+        let mut old = e.clone();
+        old.min_toolboks_version = "0.20.0".into();
+        assert!(protocol_problem(&old)
+            .unwrap()
+            .contains("custom icon needs min_toolboks_version 0.21.0"));
+        old.version = "0.5.0".into();
+        assert!(entry_problem(&[old], &[], &no_icons()).is_some());
+    }
+
+    #[test]
+    fn the_current_custom_icon_entry_must_match_the_icon_file() {
+        let mut m = manifest("1.0.0", None);
+        m.icon = "custom".into();
+        let icon = png(64);
+        let made = new_entry(
+            "hello",
+            m.clone(),
+            (vec![], false),
+            "owner/addons",
+            b"exe",
+            Some(icon.as_slice()),
+        )
+        .unwrap();
+        let icons = BTreeMap::from([(m.id.clone(), icon.clone())]);
+        let manifests = [m.clone()];
+        assert_eq!(
+            entry_problem(std::slice::from_ref(&made), &manifests, &icons),
+            None
+        );
+        let with = |change: &dyn Fn(&mut Entry)| {
+            let mut e = made.clone();
+            change(&mut e);
+            entry_problem(&[e], &manifests, &icons)
+        };
+        // Another picture in the repository than the one in the list.
+        let other = BTreeMap::from([(m.id.clone(), png(32))]);
+        assert!(
+            entry_problem(std::slice::from_ref(&made), &manifests, &other)
+                .unwrap()
+                .contains("icon_sha256 or icon_size")
+        );
+        // No picture at all.
+        assert!(
+            entry_problem(std::slice::from_ref(&made), &manifests, &no_icons())
+                .unwrap()
+                .contains("no icon.png")
+        );
+        assert!(with(&|e| e.icon_size = Some(1)).is_some());
+        assert!(
+            with(&|e| e.icon_url = Some("https://github.com/o/r/x.png".into()))
+                .unwrap()
+                .contains("icon_url")
+        );
+        // A named icon in the list for a custom manifest, and the other way round.
+        assert!(with(&|e| e.icon = "chip".into())
+            .unwrap()
+            .contains("differs from the manifest"));
+        let mut named = m.clone();
+        named.icon = "chip".into();
+        assert!(entry_problem(std::slice::from_ref(&made), &[named.clone()], &icons).is_some());
+        // A named icon may not carry the custom fields.
+        let mut bare = entry(&named);
+        assert_eq!(
+            entry_problem(std::slice::from_ref(&bare), &[named.clone()], &icons),
+            None
+        );
+        bare.icon_size = Some(10);
+        assert!(entry_problem(&[bare], &[named], &icons)
+            .unwrap()
+            .contains("not custom"));
+        // Older versions are not compared with today's picture.
+        let mut old = made.clone();
+        old.version = "0.9.0".into();
+        old.icon_sha256 = Some(toolboks_catalog::sha256_hex(b"older"));
+        assert_eq!(entry_problem(&[old], &manifests, &icons), None);
     }
 
     #[test]
@@ -410,7 +746,7 @@ mod tests {
             .contains("newer than the pinned SDK"));
         // `validate` applies it to entries of versions the manifests no longer describe.
         e.protocol_version = 4;
-        assert!(entry_problem(&[e], &[manifest("9.0.0", None)]).is_some());
+        assert!(entry_problem(&[e], &[manifest("9.0.0", None)], &no_icons()).is_some());
     }
 
     #[test]
@@ -431,7 +767,7 @@ mod tests {
         ] {
             m.checks = bad.clone();
             assert!(checks(&m).is_err(), "{bad:?}");
-            assert!(new_entry("hello", m.clone(), (vec![], false), "o/r", b"exe").is_err());
+            assert!(new_entry("hello", m.clone(), (vec![], false), "o/r", b"exe", None).is_err());
         }
     }
 
@@ -454,15 +790,18 @@ mod tests {
             e.protocol_version = 3;
             e.min_toolboks_version = "0.12.5".into();
         });
-        assert_eq!(entry_problem(&[old, made.clone()], &manifests), None);
+        assert_eq!(
+            entry_problem(&[old, made.clone()], &manifests, &no_icons()),
+            None
+        );
         // Another add-on's entries are not compared with this manifest.
         let other = with(&|e| {
             e.id = "toolboks.other".into();
             e.data_note = None;
         });
-        assert_eq!(entry_problem(&[other], &manifests), None);
+        assert_eq!(entry_problem(&[other], &manifests, &no_icons()), None);
         // A different note, or none at all, for the current version fails.
-        let problem = |e: Entry| entry_problem(&[e], &manifests);
+        let problem = |e: Entry| entry_problem(&[e], &manifests, &no_icons());
         assert!(
             problem(with(&|e| e.data_note = Some("Keeps scans.".into())))
                 .unwrap()
@@ -481,8 +820,13 @@ mod tests {
         // A note or checks the current manifest does not have fail too.
         let mut bare = manifest("2.0.0", None);
         bare.min_toolboks_version = current.min_toolboks_version.clone();
-        assert!(entry_problem(std::slice::from_ref(&made), std::slice::from_ref(&bare)).is_some());
-        assert_eq!(entry_problem(&[entry(&bare)], &[bare]), None);
+        assert!(entry_problem(
+            std::slice::from_ref(&made),
+            std::slice::from_ref(&bare),
+            &no_icons()
+        )
+        .is_some());
+        assert_eq!(entry_problem(&[entry(&bare)], &[bare], &no_icons()), None);
     }
 
     /// Reading and writing the real list with the pinned catalog crate gives back the same bytes,

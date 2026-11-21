@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "manifest": {
+    "id": "toolboks.sdk-addon",
+    "title": "SDK Add-on",
+    "native_provider": "toolboks.sdk-addon",
+    "description": "Start your own Toolboks add-on: creates a complete project in a folder you choose.",
+    "long_description": "For people who want to make an add-on. Fill in a name, a title and your name, choose a folder and press Create: SDK Add-on writes a complete Rust project there that builds and passes its tests, with a README that shows which files to edit first and notes for AI coding assistants (AGENTS.md and CLAUDE.md). It checks whether Rust and the Visual C++ build tools are installed and links to rustup.rs if not; it does not install them. It writes files only into the new project folder inside the folder you choose, only when you press Create, and never replaces a file. It remembers the last folder you chose. Nothing is sent anywhere.",
+    "version": "0.1.0",
+    "author": "Toolboks team",
+    "publisher": "Toolboks",
+    "category": "Developer tools",
+    "icon": "custom",
+    "accent": "#A48ACA",
+    "api_version": 2,
+    "min_toolboks_version": "0.21.0",
+    "website": "https://github.com/Gusseti/toolboks",
+    "support_url": "https://github.com/Gusseti/toolboks/issues",
+    "license": "MIT",
+    "capabilities": [
+      "local_preferences",
+      "user_exports"
+    ],
+    "data_note": "Creates files only in a folder you choose, and only when you press Create. Remembers the last folder you chose."
+  },
+  "pages": []
+}

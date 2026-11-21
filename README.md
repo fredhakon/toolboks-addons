@@ -6,11 +6,14 @@ is only a small pipeline fixture.
 
 ## Make a new add-on
 
-Copy `addons/hello`, rename it, and follow the
+Install **SDK Add-on** from the add-on browser in Toolboks (once it is published): it writes a
+complete add-on project into a folder you choose, with a README that shows which files to edit
+and notes for AI coding assistants (`addons/sdk-addon`). Or copy `addons/hello` by hand and
+rename it. Either way, follow the
 [add-on author guide](https://github.com/Gusseti/toolboks/blob/main/docs/ADDON-AUTHOR-GUIDE.md):
 it covers the manifest, the page, testing and what a release involves. One thing to know first:
-a new crate changes `Cargo.lock`, so run `cargo metadata --format-version 1` once without
-`--locked` before the commands below.
+a new crate in this repository changes `Cargo.lock`, so run `cargo metadata --format-version 1`
+once without `--locked` before the commands below.
 
 ## Layout
 
@@ -30,10 +33,12 @@ test accepting `ADDON_TEST_EXE` to test a release executable. Hello adapts the h
 heartbeat and quit, with a timeout and child cleanup. Named-pipe authentication and the
 graphical test-host window are not exercised by this headless test.
 
-Host dependencies pin commit `d4aab7ccf5abea21a963d7fe17e1d30f9d220922`, the commit of host release **v0.19.0** (it
-adds the Ctrl+C hover copy every add-on gets from the SDK). The pin before it, host release **v0.18.0**,
-added the `developer_integration` capability that Testdeck declares (host PR #226), after the Debloater evidence labels
-in the shared engine (host PR #214, v0.17.2). Protocol 5 and the SDK have not changed since
+Host dependencies pin commit `7c8e531f4ead178192c391729345aed5726a87ce`, the commit of host release **v0.21.0**
+(it adds custom add-on icons, `"icon": "custom"` with the add-on's own `icon.png`, the
+`toolboks-addon-templates` crate that SDK Add-on uses to write new projects, and the SDK's
+`testing` helper). The pin before it, host release **v0.19.0**, added the Ctrl+C hover copy every add-on
+gets from the SDK; **v0.18.0** added the `developer_integration` capability that Testdeck declares
+(host PR #226), after the Debloater evidence labels in the shared engine (host PR #214, v0.17.2). Protocol 5 and the SDK have not changed since
 the released host **v0.16.0** (`63beeb11`; its SDK still agrees on 4 or 3 with a host that speaks those, and
 sends a protocol 4 host its findings without `why` and `evidence`), and only the statically linked engine crate
 differs, so the add-ons still run on every host they did. `addon-repo` checks manifests as this host would
@@ -49,14 +54,27 @@ entries are never rewritten. `catalog-update` also copies the manifest's optiona
 `data_note`, `checks` or the minimum host, when any protocol 4 entry allows a host older than
 0.15.0, or when any protocol 5 entry allows a host older than 0.16.0.
 
+**Custom icons.** An add-on whose manifest says `"icon": "custom"` ships its own picture as
+`addons/<name>/icon.png` (the host's rule: a square PNG of 16 to 128 pixels, at most 32 KiB;
+`check_icon_header` in `toolboks-catalog`). Only host 0.21.0 and later draw it
+(`CUSTOM_ICON_HOST` in `tools/repo/src/main.rs`), so `catalog-update` raises the entry's minimum
+to 0.21.0, refuses a missing or bad `icon.png`, and fills `icon_url` (the release asset
+`<name>-v<version>/icon.png`), `icon_sha256` and `icon_size` from the file. Named icons carry none
+of the three fields. `validate` fails when any custom-icon entry allows a host older than 0.21.0,
+when an add-on with a custom icon has no good `icon.png`, and when the entry for the current version
+does not match that file. Each of the named icons belongs to one add-on; custom icons may not share
+a picture (same `icon_sha256`) between add-ons.
+
 **When to move the pin:** only to a commit that is in a published host release on `main`, and only
 when an add-on needs something the newer host added (a new SDK field, a new shared helper, a
 protocol change) or a host fix that affects the add-ons' tests. A host release that does not
-touch `sdk/` or `shared/` needs no move. **How:** edit the `rev` of all five host git dependencies
+touch `sdk/` or `shared/` needs no move. **How:** edit the `rev` of all six host git dependencies
 in the root `Cargo.toml` to the new release commit (`gh release view vX.Y.Z --repo Gusseti/toolboks
 --json targetCommitish`), run `cargo update -p toolboks-addon-sdk -p toolboks-addon-proto -p
-toolboks-shared -p toolboks-catalog -p toolboks-debloat-engine`, then run the checks below for the
-whole workspace and open the PR into `staging`.
+toolboks-shared -p toolboks-catalog -p toolboks-debloat-engine -p toolboks-addon-templates`, set
+`HOST_REV` in `addons/sdk-addon/src/project.rs` to the same commit (a test fails until it matches;
+new projects get their SDK from it), then run the checks below for the whole workspace and open
+the PR into `staging`.
 
 ## Build and test
 
@@ -118,7 +136,8 @@ add-on); those are checked in the host repository.
    publish real public releases.** No workflow creates tags automatically.
 3. The Windows build job validates tag syntax, main ancestry and matching versions,
    then builds only that crate's release executable (the tests ran on your PC before the
-   merge to main). It reports executable bytes and uploads the exe and `.exe.sha256`.
+   merge to main). It reports executable bytes and uploads the exe and `.exe.sha256`, and
+   `icon.png` too for an add-on whose manifest icon is `custom`.
 4. A separate publish job creates the release. It alone has a write-capable
    `GITHUB_TOKEN` and executes no repository code. All actions use full SHAs.
 5. The catalog job uses the released manifest/protocol pin and executable to update
@@ -430,3 +449,17 @@ has no UI action, so only trim and purge are scripted. `scripts/bench-memory-dri
 `scripts/bench-memory.ps1` collects the numbers (it does not run the action, needs no
 administrator rights and writes only under `-OutDir`); try it with `-Arm none -DryRun`.
 
+
+## SDK Add-on
+
+`addons/sdk-addon` builds `sdk-addon.exe` (ID `toolboks.sdk-addon`, "SDK Add-on", Developer
+tools). One page: it checks whether Rust (`cargo --version`) and the Visual C++ build tools
+(the Visual Studio Installer's `vswhere`; "Could not check" when that is absent) are installed and
+links to rustup.rs, takes a project name, title, author, accent and (under Advanced) an add-on id,
+and on Create writes a new project with `toolboks_addon_templates::write_project` into
+`<chosen folder>/<name>`, never into a drive root, the Windows folder or Program Files, and never
+over a folder with files in it. The project's SDK comes from `HOST_REV` in `src/project.rs`, the
+workspace pin. The folder picker, the README and the folder open on worker threads, so the add-on
+keeps answering the host. It remembers only the last folder. Its own `icon.png` is drawn by
+`make-icon.py` (Python 3, standard library). The page is drawn by headless tests only; the
+folder dialog, opening the README and the page in a real Toolboks window have not been checked yet.

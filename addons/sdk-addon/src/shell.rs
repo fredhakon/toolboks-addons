@@ -128,6 +128,50 @@ pub fn open_readme(readme: PathBuf, ctx: egui::Context) -> mpsc::Receiver<Result
     rx
 }
 
+/// What the PowerShell window runs: download the official Rust installer (rustup) for this PC's
+/// processor, run it so the person sees and answers its questions (it also offers the Visual C++
+/// build tools when they are missing), delete it, and wait for Enter so the window stays readable.
+/// Single quotes only, so it passes to PowerShell as one argument.
+const INSTALL_RUST_SCRIPT: &str = concat!(
+    "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; ",
+    "$arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }; ",
+    "$exe = Join-Path $env:TEMP 'rustup-init.exe'; ",
+    "try { ",
+    "Write-Host 'Downloading the Rust installer from https://win.rustup.rs ...'; ",
+    "Invoke-WebRequest -Uri ('https://win.rustup.rs/' + $arch) -OutFile $exe -UseBasicParsing; ",
+    "& $exe ",
+    "} catch { Write-Host ('Could not install Rust: ' + $_.Exception.Message) } ",
+    "finally { Remove-Item $exe -Force -ErrorAction SilentlyContinue }; ",
+    "Write-Host ''; ",
+    "Read-Host 'Press Enter to close this window, then press Check again in SDK Add-on'"
+);
+
+/// Opens a PowerShell window that installs Rust. Returns once the window has opened; the
+/// installer runs in it, in plain sight, and the person answers its questions there.
+pub fn install_rust() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+        let powershell = std::path::Path::new(&root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        std::process::Command::new(powershell)
+            .args(["-NoProfile", "-Command", INSTALL_RUST_SCRIPT])
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .spawn()
+            .map(drop)
+            .map_err(|e| format!("Could not open PowerShell: {e}"))
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Installing Rust needs Windows.".into())
+    }
+}
+
 /// Shows `folder` in File Explorer.
 pub fn open_folder(folder: &std::path::Path) -> Result<(), String> {
     std::process::Command::new("explorer.exe")
@@ -167,4 +211,19 @@ fn shell_open(file: &std::path::Path) -> Result<(), String> {
 #[cfg(not(windows))]
 fn shell_open(file: &std::path::Path) -> Result<(), String> {
     Err(format!("Cannot open {} here", file.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The script is one argument, from the official host only, and cleans up after itself.
+    #[test]
+    fn the_install_script_is_one_plain_argument_from_the_official_host() {
+        assert!(!INSTALL_RUST_SCRIPT.contains('"'), "single quotes only");
+        assert!(!INSTALL_RUST_SCRIPT.contains('\n'));
+        assert!(INSTALL_RUST_SCRIPT.contains("https://win.rustup.rs/"));
+        assert!(INSTALL_RUST_SCRIPT.contains("Remove-Item $exe"));
+        assert_eq!(INSTALL_RUST_SCRIPT.matches("https://").count(), 2);
+    }
 }

@@ -1,7 +1,10 @@
 //! SDK Add-on: writes a new, complete Toolboks add-on project into a folder the person chooses,
-//! with `toolboks_addon_templates`. One page: what you need, the answers, the folder, Create.
+//! with `toolboks_addon_templates`. One page with two views: Create (what you need, the answers,
+//! the folder, Create) and Reader (a Markdown file shown as a page, such as the new README).
 
+pub mod markdown;
 pub mod project;
+mod reader;
 mod shell;
 mod toolchain;
 
@@ -20,9 +23,19 @@ const LAST_FOLDER: &str = "last_folder";
 const COLUMN: f32 = 680.0;
 const LABEL_WIDTH: f32 = 110.0;
 
+/// The two views of the page, switched at the top.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum View {
+    #[default]
+    Create,
+    Reader,
+}
+
 #[derive(Default)]
 pub struct SdkAddon {
     styled: bool,
+    view: View,
+    reader: reader::Reader,
     form: Form,
     advanced: bool,
     folder: Option<PathBuf>,
@@ -97,6 +110,33 @@ impl SdkAddon {
             self.open_error = Some(error);
         }
         changed
+    }
+
+    /// Get started: the Reader view with the new project's README.
+    fn get_started(&mut self, project: &Path, ctx: &egui::Context) {
+        self.view = View::Reader;
+        self.reader
+            .open(project.join("README.md"), project.to_path_buf(), ctx);
+    }
+
+    /// The Create and Reader switch.
+    fn view_switch(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(ui::SPACE_L);
+            egui::Frame::new()
+                .fill(ui::PANEL_BG)
+                .stroke(egui::Stroke::new(1.0, ui::BORDER))
+                .corner_radius(ui::CONTROL_RADIUS + 2)
+                .inner_margin(2.0)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    for (view, name) in [(View::Create, "Create"), (View::Reader, "Reader")] {
+                        if ui::pill(ui, name, self.view == view).clicked() {
+                            self.view = view;
+                        }
+                    }
+                });
+        });
     }
 
     fn check_toolchain(&mut self, ctx: &egui::Context) {
@@ -328,8 +368,13 @@ impl SdkAddon {
                 );
                 ui.label(project.display().to_string());
                 ui.horizontal(|ui| {
+                    if ui.add(primary("Get started (README)")).clicked() {
+                        self.open_error = None;
+                        self.get_started(&project, ui.ctx());
+                    }
                     if ui
-                        .add_enabled(self.opening.is_none(), primary("Get started (README)"))
+                        .add_enabled(self.opening.is_none(), outlined("Open in another app"))
+                        .on_hover_text("Opens the README with the program Windows uses for .md files, or Notepad.")
                         .clicked()
                     {
                         self.open_error = None;
@@ -492,10 +537,18 @@ impl toolboks_addon_sdk::NativeAddon for SdkAddon {
             self.check_toolchain(ui.ctx());
         }
         let changed = self.collect(preferences);
+        self.reader.collect(ui.ctx());
+        ui.add_space(ui::SPACE_M);
+        self.view_switch(ui);
+        if self.view == View::Reader {
+            ui.add_space(ui::SPACE_M);
+            self.reader.ui(ui, self.folder.as_deref());
+            return changed;
+        }
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(ui::SPACE_L);
+                ui.add_space(ui::SPACE_M);
                 ui.horizontal(|ui| {
                     ui.add_space(ui::SPACE_L);
                     let width = (ui.available_width() - ui::SPACE_L).clamp(320.0, COLUMN);
@@ -612,6 +665,91 @@ mod tests {
         addon.outcome = Some(Err(
             "D:\\Projects\\counter already exists and is not empty.".into(),
         ));
+        frame(&mut addon, &mut preferences);
+    }
+
+    /// The README a new project gets, as the templates crate writes it.
+    fn generated_readme() -> Vec<u8> {
+        let params = Form::new("counter", "Ada").params();
+        toolboks_addon_templates::generate(&params)
+            .unwrap()
+            .into_iter()
+            .find(|file| file.path == "README.md")
+            .unwrap()
+            .bytes
+    }
+
+    /// The generated README parses into the headings, table, list and code a reader shows.
+    #[test]
+    fn the_generated_readme_renders() {
+        let text = String::from_utf8(generated_readme()).unwrap();
+        let doc = markdown::parse(&text);
+        let has = |pred: &dyn Fn(&markdown::Block) -> bool| doc.blocks.iter().any(pred);
+        assert!(has(&|b| matches!(
+            b,
+            markdown::Block::Heading { level: 1, .. }
+        )));
+        assert!(has(&|b| matches!(
+            b,
+            markdown::Block::Table { rows, .. } if !rows.is_empty()
+        )));
+        assert!(has(&|b| matches!(
+            b,
+            markdown::Block::List { start: Some(1), .. }
+        )));
+        assert!(has(&|b| matches!(b, markdown::Block::Code(_))));
+        assert!(doc.has_anchor("the-five-edits-in-order"));
+    }
+
+    /// The switch changes the view; the Reader draws empty, with a document and with an error.
+    #[test]
+    fn the_reader_view_draws_empty_with_a_document_and_with_an_error() {
+        let mut addon = SdkAddon::default();
+        let mut preferences = BTreeMap::new();
+        frame(&mut addon, &mut preferences);
+        assert_eq!(addon.view, View::Create);
+        addon.view = View::Reader;
+        assert!(!frame(&mut addon, &mut preferences), "nothing is saved");
+        assert!(addon.reader.doc.is_none());
+        let readme = String::from_utf8(generated_readme()).unwrap();
+        let extra = "\n\n> quote with [a link](https://example.com)\n\n- [x] done\n- [ ] open\n\n\
+                     | a | b |\n|--:|:-:|\n| [l](x.md) | ~~s~~ |\n\n![alt](i.png)\n\n\
+                     <p>html</p>\n\n---\n";
+        addon.reader.doc = Some(markdown::parse(&format!("{readme}{extra}")));
+        addon.reader.file = Some(PathBuf::from(r"D:\Projects\counter\README.md"));
+        frame(&mut addon, &mut preferences);
+        addon.reader.error = Some("README.md was not found.".into());
+        addon.reader.lossy = true;
+        addon.reader.notice = Some("Email links are not opened from the reader.".into());
+        frame(&mut addon, &mut preferences);
+        addon.reader.doc = None;
+        frame(&mut addon, &mut preferences);
+        assert!(preferences.is_empty(), "the reader remembers no file");
+    }
+
+    /// Get started switches to the Reader and reads the project's README there; it starts no
+    /// other program.
+    #[test]
+    fn get_started_opens_the_readme_in_the_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("counter");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("README.md"), generated_readme()).unwrap();
+        let mut addon = SdkAddon {
+            outcome: Some(Ok(project.clone())),
+            ..SdkAddon::default()
+        };
+        let ctx = egui::Context::default();
+        addon.get_started(&project, &ctx);
+        assert_eq!(addon.view, View::Reader);
+        assert!(addon.opening.is_none(), "no other app is started");
+        addon.reader.wait();
+        assert_eq!(addon.reader.file, Some(project.join("README.md")));
+        assert_eq!(addon.reader.root.as_deref(), Some(project.as_path()));
+        assert!(addon.reader.error.is_none());
+        let doc = addon.reader.doc.as_ref().unwrap();
+        assert!(doc.has_anchor("the-five-edits-in-order"));
+        let mut preferences = BTreeMap::new();
         frame(&mut addon, &mut preferences);
     }
 }

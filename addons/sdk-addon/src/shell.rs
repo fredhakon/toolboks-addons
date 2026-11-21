@@ -1,15 +1,34 @@
-//! Windows' own folder picker, and opening the README or the project folder. Each runs on a
-//! worker thread: the picker waits for the person, and Toolboks ends an add-on that stops
+//! Windows' own folder and file pickers, and opening the README or the project folder. Each runs
+//! on a worker thread: the picker waits for the person, and Toolboks ends an add-on that stops
 //! answering for 30 seconds.
 
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-/// What the folder picker gave: a folder, nothing (cancelled), or why it could not open.
+/// What a picker gave: a path, nothing (cancelled), or why it could not open.
 pub type Picked = Result<Option<PathBuf>, String>;
+
+/// What a picker chooses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// The folder a new project goes into.
+    Folder,
+    /// A Markdown file for the reader.
+    Markdown,
+}
 
 /// Opens the folder picker, starting at `initial` when it is set.
 pub fn pick_folder(initial: Option<PathBuf>, ctx: egui::Context) -> mpsc::Receiver<Picked> {
+    pick(Kind::Folder, initial, ctx)
+}
+
+/// Opens the file picker for a Markdown file (`*.md`, `*.markdown`, `*.txt`, or any file),
+/// starting at `initial` when it is set. Only the chosen path comes back; nothing is read here.
+pub fn pick_markdown(initial: Option<PathBuf>, ctx: egui::Context) -> mpsc::Receiver<Picked> {
+    pick(Kind::Markdown, initial, ctx)
+}
+
+fn pick(kind: Kind, initial: Option<PathBuf>, ctx: egui::Context) -> mpsc::Receiver<Picked> {
     let (tx, rx) = mpsc::channel();
     #[cfg(windows)]
     let owner =
@@ -17,41 +36,60 @@ pub fn pick_folder(initial: Option<PathBuf>, ctx: egui::Context) -> mpsc::Receiv
     #[cfg(not(windows))]
     let owner = 0isize;
     std::thread::spawn(move || {
-        let _ = tx.send(choose(initial, owner));
+        let _ = tx.send(choose(kind, initial, owner));
         ctx.request_repaint();
     });
     rx
 }
 
 #[cfg(windows)]
-fn choose(initial: Option<PathBuf>, owner: isize) -> Picked {
+fn choose(kind: Kind, initial: Option<PathBuf>, owner: isize) -> Picked {
     use windows::{
         core::{w, HRESULT, PCWSTR},
         Win32::{
             Foundation::HWND,
             System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER},
             UI::Shell::{
-                FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
-                FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
-                SIGDN_FILESYSPATH,
+                Common::COMDLG_FILTERSPEC, FileOpenDialog, IFileOpenDialog, IShellItem,
+                SHCreateItemFromParsingName, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
+                FOS_NOCHANGEDIR, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
             },
         },
     };
+    let what = match kind {
+        Kind::Folder => "folder",
+        Kind::Markdown => "file",
+    };
     let _apartment =
-        Apartment::enter().map_err(|e| format!("Could not open the folder picker: {e}"))?;
+        Apartment::enter().map_err(|e| format!("Could not open the {what} picker: {e}"))?;
     // The dialog lives on this thread only. The path is copied before its memory is freed.
     let result = (|| -> windows::core::Result<Option<PathBuf>> {
         unsafe {
             let dialog: IFileOpenDialog =
                 CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
-            dialog.SetOptions(
-                dialog.GetOptions()?
-                    | FOS_PICKFOLDERS
-                    | FOS_FORCEFILESYSTEM
-                    | FOS_PATHMUSTEXIST
-                    | FOS_NOCHANGEDIR,
-            )?;
-            dialog.SetTitle(w!("Choose where to create the project"))?;
+            let options = dialog.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR;
+            match kind {
+                Kind::Folder => {
+                    dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST)?;
+                    dialog.SetTitle(w!("Choose where to create the project"))?;
+                }
+                Kind::Markdown => {
+                    dialog.SetOptions(options | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST)?;
+                    dialog.SetTitle(w!("Open a Markdown file"))?;
+                    let filters = [
+                        COMDLG_FILTERSPEC {
+                            pszName: w!("Markdown and text (*.md, *.markdown, *.txt)"),
+                            pszSpec: w!("*.md;*.markdown;*.txt"),
+                        },
+                        COMDLG_FILTERSPEC {
+                            pszName: w!("All files (*.*)"),
+                            pszSpec: w!("*.*"),
+                        },
+                    ];
+                    dialog.SetFileTypes(&filters)?;
+                    dialog.SetFileTypeIndex(1)?;
+                }
+            }
             if let Some(initial) = initial {
                 let path = wide(initial.as_os_str());
                 let item: windows::core::Result<IShellItem> =
@@ -73,12 +111,12 @@ fn choose(initial: Option<PathBuf>, owner: isize) -> Picked {
             Ok(Some(PathBuf::from(path?)))
         }
     })();
-    result.map_err(|e| format!("Could not open the folder picker: {e}"))
+    result.map_err(|e| format!("Could not open the {what} picker: {e}"))
 }
 
 #[cfg(not(windows))]
-fn choose(_initial: Option<PathBuf>, _owner: isize) -> Picked {
-    Err("The folder picker needs Windows.".into())
+fn choose(_kind: Kind, _initial: Option<PathBuf>, _owner: isize) -> Picked {
+    Err("The picker needs Windows.".into())
 }
 
 /// `text` as a NUL-terminated UTF-16 string for Windows.

@@ -455,7 +455,7 @@ administrator rights and writes only under `-OutDir`); try it with `-Arm none -D
 `addons/sdk-addon` builds `sdk-addon.exe` (ID `toolboks.sdk-addon`, "SDK Add-on", Developer
 tools). One page: it checks whether Rust (`cargo --version`) and the Visual C++ build tools
 (the Visual Studio Installer's `vswhere`; "Could not check" when that is absent) are installed and
-links to rustup.rs, takes a project name, title, author, accent and (under Advanced) an add-on id,
+has an Install Rust button (it opens PowerShell and runs the official installer when pressed), takes a project name, title, author, accent and (under Advanced) an add-on id,
 and on Create writes a new project with `toolboks_addon_templates::write_project` into
 `<chosen folder>/<name>`, never into a drive root, the Windows folder or Program Files, and never
 over a folder with files in it. The project's SDK comes from `HOST_REV` in `src/project.rs`, the

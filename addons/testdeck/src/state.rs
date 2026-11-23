@@ -3,7 +3,8 @@
 use crate::config::Config;
 use crate::mirror::Mirror;
 use crate::scheduler::{
-    EndReason, Env, Finished, Kind, Poll, Request, Scheduler, Secs, Ticket, DEFAULT_EXPECTED_SECS,
+    EndReason, Env, Finished, Kind, Poll, Request, Running, Scheduler, Secs, Ticket,
+    DEFAULT_EXPECTED_SECS,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -707,10 +708,16 @@ fn assign_cores(c: &mut Core) -> Vec<(u32, u64)> {
             })
             .collect();
     }
-    // The gate keeps every core. The others get one block each, from the highest core down in grant order, so the low
-    // cores stay free for Windows and a job keeps its place while the ones after it come and go.
     let budget = (crate::scheduler::worker_budget(&c.config, n as u32) as usize).min(n);
-    let running = &mut c.sched.running;
+    split_cores(&mut c.sched.running, budget, n);
+    Vec::new()
+}
+
+/// The gate keeps every core. The others get one block each, from the highest core down in grant order, so the low
+/// cores stay free for Windows and a job keeps its place while the ones after it come and go. The blocks follow the
+/// jobs that run now (the tick re-applies them): a job granted more workers than its share to start with widens as
+/// soon as the others end, because jest cannot add workers but can use more cores.
+fn split_cores(running: &mut [Running], budget: usize, n: usize) {
     let mut jobs: Vec<usize> = (0..running.len())
         .filter(|&i| running[i].req.kind != Kind::Gate)
         .collect();
@@ -737,5 +744,56 @@ fn assign_cores(c: &mut Core) -> Vec<(u32, u64)> {
         running[i].cpu_mask = (top - share..top).fold(0, |m, k| m | 1 << k);
         top -= share;
     }
-    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(kind: Kind, workers: u32, granted_at: Secs) -> Running {
+        Running {
+            ticket: granted_at as Ticket,
+            req: Request {
+                kind,
+                cwd: String::new(),
+                command: "jest".into(),
+                requester: "test".into(),
+                priority: 0,
+                log_glob: None,
+                shell_pid: None,
+                win_pid: None,
+                requeue_ok: false,
+                requeue_of: None,
+            },
+            workers,
+            granted_at,
+            last_heartbeat: granted_at,
+            below_normal: false,
+            stalled: false,
+            cpu_mask: 0,
+        }
+    }
+
+    #[test]
+    fn a_job_widens_its_cores_when_the_other_job_ends() {
+        let mut running = vec![job(Kind::Jest, 30, 1.0), job(Kind::Jest, 30, 2.0)];
+        split_cores(&mut running, 30, 32);
+        let (a, b) = (running[0].cpu_mask, running[1].cpu_mask);
+        assert_eq!((a.count_ones(), b.count_ones()), (15, 15));
+        assert_eq!(a & b, 0, "the two jobs get their own cores");
+        assert_eq!((a | b) & 0b11, 0, "cores 0 and 1 stay free");
+        // The second job ends: the next tick gives the first one a core per worker.
+        running.pop();
+        split_cores(&mut running, 30, 32);
+        assert_eq!(running[0].cpu_mask.count_ones(), 30);
+        assert_eq!(running[0].cpu_mask & 1, 0, "core 0 stays free");
+    }
+
+    #[test]
+    fn a_one_worker_job_keeps_one_core_and_the_gate_keeps_none_locked() {
+        let mut running = vec![job(Kind::Jest, 1, 1.0), job(Kind::Gate, 30, 2.0)];
+        split_cores(&mut running, 30, 32);
+        assert_eq!(running[0].cpu_mask.count_ones(), 1);
+        assert_eq!(running[1].cpu_mask, 0);
+    }
 }

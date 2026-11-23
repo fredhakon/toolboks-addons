@@ -3,6 +3,7 @@
 //! copy.
 mod agents;
 mod ai;
+mod disk;
 mod graphs;
 mod history_view;
 mod lanes;
@@ -292,6 +293,7 @@ pub struct TestdeckApp {
     settings: settings::State,
     hist_view: history_view::State,
     orphans: orphans::State,
+    disk: disk::State,
     lanes: lanes::State,
     agents: agents::State,
     ai: ai::State,
@@ -311,6 +313,7 @@ impl TestdeckApp {
             settings: settings::State::default(),
             hist_view: history_view::State::default(),
             orphans: orphans::State::default(),
+            disk: disk::State::default(),
             lanes: lanes::State::default(),
             agents: agents::State::default(),
             ai: ai::State::default(),
@@ -372,7 +375,14 @@ impl TestdeckApp {
             }
             3 => lanes::show(ui, &mut self.lanes, &hub.shared),
             4 => orphans::show(ui, &mut self.orphans, &hub.shared),
-            5 => ai::show(ui, &mut self.ai, &hub.shared),
+            5 => disk::show(
+                ui,
+                &mut self.disk,
+                &hub.shared,
+                &hub.history,
+                snap.config.disk_limit_gb,
+            ),
+            6 => ai::show(ui, &mut self.ai, &hub.shared),
             _ => settings::show(ui, &mut self.settings, &snap.config, &hub.shared),
         }
     }

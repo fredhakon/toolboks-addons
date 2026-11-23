@@ -4,6 +4,7 @@
 pub mod broker;
 pub mod cache;
 pub mod config;
+pub mod folders;
 pub mod guard;
 pub mod history;
 pub mod idle;
@@ -29,8 +30,8 @@ use std::sync::{Arc, Mutex};
 use toolboks_addon_sdk::{NativeAddon, StatusItem, TrayItem};
 
 pub const ID: &str = "toolboks.testdeck";
-pub const PAGES: [&str; 7] = [
-    "Overview", "History", "Agents", "DB lanes", "Orphans", "AI setup", "Settings",
+pub const PAGES: [&str; 8] = [
+    "Overview", "History", "Agents", "DB lanes", "Orphans", "Disk", "AI setup", "Settings",
 ];
 
 /// `<Toolboks data folder>/addon-data/toolboks.testdeck`.
@@ -156,6 +157,21 @@ fn start() -> anyhow::Result<Core> {
         let stats = h.job_averages();
         s.lock().job_stats = stats;
         std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+    // Every 30 minutes: the automatic jest folder cleanup, when the config turns it on (off by default).
+    let (s, h) = (shared.clone(), history.clone());
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(30 * 60));
+        if let Some(o) = folders::auto_clean(&s, h.job_paths()) {
+            if !o.removed.is_empty() || !o.failed.is_empty() {
+                eprintln!(
+                    "testdeck: disk cleanup freed {} MB in {} folders, {} kept or failed",
+                    o.freed >> 20,
+                    o.removed.len(),
+                    o.failed.len()
+                );
+            }
+        }
     });
     let broker_error = Arc::new(Mutex::new(None));
     let (s, err) = (shared.clone(), broker_error.clone());

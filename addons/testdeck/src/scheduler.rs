@@ -139,6 +139,16 @@ pub fn worker_budget(cfg: &Config, cores: u32) -> u32 {
 }
 
 /// Jobs that share the worker budget: everything but type checks (one core each, own lane) and the gate (alone).
+/// A job granted beside others gets this many times its fair share of workers (at most the budget). Free RAM still
+/// caps each grant; `state::assign_cores` keeps the jobs to their share of the cores while they run together.
+const SPLIT_OVERSUB: u32 = 2;
+
+/// Cores the PC leaves idle by the 10 s CPU average, minus core 0, which stays free for Windows and the UI.
+fn idle_cores(env: &Env) -> u32 {
+    let idle = env.cores as f32 * (100.0 - env.cpu_avg).clamp(0.0, 100.0) / 100.0;
+    (idle.floor() as u32).saturating_sub(1)
+}
+
 fn shares_budget(kind: Kind) -> bool {
     !matches!(kind, Kind::Tsc | Kind::Gate)
 }
@@ -247,17 +257,22 @@ impl Scheduler {
     /// Workers for the head of the queue, of `kind`, called before it leaves the queue. jest cannot change its worker
     /// count once started, so the split is decided here: the gate, or a job alone with nothing waiting behind it, gets
     /// the whole budget; otherwise the budget is split evenly between the jobs that run or will run beside it (at most
-    /// `slots`). A job that got everything gives cores back when the next one starts (`state::assign_cores`). Free RAM
-    /// caps the count.
+    /// `slots`), times `SPLIT_OVERSUB`: the count is fixed for the life of the job but its cores are not, so a job
+    /// that started beside others can use the whole PC once they end (`state::assign_cores`). In user mode the count
+    /// follows the measured idle cores (core 0 stays free), at least `workers_user_mode`. Free RAM caps the count.
     fn workers_for(&self, cfg: &Config, env: &Env, kind: Kind) -> u32 {
-        if env.user_mode {
-            return cfg.workers_user_mode.max(1);
-        }
         if kind == Kind::Tsc {
             return 1;
         }
         let budget = worker_budget(cfg, env.cores);
-        let share = if kind == Kind::Gate {
+        let share = if env.user_mode {
+            let floor = cfg.workers_user_mode.max(1);
+            if cfg.workers_user_mode_idle {
+                floor.max(idle_cores(env).min(budget))
+            } else {
+                floor
+            }
+        } else if kind == Kind::Gate {
             budget
         } else {
             let running = self
@@ -272,7 +287,8 @@ impl Scheduler {
                 .iter()
                 .filter(|q| shares_budget(q.req.kind))
                 .count() as u32;
-            budget / (running + waiting).min(cfg.slots.max(1)).max(running + 1)
+            let fair = budget / (running + waiting).min(cfg.slots.max(1)).max(running + 1);
+            (fair * SPLIT_OVERSUB).min(budget)
         };
         if env.ram_free_gb <= 0.0 {
             return share.max(1);
@@ -555,5 +571,132 @@ impl Scheduler {
             .map(|q| expected(&q.req.command))
             .sum();
         Some((running + ahead) / limit.max(1) as Secs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        Config {
+            worker_budget: 30,
+            ..Config::default()
+        }
+    }
+
+    fn env(user_mode: bool, cpu_avg: f32, ram_free_gb: f32) -> Env {
+        Env {
+            now: 1000.0,
+            cpu_avg,
+            ram_free_gb,
+            user_mode,
+            cores: 32,
+            ..Env::default()
+        }
+    }
+
+    fn req(kind: Kind) -> Request {
+        Request {
+            kind,
+            cwd: String::new(),
+            command: "jest".into(),
+            requester: "test".into(),
+            priority: 0,
+            log_glob: None,
+            shell_pid: None,
+            win_pid: None,
+            requeue_ok: false,
+            requeue_of: None,
+        }
+    }
+
+    /// Workers of the first grant after queueing `kinds`.
+    fn first_grant(cfg: &Config, env: &Env, kinds: &[Kind]) -> u32 {
+        let mut s = Scheduler::new();
+        for &k in kinds {
+            s.enqueue(req(k), 0.0, true);
+        }
+        s.admit(cfg, env)[0].1
+    }
+
+    #[test]
+    fn user_mode_on_an_idle_pc_gets_the_idle_cores_but_not_core_0() {
+        // 32 cores at 10% load: 28 idle, one kept for core 0.
+        assert_eq!(
+            first_grant(&cfg(), &env(true, 10.0, 100.0), &[Kind::Jest]),
+            27
+        );
+    }
+
+    #[test]
+    fn user_mode_on_a_busy_pc_keeps_the_floor() {
+        assert_eq!(
+            first_grant(&cfg(), &env(true, 100.0, 100.0), &[Kind::Jest]),
+            1
+        );
+        let c = Config {
+            workers_user_mode: 3,
+            ..cfg()
+        };
+        assert_eq!(first_grant(&c, &env(true, 100.0, 100.0), &[Kind::Jest]), 3);
+    }
+
+    #[test]
+    fn user_mode_idle_grant_can_be_switched_off() {
+        let c = Config {
+            workers_user_mode_idle: false,
+            ..cfg()
+        };
+        assert_eq!(first_grant(&c, &env(true, 0.0, 100.0), &[Kind::Jest]), 1);
+    }
+
+    #[test]
+    fn user_mode_grant_stays_inside_the_budget() {
+        let c = Config {
+            worker_budget: 4,
+            ..cfg()
+        };
+        assert_eq!(first_grant(&c, &env(true, 0.0, 100.0), &[Kind::Jest]), 4);
+    }
+
+    #[test]
+    fn free_ram_still_caps_user_mode_and_normal_grants() {
+        // (10 - 4 GB needed) / 0.75 GB per worker = 8.
+        assert_eq!(first_grant(&cfg(), &env(true, 0.0, 10.0), &[Kind::Jest]), 8);
+        assert_eq!(
+            first_grant(&cfg(), &env(false, 0.0, 10.0), &[Kind::Jest]),
+            8
+        );
+    }
+
+    #[test]
+    fn a_job_beside_others_gets_more_than_its_fair_share_up_to_the_budget() {
+        let c = Config { slots: 3, ..cfg() };
+        let e = env(false, 0.0, 100.0);
+        // Three jobs: fair share 10, granted twice that.
+        assert_eq!(first_grant(&c, &e, &[Kind::Jest; 3]), 20);
+        // Two jobs on two slots: twice the fair 15 is the whole budget, not more.
+        assert_eq!(first_grant(&cfg(), &e, &[Kind::Jest; 2]), 30);
+        assert_eq!(first_grant(&cfg(), &e, &[Kind::Jest]), 30);
+        // The RAM cap still holds for the split grant.
+        assert_eq!(first_grant(&c, &env(false, 0.0, 10.0), &[Kind::Jest; 3]), 8);
+    }
+
+    #[test]
+    fn type_checks_stay_at_one_worker() {
+        assert_eq!(first_grant(&cfg(), &env(true, 0.0, 100.0), &[Kind::Tsc]), 1);
+        assert_eq!(
+            first_grant(&cfg(), &env(false, 0.0, 100.0), &[Kind::Tsc]),
+            1
+        );
+    }
+
+    #[test]
+    fn the_gate_gets_the_budget() {
+        assert_eq!(
+            first_grant(&cfg(), &env(false, 0.0, 100.0), &[Kind::Gate]),
+            30
+        );
     }
 }

@@ -46,6 +46,10 @@ impl ProcCtl for WinProc {
         }
     }
 
+    fn track(&self, win_pid: u32) {
+        job_pids(win_pid);
+    }
+
     fn set_tree_priority(&self, win_pid: u32, below_normal: bool) {
         let class = if below_normal {
             BELOW_NORMAL_PRIORITY_CLASS
@@ -216,7 +220,8 @@ static JOBS: Mutex<Option<HashMap<u32, usize>>> = Mutex::new(None);
 /// Processes the root spawns afterwards stay in the job even when their parent exits. Empty when the root cannot
 /// be assigned (gone, access denied, or already in a job that forbids nesting): callers then use the parent walk.
 /// shortcut: processes spawned before the first call are not in the job (the walk still finds those whose parent
-/// lives); the broker tick calls this once a second from the grant on.
+/// lives); `track` makes the first call at the grant, before the client knows it was granted, so only a root that
+/// already runs work at that point (an old client that registers late) loses the processes whose parent exited.
 fn job_pids(root: u32) -> Vec<u32> {
     let mut g = JOBS.lock().unwrap_or_else(|e| e.into_inner());
     let jobs = g.get_or_insert_with(HashMap::new);
@@ -378,5 +383,43 @@ mod tests {
         WinProc.kill_tree(root);
         assert!(found, "ping not found through the job");
         assert!(job_pids(root).is_empty());
+    }
+
+    #[test]
+    fn track_covers_the_root_and_its_later_children_but_never_an_unrelated_process() {
+        let ping = |secs: u32| {
+            Command::new("ping")
+                .args(["-n", &secs.to_string(), "127.0.0.1"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        // Another tool's process, started before and outside the ticket.
+        let mut other = ping(20);
+        let mut root = Command::new("cmd")
+            .args(["/c", "ping -n 3 127.0.0.1 >nul & ping -n 20 127.0.0.1 >nul"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        WinProc.track(root.id());
+        let mut seen = Vec::new();
+        for _ in 0..40 {
+            seen = tree(root.id(), &snapshot());
+            if seen.len() > 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        WinProc.kill_tree(root.id());
+        let _ = other.kill();
+        let _ = (root.wait(), other.wait());
+        assert!(seen.contains(&root.id()) && seen.len() > 1, "{seen:?}");
+        assert!(!seen.contains(&other.id()), "unrelated process adopted");
     }
 }

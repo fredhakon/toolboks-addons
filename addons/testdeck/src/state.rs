@@ -17,6 +17,10 @@ use tokio::sync::Notify;
 /// Process control by Windows pid. Phase 2 implements it in `winproc.rs`.
 pub trait ProcCtl: Send + Sync {
     fn is_alive(&self, win_pid: u32) -> bool;
+    /// Starts tracking the process tree of a ticket's client at the grant, before the client replies to anything
+    /// the grant tells it and so before it starts any work: whatever it spawns later belongs to the ticket even
+    /// when its parent exits.
+    fn track(&self, _win_pid: u32) {}
     /// BELOW_NORMAL when `below_normal`, else NORMAL, on the process and all its descendants.
     fn set_tree_priority(&self, win_pid: u32, below_normal: bool);
     fn kill_tree(&self, win_pid: u32);
@@ -301,12 +305,16 @@ impl AppState {
     }
 
     /// Runs admission and mirrors each grant into the slot dir.
-    fn admit_locked(c: &mut Core, now: Secs) {
+    fn admit_locked(c: &mut Core, now: Secs, proc_ctl: &dyn ProcCtl) {
         c.foreign_busy = c.mirror.foreign_busy();
         let env = c.env(now);
         for (t, _) in c.sched.admit(&c.config, &env) {
             if let Some(r) = c.sched.running.iter().find(|r| r.ticket == t) {
                 let gate = r.req.kind == Kind::Gate && c.config.gate_exclusive;
+                // Under the core lock, so a client polling for its grant cannot see it before its tree is tracked.
+                if let Some(pid) = r.req.win_pid {
+                    proc_ctl.track(pid);
+                }
                 // shortcut: when an old script took the slot dir first, the grant stands without a mirror dir.
                 c.mirror
                     .grant(t, gate, c.config.slots, r.req.shell_pid, r.req.win_pid);
@@ -320,7 +328,7 @@ impl AppState {
         let out = {
             let mut g = self.lock();
             let out = f(&mut g, now);
-            Self::admit_locked(&mut g, now);
+            Self::admit_locked(&mut g, now, &*self.proc_ctl);
             out
         };
         self.changed();
@@ -349,7 +357,12 @@ impl AppState {
 
     pub fn started(&self, t: Ticket, win_pid: Option<u32>, log_glob: Option<String>) -> bool {
         let now = self.now();
-        self.lock().sched.started(t, win_pid, log_glob, now)
+        let ok = self.lock().sched.started(t, win_pid, log_glob, now);
+        // A client that names its runner here (not at the grant) gets that process tracked from now on.
+        if let Some(pid) = win_pid.filter(|_| ok) {
+            self.proc_ctl.track(pid);
+        }
+        ok
     }
 
     pub fn heartbeat(&self, t: Ticket) -> bool {
@@ -459,7 +472,7 @@ impl AppState {
             for f in &finished {
                 c.mirror.release(f.run.ticket);
             }
-            Self::admit_locked(c, now);
+            Self::admit_locked(c, now, &*self.proc_ctl);
             let user_mode = c.user_mode();
             let mut priorities = Vec::new();
             affinities.extend(assign_cores(c));
@@ -795,5 +808,68 @@ mod tests {
         split_cores(&mut running, 30, 32);
         assert_eq!(running[0].cpu_mask.count_ones(), 1);
         assert_eq!(running[1].cpu_mask, 0);
+    }
+
+    /// Records the pids it is asked to track and whether the ticket was already visible as granted at that time.
+    struct Recorder(Mutex<Vec<u32>>);
+    impl ProcCtl for Recorder {
+        fn is_alive(&self, _win_pid: u32) -> bool {
+            true
+        }
+        fn set_tree_priority(&self, _win_pid: u32, _below_normal: bool) {}
+        fn kill_tree(&self, _win_pid: u32) {}
+        fn track(&self, win_pid: u32) {
+            self.0.lock().unwrap().push(win_pid);
+        }
+    }
+
+    fn state_with(rec: Arc<Recorder>) -> Shared {
+        let mut deps = Deps::fake();
+        deps.proc_ctl = rec;
+        // A scratch mirror dir: the default one is the real machine-wide slot dir, whose busy slots would block a grant.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let config = Config {
+            mirror_dir: std::env::temp_dir()
+                .join(format!(
+                    "td-state-test-{}-{}",
+                    std::process::id(),
+                    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ))
+                .to_string_lossy()
+                .into_owned(),
+            ..Config::default()
+        };
+        AppState::new(config, None, deps)
+    }
+
+    fn request(win_pid: Option<u32>) -> Request {
+        let mut r = job(Kind::Jest, 1, 1.0).req;
+        r.win_pid = win_pid;
+        r
+    }
+
+    #[test]
+    fn a_grant_tracks_the_client_tree_before_the_client_can_see_it() {
+        let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let s = state_with(rec.clone());
+        let t = s.acquire(request(Some(4242)));
+        assert!(matches!(s.poll(t).0, Poll::Granted { .. }));
+        assert_eq!(*rec.0.lock().unwrap(), vec![4242]);
+        // No Windows pid (old client or non-Windows shell): nothing to track.
+        s.acquire(request(None));
+        assert_eq!(rec.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn started_with_a_runner_pid_tracks_it() {
+        let rec = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let s = state_with(rec.clone());
+        let t = s.acquire(request(None));
+        assert!(s.started(t, Some(777), None));
+        assert!(
+            !s.started(t + 99, Some(888), None),
+            "an unknown ticket tracks nothing"
+        );
+        assert_eq!(*rec.0.lock().unwrap(), vec![777]);
     }
 }

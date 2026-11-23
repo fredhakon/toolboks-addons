@@ -41,7 +41,8 @@ pub(crate) fn show(ui: &mut Ui, st: &mut State, current: &Config, shared: &Share
             row(ui, "RAM per worker", "A job gets no more workers than free RAM above \"Free RAM needed\" allows", |ui| {
                 ui.add(DragValue::new(&mut d.ram_per_worker_gb).range(0.1..=8.0).speed(0.05).fixed_decimals(2).suffix(" GB"));
             });
-            num(ui, "Workers in user mode", "Used while you are using the PC", &mut d.workers_user_mode, 1..=8, "");
+            num(ui, "Workers in user mode", "Fewest workers a job gets while you are using the PC", &mut d.workers_user_mode, 1..=8, "");
+            flag(ui, "Use idle cores in user mode", "A job gets as many workers as there are idle cores (core 0 stays free) and runs at below-normal priority; off keeps it at the number above", &mut d.workers_user_mode_idle);
             flag(ui, "Gate waits for the whole PC", "A gate job starts only when nothing else runs", &mut d.gate_exclusive);
             flag(ui, "Gate goes first", "Gate jobs jump the queue", &mut d.gate_first);
             flag(ui, "Split cores between jobs", "Locks each job (not the gate) to its own cores: a core per worker, or a share of the budget when more jobs run", &mut d.cpu_cap);

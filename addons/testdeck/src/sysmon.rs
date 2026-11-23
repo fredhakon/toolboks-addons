@@ -53,6 +53,7 @@ impl LoadSource for SysMon {
         });
 
         load.per_ticket.clear();
+        crate::winproc::forget_jobs_except(&pids.iter().map(|&(_, p)| p).collect::<Vec<_>>());
         if pids.is_empty() {
             return; // The process list is the costly part; skip it when nothing runs.
         }

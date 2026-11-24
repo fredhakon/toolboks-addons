@@ -14,6 +14,10 @@ pub const QUEUE_POLL_TIMEOUT: Secs = 30.0;
 pub const STARVATION_SECS: Secs = 120.0;
 /// At most one load-based grant per this many seconds: the CPU average needs time to see the new job.
 pub const GRANT_SPACING_SECS: Secs = 3.0;
+/// Idle boost: at most one extra grant per this many seconds (twice the 10 s CPU window), so the average sees it.
+pub const BOOST_SPACING_SECS: Secs = 20.0;
+/// Idle boost: free RAM needed above `ram_free_min_gb` to start one more job.
+const BOOST_RAM_MARGIN_GB: f32 = 4.0;
 /// A running ticket whose Windows pid is dead is released once its heartbeats are this late (clients beat every
 /// 5 s, so two beats may be lost or slow).
 pub const DEAD_PID_GRACE_SECS: Secs = 12.0;
@@ -170,6 +174,8 @@ pub struct Scheduler {
     next_ticket: Ticket,
     next_seq: u64,
     last_load_grant: Option<Secs>,
+    /// Time of the last grant beyond `slots` (idle boost).
+    last_boost_grant: Option<Secs>,
     cancelled: HashMap<Ticket, (String, Secs)>,
     /// Tickets stopped for low RAM; their heartbeat answers "requeue" for a while.
     requeued: HashMap<Ticket, Secs>,
@@ -351,9 +357,13 @@ impl Scheduler {
                         self.running.len() as u32 - tsc_running + env.foreign_busy,
                     )
                 };
+                let mut boost = false;
                 if used >= limit {
-                    skipped.insert(head.ticket);
-                    continue;
+                    if tsc || !self.can_boost(cfg, env, head, used, limit) {
+                        skipped.insert(head.ticket);
+                        continue;
+                    }
+                    boost = true;
                 }
                 let starving =
                     self.running.is_empty() && env.now - head.enqueued_at >= STARVATION_SECS;
@@ -372,6 +382,9 @@ impl Scheduler {
                     break;
                 }
                 self.last_load_grant = Some(env.now);
+                if boost {
+                    self.last_boost_grant = Some(env.now);
+                }
                 self.workers_for(cfg, env, kind)
             };
             let q = self.queue.remove(i);
@@ -388,6 +401,28 @@ impl Scheduler {
             });
         }
         grants
+    }
+
+    /// Idle boost: may `head` start beyond the `limit` slots (at most twice) because the PC is clearly under-used?
+    /// The extra job counts in `running`, so `workers_for` already shrinks every later grant's share.
+    fn can_boost(&self, cfg: &Config, env: &Env, head: &Queued, used: u32, limit: u32) -> bool {
+        // A `--rdb` job waits for one of the real-DB lanes inside its slot (rdb-lock.sh): an extra one would only sit
+        // in the lock and hold a slot, so only other jobs use the boost.
+        let rdb = head.req.command.contains(" --rdb");
+        cfg.idle_boost
+            && !env.user_mode
+            && !rdb
+            && used < limit * 2
+            && env.cpu_avg < cfg.cpu_threshold * 0.5
+            && env.ram_free_gb >= cfg.ram_free_min_gb + BOOST_RAM_MARGIN_GB
+            && !self.running.iter().any(|r| r.req.kind == Kind::Gate)
+            && !self
+                .queue
+                .iter()
+                .any(|q| q.req.kind == Kind::Gate && !self.gate_held(q, env))
+            && self
+                .last_boost_grant
+                .is_none_or(|t| env.now - t >= BOOST_SPACING_SECS)
     }
 
     fn gate_held(&self, q: &Queued, env: &Env) -> bool {
@@ -698,5 +733,108 @@ mod tests {
             first_grant(&cfg(), &env(false, 0.0, 100.0), &[Kind::Gate]),
             30
         );
+    }
+
+    /// A scheduler with `cfg.slots` jobs running, granted 10 s apart on an idle PC (so the boost is not used).
+    fn full(cfg: &Config) -> Scheduler {
+        let mut s = Scheduler::new();
+        for i in 0..cfg.slots {
+            s.enqueue(req(Kind::Jest), 0.0, true);
+            let e = Env {
+                now: 100.0 + 10.0 * i as Secs,
+                ..env(false, 0.0, 100.0)
+            };
+            assert_eq!(s.admit(cfg, &e).len(), 1);
+        }
+        s
+    }
+
+    fn boost_at(s: &mut Scheduler, now: Secs, cpu: f32, ram: f32, r: Request) -> usize {
+        s.enqueue(r, now, true);
+        let e = Env {
+            now,
+            ..env(false, cpu, ram)
+        };
+        s.admit(&cfg(), &e).len()
+    }
+
+    fn rdb_req() -> Request {
+        Request {
+            command: "jt.sh --rdb real-db/a.test.ts".into(),
+            ..req(Kind::Jest)
+        }
+    }
+
+    #[test]
+    fn idle_boost_admits_beyond_the_slots_on_a_quiet_pc() {
+        let mut s = full(&cfg());
+        // 85 threshold: 40% is under half of it, and RAM is well above 4 + 4 GB.
+        assert_eq!(boost_at(&mut s, 200.0, 40.0, 100.0, req(Kind::Jest)), 1);
+        assert_eq!(s.running.len(), 3);
+        // The extra job counts in the split: budget 30 / 3 jobs = 10, times SPLIT_OVERSUB; the first two keep theirs.
+        assert_eq!(s.running[2].workers, 20);
+        assert_eq!(s.running[0].workers, 30);
+    }
+
+    #[test]
+    fn idle_boost_refuses_when_the_pc_is_busy_or_short_of_ram() {
+        let mut s = full(&cfg());
+        assert_eq!(boost_at(&mut s, 200.0, 43.0, 100.0, req(Kind::Jest)), 0);
+        assert_eq!(boost_at(&mut s, 210.0, 40.0, 7.0, req(Kind::Jest)), 0);
+        assert_eq!(s.running.len(), 2);
+    }
+
+    #[test]
+    fn idle_boost_skips_rdb_jobs_but_not_the_ones_behind_them() {
+        let mut s = full(&cfg());
+        assert_eq!(boost_at(&mut s, 200.0, 0.0, 100.0, rdb_req()), 0);
+        assert_eq!(boost_at(&mut s, 201.0, 0.0, 100.0, req(Kind::Jest)), 1);
+        assert_eq!(s.queue.len(), 1);
+        assert!(s.queue[0].req.command.contains("--rdb"));
+    }
+
+    #[test]
+    fn idle_boost_waits_for_a_gate_user_mode_pause_and_the_switch() {
+        let mut s = full(&cfg());
+        s.enqueue(req(Kind::Gate), 0.0, true);
+        assert_eq!(boost_at(&mut s, 200.0, 0.0, 100.0, req(Kind::Jest)), 0);
+        s.cancel(
+            s.queue
+                .iter()
+                .find(|q| q.req.kind == Kind::Gate)
+                .unwrap()
+                .ticket,
+            "t",
+            200.0,
+        );
+        let user = Env {
+            now: 200.0,
+            ..env(true, 0.0, 100.0)
+        };
+        assert!(s.admit(&cfg(), &user).is_empty());
+        let off = Config {
+            idle_boost: false,
+            ..cfg()
+        };
+        let e = Env {
+            now: 200.0,
+            ..env(false, 0.0, 100.0)
+        };
+        assert!(s.admit(&off, &e).is_empty());
+        s.paused = true;
+        assert!(s.admit(&cfg(), &e).is_empty());
+        s.paused = false;
+        assert_eq!(s.admit(&cfg(), &e).len(), 1);
+    }
+
+    #[test]
+    fn idle_boost_is_spaced_and_capped_at_twice_the_slots() {
+        let mut s = full(&cfg());
+        assert_eq!(boost_at(&mut s, 200.0, 0.0, 100.0, req(Kind::Jest)), 1);
+        assert_eq!(boost_at(&mut s, 215.0, 0.0, 100.0, req(Kind::Jest)), 0);
+        assert_eq!(boost_at(&mut s, 220.0, 0.0, 100.0, req(Kind::Jest)), 1);
+        // 2 slots + 2 extra = the cap.
+        assert_eq!(boost_at(&mut s, 300.0, 0.0, 100.0, req(Kind::Jest)), 0);
+        assert_eq!(s.running.len(), 4);
     }
 }

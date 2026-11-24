@@ -389,7 +389,11 @@ impl TestdeckApp {
 
     fn header(&mut self, ui: &mut egui::Ui, snap: &Snapshot) {
         ui.horizontal(|ui| {
-            ui.label(theme::mono(format!("{} of {} slots \u{B7} {} queued", snap.running.len(), snap.slots, snap.queue.len())).color(TEXT2));
+            // Idle boost runs jobs beyond the slots: say so, so "5 of 4" does not look like a bug.
+            let jobs = snap.running.iter().filter(|r| r.kind != Kind::Tsc).count();
+            let extra = jobs.saturating_sub(snap.slots as usize);
+            let extra = if extra > 0 { format!(" (+{extra} extra)") } else { String::new() };
+            ui.label(theme::mono(format!("{} of {} slots{extra} \u{B7} {} queued", snap.running.len(), snap.slots, snap.queue.len())).color(TEXT2));
             let port = snap.bound_port.unwrap_or(snap.config.port);
             ui.label(RichText::new(format!("127.0.0.1:{port}")).small().color(TEXT3)).on_hover_text("The broker agents ask for a slot");
             if snap.config.night_window_enabled {

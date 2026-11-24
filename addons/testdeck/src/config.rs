@@ -26,6 +26,9 @@ pub struct Config {
     pub workers_user_mode: u32,
     /// In user mode grant workers from the cores that are idle (core 0 stays free), at least `workers_user_mode`.
     pub workers_user_mode_idle: bool,
+    /// While jobs wait and the 10 s CPU average is under half of `cpu_threshold` (RAM free, no gate), start up to
+    /// `slots` extra jobs beyond the slot limit, one per 20 s. Jobs that wait for a real-DB lane never use it.
+    pub idle_boost: bool,
     /// Percent; load-based grants need the 10 s CPU average below this.
     pub cpu_threshold: f32,
     pub ram_free_min_gb: f32,
@@ -80,6 +83,7 @@ impl Default for Config {
             ram_per_worker_gb: 0.75,
             workers_user_mode: 1,
             workers_user_mode_idle: true,
+            idle_boost: true,
             cpu_threshold: 85.0,
             ram_free_min_gb: 4.0,
             auto_user_mode: true,

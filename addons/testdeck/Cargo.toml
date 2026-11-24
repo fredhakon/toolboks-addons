@@ -1,6 +1,6 @@
 [package]
 name = "testdeck"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 license = "MIT"
 description = "Testdeck - native Toolboks background add-on that queues and shows the heavy test and build jobs on this PC"

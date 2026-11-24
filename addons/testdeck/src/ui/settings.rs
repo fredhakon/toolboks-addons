@@ -43,6 +43,7 @@ pub(crate) fn show(ui: &mut Ui, st: &mut State, current: &Config, shared: &Share
             });
             num(ui, "Workers in user mode", "Fewest workers a job gets while you are using the PC", &mut d.workers_user_mode, 1..=8, "");
             flag(ui, "Use idle cores in user mode", "A job gets as many workers as there are idle cores (core 0 stays free) and runs at below-normal priority; off keeps it at the number above", &mut d.workers_user_mode_idle);
+            flag(ui, "Start extra jobs on an idle PC", "While jobs wait and the CPU average is under half of the CPU limit, start up to as many extra jobs as there are slots, one per 20 s (not --rdb jobs, not in user mode, not while a gate waits)", &mut d.idle_boost);
             flag(ui, "Gate waits for the whole PC", "A gate job starts only when nothing else runs", &mut d.gate_exclusive);
             flag(ui, "Gate goes first", "Gate jobs jump the queue", &mut d.gate_first);
             flag(ui, "Split cores between jobs", "Locks each job (not the gate) to its own cores: a core per worker, or a share of the budget when more jobs run", &mut d.cpu_cap);

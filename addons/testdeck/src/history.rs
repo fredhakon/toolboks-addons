@@ -230,6 +230,27 @@ impl History {
         log_err("suite_stats", run())
     }
 
+    /// Every distinct cwd with its latest requester, and every distinct command that names a `cacheDirectory`: where
+    /// the Disk page looks for jest caches.
+    pub fn job_paths(&self) -> Vec<crate::folders::JobPath> {
+        let c = self.conn();
+        let run = || -> rusqlite::Result<Vec<crate::folders::JobPath>> {
+            let mut st = c.prepare_cached(
+                "SELECT DISTINCT cwd, requester, command FROM jobs
+                 WHERE id IN (SELECT MAX(id) FROM jobs GROUP BY cwd) OR command LIKE '%cacheDirectory%'",
+            )?;
+            let rows = st.query_map([], |r| {
+                Ok(crate::folders::JobPath {
+                    cwd: r.get(0)?,
+                    requester: r.get(1)?,
+                    command: r.get(2)?,
+                })
+            })?;
+            rows.collect()
+        };
+        log_err("job_paths", run())
+    }
+
     /// Average duration per command; a thread in `main.rs` copies it into `Core::job_stats` for the queue ETA.
     pub fn job_averages(&self) -> HashMap<String, f64> {
         self.command_stats()

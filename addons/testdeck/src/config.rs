@@ -61,6 +61,13 @@ pub struct Config {
     /// The test load preset (index into `LOAD_LEVELS`) the limits match; None = set by hand. Re-applied on start, so a
     /// preset follows the thread count of the PC it runs on.
     pub load_level: Option<u8>,
+    /// The Disk page warns when jest folders use more than this (GB).
+    pub disk_limit_gb: f32,
+    /// Remove finished `jt-*` run folders older than an hour in the background (every 30 minutes).
+    pub disk_auto_clean_jt: bool,
+    /// Keep the jest caches under `disk_cache_cap_gb` by deleting the oldest unused cache folder first.
+    pub disk_cache_cap_enabled: bool,
+    pub disk_cache_cap_gb: f32,
 }
 
 impl Default for Config {
@@ -93,6 +100,10 @@ impl Default for Config {
             night_end: "07:00".into(),
             gate_ask_in_user_mode: true,
             load_level: None,
+            disk_limit_gb: 20.0,
+            disk_auto_clean_jt: false,
+            disk_cache_cap_enabled: false,
+            disk_cache_cap_gb: 10.0,
         }
     }
 }

@@ -51,6 +51,16 @@ pub(crate) fn show(ui: &mut Ui, st: &mut State, current: &Config, shared: &Share
             pct(ui, "CPU limit", "New jobs wait while the 10 s CPU average is above this", &mut d.cpu_threshold);
             gb(ui, "Free RAM needed", "New jobs wait while free RAM is below this", &mut d.ram_free_min_gb);
         });
+        section(ui, "disk", "Disk", |ui| {
+            row(ui, "Warn above", "The Disk page shows a warning when jest folders use more than this", |ui| {
+                ui.add(DragValue::new(&mut d.disk_limit_gb).range(1.0..=2000.0).speed(0.5).fixed_decimals(0).suffix(" GB"));
+            });
+            flag(ui, "Remove old run folders", "Every 30 minutes, deletes finished jt-* folders in %TEMP% that are over an hour old", &mut d.disk_auto_clean_jt);
+            flag(ui, "Cap the jest caches", "Every 30 minutes, deletes the oldest jest cache folder no job uses until the caches fit the size below", &mut d.disk_cache_cap_enabled);
+            row(ui, "Cache size cap", "Total size the jest caches may use when the cap is on", |ui| {
+                ui.add(DragValue::new(&mut d.disk_cache_cap_gb).range(1.0..=2000.0).speed(0.5).fixed_decimals(0).suffix(" GB"));
+            });
+        });
         section(ui, "usermode", "User mode", |ui| {
             flag(ui, "Detect PC use", "Keyboard or mouse input switches user mode on", &mut d.auto_user_mode);
             // Disable the grid's own ui, not a nested scope: a scope is one grid cell and collapses the row into column 1.
